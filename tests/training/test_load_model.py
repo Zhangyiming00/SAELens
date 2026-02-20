@@ -120,6 +120,8 @@ def test_extract_logits_from_output_works_with_multiple_return_types():
     logits_dict = _extract_logits_from_output(out_dict)
     logits_tuple = _extract_logits_from_output(out_tuple)
 
+    assert logits_dict is not None
+    assert logits_tuple is not None
     assert_close(logits_dict, logits_tuple)
 
 
@@ -263,5 +265,26 @@ def test_load_model_raises_on_unknown_model_class():
 
 
 def test_extract_logits_from_output_raises_on_unknown_type():
-    with pytest.raises(ValueError, match="Unknown output type"):
+    with pytest.raises(ValueError, match="Unsupported model output type"):
         _extract_logits_from_output("not a valid output type")
+
+
+def test_extract_logits_from_output_works_with_object_logits_attribute():
+    logits = torch.randn(2, 10)
+
+    class FakeModelOutput:
+        def __init__(self, logits: torch.Tensor | None):
+            self.logits = logits
+
+    result = _extract_logits_from_output(FakeModelOutput(logits))
+    assert result is not None
+    assert_close(result, logits)
+
+
+def test_extract_logits_from_output_returns_none_when_object_logits_is_none():
+    class FakeModelOutput:
+        def __init__(self) -> None:
+            self.logits = None
+
+    result = _extract_logits_from_output(FakeModelOutput())
+    assert result is None
