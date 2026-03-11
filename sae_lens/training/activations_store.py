@@ -772,6 +772,8 @@ def _get_model_device(model: HookedRootModule) -> torch.device:
         return model.W_E.device  # type: ignore
     if hasattr(model, "cfg") and hasattr(model.cfg, "device"):
         return model.cfg.device  # type: ignore
+    if isinstance(getattr(model, "device", None), torch.device):
+        return model.device  # type: ignore
     return next(model.parameters()).device  # type: ignore
 
 

@@ -55,6 +55,11 @@ def load_model(
         ).to(device)  # type: ignore
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         return HookedProxyLM(hf_model, tokenizer)
+    if model_class_name == "VLLMModel":
+        from sae_lens.vllm_model import HookedVLLMModel
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        return HookedVLLMModel(model_name, tokenizer, **model_from_pretrained_kwargs)  # type: ignore
 
     # pragma: no cover
     raise ValueError(f"Unknown model class: {model_class_name}")

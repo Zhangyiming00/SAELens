@@ -85,6 +85,10 @@ select = ["UP", "TID", "I", "F", "E", "ARG", "SIM", "RET", "LOG", "T20"]
 "typing.List".msg = "Use `list` instead"
 "tests".msg = "Do not import from tests in the main codebase."
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["third_party"]
+
 [tool.pyright]
 typeCheckingMode = "strict"
 reportMissingTypeStubs = "none"
