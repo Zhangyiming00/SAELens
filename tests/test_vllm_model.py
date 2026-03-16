@@ -18,7 +18,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ.setdefault("VLLM_ACTIVATION_CAPTURE_MODE", "1")
 
-from sae_lens.vllm_model import ARCH_CONFIGS, HookedVLLMModel, _parse_hook_name
+from sae_lens.vllm_model import (
+    ARCH_CONFIGS,
+    HookedVLLMModel,
+    _gather_gate_up,
+    _k_proj_extractor,
+    _parse_hook_name,
+    _q_proj_extractor,
+    _v_proj_extractor,
+)
 
 MODEL_PATH = "/data/models/Llama-3.1-8B"
 LAYER = 2  # layer index used in all per-layer hook tests
@@ -132,6 +140,18 @@ def test_parse_hook_name_global():
     assert layer is None
 
 
+def test_parse_hook_name_attn_submodule():
+    hook_type, layer = _parse_hook_name("blocks.5.attn.hook_q")
+    assert hook_type == "attn.hook_q"
+    assert layer == 5
+
+
+def test_parse_hook_name_mlp_submodule():
+    hook_type, layer = _parse_hook_name("blocks.5.mlp.hook_pre")
+    assert hook_type == "mlp.hook_pre"
+    assert layer == 5
+
+
 def test_parse_hook_name_invalid():
     with pytest.raises(ValueError):
         _parse_hook_name("invalid_name_no_hook_prefix")
@@ -143,13 +163,79 @@ def test_parse_hook_name_invalid():
 
 
 def test_arch_configs_have_all_hook_types():
-    expected = {"hook_embed", "hook_resid_pre", "hook_resid_post", "hook_mlp_out", "hook_attn_out"}
+    expected = {
+        "hook_embed",
+        "hook_resid_pre",
+        "hook_resid_mid",
+        "hook_resid_post",
+        "hook_mlp_out",
+        "hook_attn_out",
+        "attn.hook_q",
+        "attn.hook_k",
+        "attn.hook_v",
+        "attn.hook_z",
+        "mlp.hook_pre",
+        "mlp.hook_post",
+    }
     for arch, cfg in ARCH_CONFIGS.items():
         assert expected <= set(cfg.keys()), f"{arch} missing hooks: {expected - set(cfg.keys())}"
 
 
 def test_llama_arch_registered():
     assert "LlamaForCausalLM" in ARCH_CONFIGS
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: gather functions
+# ---------------------------------------------------------------------------
+
+
+def test_gather_gate_up_single_shard():
+    # Single shard (TP=1): should just return the tensor as-is.
+    t = torch.randn(4, 10)
+    result = _gather_gate_up([t])
+    assert result.shape == t.shape
+    assert torch.allclose(result, t)
+
+
+def test_gather_gate_up_two_shards():
+    # TP=2: rank 0 has [g0, u0], rank 1 has [g1, u1].
+    # Result should be [g0, g1, u0, u1].
+    g0 = torch.ones(4, 3) * 1
+    u0 = torch.ones(4, 3) * 2
+    g1 = torch.ones(4, 3) * 3
+    u1 = torch.ones(4, 3) * 4
+
+    shard0 = torch.cat([g0, u0], dim=-1)  # (4, 6)
+    shard1 = torch.cat([g1, u1], dim=-1)  # (4, 6)
+
+    result = _gather_gate_up([shard0, shard1])
+    assert result.shape == (4, 12)
+    # gate portion = [g0, g1]
+    assert torch.allclose(result[..., :6], torch.cat([g0, g1], dim=-1))
+    # up portion = [u0, u1]
+    assert torch.allclose(result[..., 6:], torch.cat([u0, u1], dim=-1))
+
+
+class _DummyQKVModule:
+    def __init__(self, num_heads: int, num_kv_heads: int, head_size: int, v_head_size: int):
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.v_head_size = v_head_size
+
+
+def test_qkv_extractors_split_pre_rope_outputs_correctly():
+    module = _DummyQKVModule(num_heads=2, num_kv_heads=1, head_size=2, v_head_size=2)
+    q = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    k = torch.tensor([[5.0, 6.0]])
+    v = torch.tensor([[7.0, 8.0]])
+    qkv = torch.cat([q, k, v], dim=-1)
+    output = (qkv, None)
+
+    assert torch.equal(_q_proj_extractor(module, output), q)
+    assert torch.equal(_k_proj_extractor(module, output), k)
+    assert torch.equal(_v_proj_extractor(module, output), v)
 
 
 # ---------------------------------------------------------------------------
@@ -200,9 +286,6 @@ def test_activation_matches_hf(vllm_model, hf_model, batch_tokens, hook_name):
     )
 
     # RMS should match within 1% (catches scale bugs like 2x multiplier).
-    # max_abs_diff / rms is intentionally NOT used here: at bfloat16 values near
-    # the max (~414 for Llama residual stream), the bfloat16 step size equals 2.0,
-    # so a single outlier element inflates max diff while mean diff is negligible.
     vllm_rms = vllm_act.pow(2).mean().sqrt().item()
     hf_rms = hf_act.pow(2).mean().sqrt().item()
     rms_ratio = abs(vllm_rms - hf_rms) / (hf_rms + 1e-8)
@@ -252,4 +335,106 @@ def test_activation_capture_mode_reduces_kv_memory(vllm_model):
     assert cfg.num_gpu_blocks is not None
     assert cfg.num_gpu_blocks < 2000, (
         f"Expected minimal KV blocks (<2000), got {cfg.num_gpu_blocks}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: new hook points
+# ---------------------------------------------------------------------------
+
+
+def test_hook_resid_mid_shape_and_consistency(vllm_model, batch_tokens):
+    """hook_resid_mid = hook_resid_pre + hook_attn_out (residual addition identity)."""
+    B, S = batch_tokens.shape
+    hooks = [
+        f"blocks.{LAYER}.hook_resid_pre",
+        f"blocks.{LAYER}.hook_attn_out",
+        f"blocks.{LAYER}.hook_resid_mid",
+    ]
+    _, acts = vllm_model.run_with_cache(batch_tokens, names_filter=hooks)
+
+    mid = acts[f"blocks.{LAYER}.hook_resid_mid"].float()
+    pre = acts[f"blocks.{LAYER}.hook_resid_pre"].float()
+    attn_out = acts[f"blocks.{LAYER}.hook_attn_out"].float()
+
+    assert mid.shape == (B, S, pre.shape[-1])
+
+    # Identity: hook_resid_mid = hook_resid_pre + hook_attn_out
+    expected = pre + attn_out
+    cos = torch.nn.functional.cosine_similarity(
+        mid.view(-1, mid.shape[-1]), expected.view(-1, expected.shape[-1]), dim=-1
+    )
+    assert cos.min().item() > 0.999, f"hook_resid_mid consistency failed: cos={cos.min():.4f}"
+
+
+def test_hook_resid_post_consistency(vllm_model, batch_tokens):
+    """hook_resid_post = hook_resid_mid + hook_mlp_out."""
+    B, S = batch_tokens.shape
+    hooks = [
+        f"blocks.{LAYER}.hook_resid_mid",
+        f"blocks.{LAYER}.hook_mlp_out",
+        f"blocks.{LAYER}.hook_resid_post",
+    ]
+    _, acts = vllm_model.run_with_cache(batch_tokens, names_filter=hooks)
+
+    post = acts[f"blocks.{LAYER}.hook_resid_post"].float()
+    mid = acts[f"blocks.{LAYER}.hook_resid_mid"].float()
+    mlp_out = acts[f"blocks.{LAYER}.hook_mlp_out"].float()
+
+    expected = mid + mlp_out
+    cos = torch.nn.functional.cosine_similarity(
+        post.view(-1, post.shape[-1]), expected.view(-1, expected.shape[-1]), dim=-1
+    )
+    assert cos.min().item() > 0.999, f"hook_resid_post consistency failed: cos={cos.min():.4f}"
+
+
+def test_attn_hooks_shapes(vllm_model, batch_tokens):
+    """Attention internal hooks produce correct shapes."""
+    B, S = batch_tokens.shape
+    hooks = [
+        f"blocks.{LAYER}.attn.hook_q",
+        f"blocks.{LAYER}.attn.hook_k",
+        f"blocks.{LAYER}.attn.hook_v",
+        f"blocks.{LAYER}.attn.hook_z",
+    ]
+    _, acts = vllm_model.run_with_cache(batch_tokens, names_filter=hooks)
+
+    q = acts[f"blocks.{LAYER}.attn.hook_q"]
+    k = acts[f"blocks.{LAYER}.attn.hook_k"]
+    v = acts[f"blocks.{LAYER}.attn.hook_v"]
+    z = acts[f"blocks.{LAYER}.attn.hook_z"]
+
+    # All must be 3D (B, S, d)
+    assert q.shape[:2] == (B, S)
+    assert k.shape[:2] == (B, S)
+    assert v.shape[:2] == (B, S)
+    assert z.shape[:2] == (B, S)
+
+    # hook_z has the same last dim as hook_q (both are query-sized)
+    assert z.shape[-1] == q.shape[-1], "hook_z should have same d as hook_q"
+
+    # GQA: k/v have fewer heads than q; their last dim must be smaller
+    assert k.shape[-1] <= q.shape[-1], "GQA: k dim should be <= q dim"
+    assert k.shape == v.shape, "k and v must have the same shape"
+
+
+def test_mlp_hooks_shapes(vllm_model, batch_tokens):
+    """MLP internal hooks produce correct shapes."""
+    B, S = batch_tokens.shape
+    hooks = [
+        f"blocks.{LAYER}.mlp.hook_pre",
+        f"blocks.{LAYER}.mlp.hook_post",
+    ]
+    _, acts = vllm_model.run_with_cache(batch_tokens, names_filter=hooks)
+
+    pre = acts[f"blocks.{LAYER}.mlp.hook_pre"]
+    post = acts[f"blocks.{LAYER}.mlp.hook_post"]
+
+    assert pre.shape[:2] == (B, S)
+    assert post.shape[:2] == (B, S)
+
+    # hook_pre = gate only (first half of gate_up_proj) → same size as hook_post
+    # hook_post = silu(gate) * up → intermediate_size
+    assert pre.shape[-1] == post.shape[-1], (
+        f"hook_pre.d={pre.shape[-1]} should equal hook_post.d={post.shape[-1]}"
     )
