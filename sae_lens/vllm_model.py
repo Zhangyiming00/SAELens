@@ -10,14 +10,17 @@ Key design points:
   cache needed for one batch (no large block pool), since decode is never used.
 - VLLM_ENABLE_V1_MULTIPROCESSING=0 forces in-process scheduler so hook
   closures do not need cross-process serialisation.
-- For TP, each hook captures after RowParallelLinear's allreduce, so rank-0
-  activations are already full (not sharded) tensors.
+- For TP, hooks that are post-allreduce (all current ones) capture full tensors
+  on every rank; rank-0's capture is used directly (gather_dim=None).
+  Hooks that capture sharded tensors (e.g. inside QKV) use gather_dim to
+  concatenate shards from all TP workers into a full tensor.
 """
 
 from __future__ import annotations
 
 import os
 import re
+from functools import partial
 from typing import Any, Callable
 
 import torch
@@ -25,16 +28,17 @@ import torch.nn as nn
 from transformer_lens.utils import USE_DEFAULT_VALUE, get_tokens_with_bos_removed
 from transformers import PreTrainedTokenizerBase
 
-# Force in-process vLLM scheduler so apply_model() closures work without
-# cross-process pickling.  Must be set before vllm is imported.
+# Force in-process vLLM scheduler.  Must be set before vllm is imported.
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-# Allow cloudpickle serialisation as a fallback for any worker-to-worker comms
-# (needed if TP workers are in separate processes).
+# Allow cloudpickle serialisation as a fallback for any worker-to-worker comms.
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-# Activation capture mode: allocate only the minimum KV cache needed for one
-# batch.  This avoids the large block pool reservation that is wasted during
-# prefill-only activation extraction.
+# Activation capture mode: allocate only the minimum KV cache for one batch.
 os.environ.setdefault("VLLM_ACTIVATION_CAPTURE_MODE", "1")
+# Use spawn (not fork) for TP worker processes.  vLLM's MultiprocExecutor
+# initialises CUDA in the parent before forking, which makes forked children
+# crash with "Cannot re-initialize CUDA in forked subprocess".  Spawn avoids
+# this.  For TP=1 (UniProcExecutor) this env var has no effect.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 try:
     from vllm import LLM, SamplingParams
@@ -77,15 +81,24 @@ def _identity_extractor(output: Any) -> torch.Tensor:
     return output
 
 
-_LLAMA_LIKE_HOOKS: dict[str, tuple[str, Callable, bool]] = {
-    "hook_embed": ("model.embed_tokens", _identity_extractor, False),
-    "hook_resid_pre": ("model.layers.{layer}", _resid_pre_extractor, True),
-    "hook_resid_post": ("model.layers.{layer}", _resid_post_extractor, False),
-    "hook_mlp_out": ("model.layers.{layer}.mlp", _identity_extractor, False),
-    "hook_attn_out": ("model.layers.{layer}.self_attn", _identity_extractor, False),
+# Each entry: hook_type → (path_template, extractor_fn, is_pre_hook, gather_dim)
+#
+# gather_dim:
+#   None  → post-allreduce; rank-0's capture is the full tensor (no gather needed)
+#   int   → sharded along that dimension; shards from all TP workers will be
+#            concatenated along gather_dim to reconstruct the full tensor
+#
+# All current hooks are post-allreduce (RowParallelLinear reduce_results=True),
+# so gather_dim=None for all of them.
+_LLAMA_LIKE_HOOKS: dict[str, tuple[str, Callable, bool, int | None]] = {
+    "hook_embed": ("model.embed_tokens", _identity_extractor, False, None),
+    "hook_resid_pre": ("model.layers.{layer}", _resid_pre_extractor, True, None),
+    "hook_resid_post": ("model.layers.{layer}", _resid_post_extractor, False, None),
+    "hook_mlp_out": ("model.layers.{layer}.mlp", _identity_extractor, False, None),
+    "hook_attn_out": ("model.layers.{layer}.self_attn", _identity_extractor, False, None),
 }
 
-ARCH_CONFIGS: dict[str, dict[str, tuple[str, Callable, bool]]] = {
+ARCH_CONFIGS: dict[str, dict[str, tuple[str, Callable, bool, int | None]]] = {
     arch: _LLAMA_LIKE_HOOKS
     for arch in [
         "LlamaForCausalLM",
@@ -120,6 +133,80 @@ def _parse_hook_name(hook_name: str) -> tuple[str, int | None]:
 
 
 # ---------------------------------------------------------------------------
+# Module-level helpers (must be picklable for multiprocessing with TP>1)
+#
+# With TP>1, vLLM spawns one worker process per GPU rank.  Functions passed
+# as args to LLM.apply_model() are serialised by MessageQueue.enqueue() with
+# standard pickle (not cloudpickle).  Module-level functions + functools.partial
+# with plain-Python captured values are standard-picklable, so all helpers that
+# will be passed to apply_model() are defined at module level.
+# ---------------------------------------------------------------------------
+
+
+def _get_arch_name(model: nn.Module) -> str:
+    """Return the class name of the top-level model module."""
+    return type(model).__name__
+
+
+def _register_hooks(
+    model: nn.Module,
+    hook_specs: list[tuple[str, str, Callable, bool, int | None]],
+    total_tokens: int,
+    stop_at_layer: int | None,
+) -> None:
+    """Register SAE capture hooks on the worker's model."""
+    model._sae_captures: dict[str, torch.Tensor] = {}  # type: ignore[attr-defined]
+    model._sae_handles: list = []  # type: ignore[attr-defined]
+    if stop_at_layer is not None:
+        model.model._sae_stop_at_layer = stop_at_layer  # type: ignore[attr-defined]
+
+    for hook_name, path, extractor, is_pre, _gather_dim in hook_specs:
+        module = model.get_submodule(path)
+
+        if is_pre:
+
+            def make_pre_hook(
+                name: str, ext: Callable
+            ) -> Callable[[nn.Module, tuple], None]:
+                def hook_fn(m: nn.Module, args: tuple) -> None:
+                    act = ext(args)
+                    # Only capture prefill pass: shape (B*S, d).
+                    # Decode pass has shape (B, d).
+                    if act.shape[0] == total_tokens:
+                        model._sae_captures[name] = act.detach().cpu()  # type: ignore[attr-defined]
+
+                return hook_fn
+
+            handle = module.register_forward_pre_hook(make_pre_hook(hook_name, extractor))
+        else:
+
+            def make_post_hook(
+                name: str, ext: Callable
+            ) -> Callable[[nn.Module, Any, Any], None]:
+                def hook_fn(m: nn.Module, inp: Any, out: Any) -> None:
+                    act = ext(out)
+                    if act.shape[0] == total_tokens:
+                        model._sae_captures[name] = act.detach().cpu()  # type: ignore[attr-defined]
+
+                return hook_fn
+
+            handle = module.register_forward_hook(make_post_hook(hook_name, extractor))
+
+        model._sae_handles.append(handle)  # type: ignore[attr-defined]
+
+
+def _collect_and_cleanup(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Collect captured activations and remove all hooks from the model."""
+    captures = dict(model._sae_captures)  # type: ignore[attr-defined]
+    for handle in model._sae_handles:  # type: ignore[attr-defined]
+        handle.remove()
+    del model._sae_captures, model._sae_handles  # type: ignore[attr-defined]
+    if hasattr(model.model, "_sae_stop_at_layer"):
+        del model.model._sae_stop_at_layer  # type: ignore[attr-defined]
+    return captures
+
+
+# ---------------------------------------------------------------------------
 # HookedVLLMModel
 # ---------------------------------------------------------------------------
 
@@ -130,8 +217,8 @@ class HookedVLLMModel:
     ActivationsStore.get_activations() (activations_store.py:491).
 
     Supports tensor parallelism via vLLM's tensor_parallel_size kwarg.
-    Hooks run on rank-0; post-allreduce activations are full tensors for dense
-    architectures.
+    Post-allreduce hooks (all current ones) use rank-0's capture directly.
+    Sharded hooks (gather_dim != None) concatenate captures from all TP workers.
 
     Supported architectures:
 
@@ -161,7 +248,7 @@ class HookedVLLMModel:
         llm_kwargs.setdefault("enforce_eager", True)
         self.llm = LLM(model_name, **llm_kwargs)
 
-        arch: str = self.llm.apply_model(lambda m: type(m).__name__)[0]
+        arch: str = self.llm.apply_model(_get_arch_name)[0]
         if arch not in ARCH_CONFIGS:
             raise ValueError(
                 f"Architecture {arch!r} is not supported by HookedVLLMModel. "
@@ -195,8 +282,8 @@ class HookedVLLMModel:
         total_tokens = B * S
         stop_at_layer: int | None = kwargs.get("stop_at_layer", None)
 
-        # Resolve hook names to (name, module_path, extractor, is_pre_hook).
-        hook_specs: list[tuple[str, str, Callable, bool]] = []
+        # Resolve hook names to (name, module_path, extractor, is_pre_hook, gather_dim).
+        hook_specs: list[tuple[str, str, Callable, bool, int | None]] = []
         for hook_name in names_filter:
             hook_type, layer = _parse_hook_name(hook_name)
             if hook_type not in arch_config:
@@ -204,58 +291,22 @@ class HookedVLLMModel:
                     f"Hook type {hook_type!r} not supported for {self._arch}. "
                     f"Supported: {sorted(arch_config)}"
                 )
-            path_tpl, extractor, is_pre = arch_config[hook_type]
+            path_tpl, extractor, is_pre, gather_dim = arch_config[hook_type]
             path = path_tpl if layer is None else path_tpl.format(layer=layer)
-            hook_specs.append((hook_name, path, extractor, is_pre))
+            hook_specs.append((hook_name, path, extractor, is_pre, gather_dim))
 
-        # Register hooks inside the worker process.
-        # Closures work here because VLLM_ENABLE_V1_MULTIPROCESSING=0 means
-        # apply_model() runs in-process (no pickling required).
-        def register_hooks(model: nn.Module) -> None:
-            model._sae_captures: dict[str, torch.Tensor] = {}  # type: ignore[attr-defined]
-            model._sae_handles: list = []  # type: ignore[attr-defined]
-            if stop_at_layer is not None:
-                model.model._sae_stop_at_layer = stop_at_layer  # type: ignore[attr-defined]
-
-            for hook_name, path, extractor, is_pre in hook_specs:
-                module = model.get_submodule(path)
-
-                if is_pre:
-
-                    def make_pre_hook(
-                        name: str, ext: Callable
-                    ) -> Callable[[nn.Module, tuple], None]:
-                        def hook_fn(m: nn.Module, args: tuple) -> None:
-                            act = ext(args)
-                            # Only capture prefill pass: shape (B*S, d).
-                            # Decode pass has shape (B, d).
-                            if act.shape[0] == total_tokens:
-                                model._sae_captures[name] = act.detach().cpu()  # type: ignore[attr-defined]
-
-                        return hook_fn
-
-                    handle = module.register_forward_pre_hook(
-                        make_pre_hook(hook_name, extractor)
-                    )
-                else:
-
-                    def make_post_hook(
-                        name: str, ext: Callable
-                    ) -> Callable[[nn.Module, Any, Any], None]:
-                        def hook_fn(m: nn.Module, inp: Any, out: Any) -> None:
-                            act = ext(out)
-                            if act.shape[0] == total_tokens:
-                                model._sae_captures[name] = act.detach().cpu()  # type: ignore[attr-defined]
-
-                        return hook_fn
-
-                    handle = module.register_forward_hook(
-                        make_post_hook(hook_name, extractor)
-                    )
-
-                model._sae_handles.append(handle)  # type: ignore[attr-defined]
-
-        self.llm.apply_model(register_hooks)
+        # Register hooks inside the worker process(es).
+        # For TP>1, MultiprocExecutor serialises the function with standard
+        # pickle (via MessageQueue.enqueue).  We use functools.partial over the
+        # module-level _register_hooks so all captured values are picklable.
+        self.llm.apply_model(
+            partial(
+                _register_hooks,
+                hook_specs=hook_specs,
+                total_tokens=total_tokens,
+                stop_at_layer=stop_at_layer,
+            )
+        )
 
         # Run inference.  max_tokens=1 keeps decode overhead minimal.
         # The shape check in hooks means only the prefill activation is kept.
@@ -263,24 +314,19 @@ class HookedVLLMModel:
         try:
             self.llm.generate(prompts, SamplingParams(max_tokens=1), use_tqdm=False)
         finally:
-            # Always clean up regardless of whether generate() raises.
-            def collect_and_cleanup(model: nn.Module) -> dict[str, torch.Tensor]:
-                captures = dict(model._sae_captures)  # type: ignore[attr-defined]
-                for handle in model._sae_handles:  # type: ignore[attr-defined]
-                    handle.remove()
-                del model._sae_captures, model._sae_handles  # type: ignore[attr-defined]
-                if hasattr(model.model, "_sae_stop_at_layer"):
-                    del model.model._sae_stop_at_layer  # type: ignore[attr-defined]
-                return captures
+            results = self.llm.apply_model(_collect_and_cleanup)
 
-            results = self.llm.apply_model(collect_and_cleanup)
-
-        # results[0] = rank-0 worker's captures.  For dense architectures,
-        # rank-0 has post-allreduce (full) tensors for all supported hook types.
-        raw = results[0]
-
-        # Reshape (B*S, d) → (B, S, d).
-        activations = {name: tensor.view(B, S, -1) for name, tensor in raw.items()}
+        # Build per-hook activations.
+        # - gather_dim=None: post-allreduce; rank-0's capture is already full.
+        # - gather_dim=int: sharded; concatenate shards from all TP workers.
+        activations: dict[str, torch.Tensor] = {}
+        for hook_name, _path, _extractor, _is_pre, gather_dim in hook_specs:
+            if gather_dim is None or len(results) == 1:
+                raw = results[0][hook_name]
+            else:
+                shards = [r[hook_name] for r in results if hook_name in r]
+                raw = torch.cat(shards, dim=gather_dim)
+            activations[hook_name] = raw.view(B, S, -1)
         return None, activations
 
     def to_tokens(
