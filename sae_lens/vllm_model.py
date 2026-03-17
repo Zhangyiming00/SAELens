@@ -342,7 +342,8 @@ def _register_hooks(
     stop_at_layer: int | None,
 ) -> None:
     """Register SAE capture hooks on the worker's model."""
-    model._sae_captures: dict[str, torch.Tensor] = {}  # type: ignore[attr-defined]
+    # Use lists to accumulate chunks from chunked prefill.
+    model._sae_captures: dict[str, list[torch.Tensor]] = {}  # type: ignore[attr-defined]
     model._sae_handles: list = []  # type: ignore[attr-defined]
     if stop_at_layer is not None:
         model.model._sae_stop_at_layer = stop_at_layer  # type: ignore[attr-defined]
@@ -357,10 +358,11 @@ def _register_hooks(
             ) -> Callable[[nn.Module, tuple], None]:
                 def hook_fn(m: nn.Module, args: tuple) -> None:
                     act = ext(m, args)
-                    # Only capture prefill pass: shape (B*S, d).
-                    # Decode pass has shape (B, d).
-                    if act.shape[0] == total_tokens:
-                        model._sae_captures[name] = act.detach().cpu()  # type: ignore[attr-defined]
+                    # Accumulate all chunks (chunked prefill splits the batch).
+                    # We slice to total_tokens in run_with_cache.
+                    if name not in model._sae_captures:  # type: ignore[attr-defined]
+                        model._sae_captures[name] = []  # type: ignore[attr-defined]
+                    model._sae_captures[name].append(act.detach().cpu())  # type: ignore[attr-defined]
 
                 return hook_fn
 
@@ -372,8 +374,9 @@ def _register_hooks(
             ) -> Callable[[nn.Module, Any, Any], None]:
                 def hook_fn(m: nn.Module, inp: Any, out: Any) -> None:
                     act = ext(m, out)
-                    if act.shape[0] == total_tokens:
-                        model._sae_captures[name] = act.detach().cpu()  # type: ignore[attr-defined]
+                    if name not in model._sae_captures:  # type: ignore[attr-defined]
+                        model._sae_captures[name] = []  # type: ignore[attr-defined]
+                    model._sae_captures[name].append(act.detach().cpu())  # type: ignore[attr-defined]
 
                 return hook_fn
 
@@ -384,7 +387,10 @@ def _register_hooks(
 
 def _collect_and_cleanup(model: nn.Module) -> dict[str, torch.Tensor]:
     """Collect captured activations and remove all hooks from the model."""
-    captures = dict(model._sae_captures)  # type: ignore[attr-defined]
+    captures = {
+        k: torch.cat(v, dim=0)
+        for k, v in model._sae_captures.items()  # type: ignore[attr-defined]
+    }
     for handle in model._sae_handles:  # type: ignore[attr-defined]
         handle.remove()
     del model._sae_captures, model._sae_handles  # type: ignore[attr-defined]
@@ -511,7 +517,7 @@ class HookedVLLMModel:
             else:
                 shards = [r[hook_name] for r in results if hook_name in r]
                 raw = gather_fn(shards)
-            activations[hook_name] = raw.view(B, S, -1)
+            activations[hook_name] = raw[:total_tokens].view(B, S, -1)
         return None, activations
 
     def to_tokens(
