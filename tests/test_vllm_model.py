@@ -54,7 +54,7 @@ def vllm_model(tokenizer):
 
 @pytest.fixture(scope="module")
 def hf_model():
-    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype=torch.bfloat16).cuda()
+    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, torch_dtype=torch.bfloat16).cuda()
     model.eval()
     return model
 
@@ -265,7 +265,7 @@ def test_activation_matches_hf(vllm_model, hf_model, batch_tokens, hook_name):
 
     # --- vLLM capture ---
     _, vllm_acts = vllm_model.run_with_cache(batch_tokens, names_filter=[hook_name])
-    vllm_act = vllm_acts[hook_name].float()  # (B, S, d)
+    vllm_act = vllm_acts[hook_name].float().cpu()  # (B, S, d)
 
     # --- HF reference ---
     hook_type, layer = _parse_hook_name(hook_name)

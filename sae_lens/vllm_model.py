@@ -40,9 +40,12 @@ Not supported (inside FlashAttention kernel, unreachable by forward hooks):
 
 from __future__ import annotations
 
+import io
 import os
+import pickle
 import re
 from functools import partial
+from multiprocessing.reduction import ForkingPickler
 from typing import Any, Callable
 
 import torch
@@ -67,6 +70,12 @@ try:
 except ImportError:
     LLM = None  # type: ignore[assignment,misc]
     SamplingParams = None  # type: ignore[assignment,misc]
+
+_DTYPE_TO_STR: dict[torch.dtype, str] = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float32: "float32",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +176,8 @@ def _v_proj_extractor(module: nn.Module, output: Any) -> torch.Tensor:
 
 def _gather_cat(shards: list[torch.Tensor]) -> torch.Tensor:
     """Concatenate shards along the feature dimension (dim=-1)."""
-    return torch.cat(shards, dim=-1)
+    dev = shards[0].device
+    return torch.cat([s.to(dev) for s in shards], dim=-1)
 
 
 def _gather_gate_up(shards: list[torch.Tensor]) -> torch.Tensor:
@@ -177,9 +187,10 @@ def _gather_gate_up(shards: list[torch.Tensor]) -> torch.Tensor:
     Each TP rank produces [gate_local, up_local] concatenated.  After simple
     cat we'd get [g0, u0, g1, u1, ...] which is wrong; we need [gate_all, up_all].
     """
+    dev = shards[0].device
     half = shards[0].shape[-1] // 2
-    gate = torch.cat([s[..., :half] for s in shards], dim=-1)
-    up = torch.cat([s[..., half:] for s in shards], dim=-1)
+    gate = torch.cat([s[..., :half].to(dev) for s in shards], dim=-1)
+    up = torch.cat([s[..., half:].to(dev) for s in shards], dim=-1)
     return torch.cat([gate, up], dim=-1)
 
 
@@ -362,7 +373,7 @@ def _register_hooks(
                     # We slice to total_tokens in run_with_cache.
                     if name not in model._sae_captures:  # type: ignore[attr-defined]
                         model._sae_captures[name] = []  # type: ignore[attr-defined]
-                    model._sae_captures[name].append(act.detach().cpu())  # type: ignore[attr-defined]
+                    model._sae_captures[name].append(act.detach().clone())  # type: ignore[attr-defined]
 
                 return hook_fn
 
@@ -376,7 +387,7 @@ def _register_hooks(
                     act = ext(m, out)
                     if name not in model._sae_captures:  # type: ignore[attr-defined]
                         model._sae_captures[name] = []  # type: ignore[attr-defined]
-                    model._sae_captures[name].append(act.detach().cpu())  # type: ignore[attr-defined]
+                    model._sae_captures[name].append(act.detach().clone())  # type: ignore[attr-defined]
 
                 return hook_fn
 
@@ -397,6 +408,65 @@ def _collect_and_cleanup(model: nn.Module) -> dict[str, torch.Tensor]:
     if hasattr(model.model, "_sae_stop_at_layer"):
         del model.model._sae_stop_at_layer  # type: ignore[attr-defined]
     return captures
+
+
+# ---------------------------------------------------------------------------
+# CUDA IPC helpers for TP>1
+#
+# With TP>1, vLLM's MultiprocExecutor uses ZMQ to transfer apply_model()
+# return values from worker to main process.  Standard pickle cannot handle
+# CUDA tensors, and serialising large activations (~128 MB) as CPU bytes
+# takes ~800 ms at the ZMQ bandwidth (~160 MB/s).
+#
+# Instead, we:
+#   1. Keep activations on GPU in hooks (no .cpu()).
+#   2. In _collect_and_pin, cat on GPU, store in the worker's module-level
+#      _CUDA_IPC_PINNED dict to prevent GC, then use ForkingPickler to
+#      serialise the dict to CUDA IPC handle bytes (~64 bytes per tensor).
+#   3. Return those tiny bytes through ZMQ (microseconds).
+#   4. Main process calls pickle.loads — torch's registered reducers
+#      reconstruct tensors pointing to the same GPU memory (zero copy).
+#   5. After main is done, _release_pinned deletes the worker's reference;
+#      CUDA frees the memory once all IPC handles are closed.
+#
+# For TP=1 (UniProcExecutor), apply_model runs in-process and Python objects
+# are returned directly — no serialisation at all, so _collect_and_cleanup
+# already returns CUDA tensors with zero overhead.
+# ---------------------------------------------------------------------------
+
+# Worker-side storage that keeps GPU tensors alive while main process holds
+# CUDA IPC handles to the same memory.
+_CUDA_IPC_PINNED: dict[str, torch.Tensor] = {}
+
+
+def _collect_and_pin(model: nn.Module) -> bytes:
+    """
+    Collect GPU activations, pin them, and return CUDA IPC handle bytes.
+
+    The bytes are created by ForkingPickler (~64 B per tensor, not the tensor
+    data), so ZMQ transfer is microseconds regardless of activation size.
+    Main process reconstructs zero-copy CUDA tensors via pickle.loads.
+    """
+    global _CUDA_IPC_PINNED
+    captures = {
+        k: torch.cat(v, dim=0)
+        for k, v in model._sae_captures.items()  # type: ignore[attr-defined]
+    }
+    for handle in model._sae_handles:  # type: ignore[attr-defined]
+        handle.remove()
+    del model._sae_captures, model._sae_handles  # type: ignore[attr-defined]
+    if hasattr(model.model, "_sae_stop_at_layer"):
+        del model.model._sae_stop_at_layer  # type: ignore[attr-defined]
+    _CUDA_IPC_PINNED = captures  # prevent GC until _release_pinned is called
+    buf = io.BytesIO()
+    ForkingPickler(buf, 2).dump(captures)
+    return buf.getvalue()
+
+
+def _release_pinned(model: nn.Module) -> None:
+    """Release worker-side pinned activations after main process is done."""
+    global _CUDA_IPC_PINNED
+    _CUDA_IPC_PINNED = {}
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +498,7 @@ class HookedVLLMModel:
         self,
         model_name: str,
         tokenizer: PreTrainedTokenizerBase,
+        dtype: torch.dtype = torch.bfloat16,
         **llm_kwargs: Any,
     ) -> None:
         if LLM is None:
@@ -440,6 +511,8 @@ class HookedVLLMModel:
         # VLLM_ACTIVATION_CAPTURE_MODE=1 (set at module load above) ensures
         # vLLM allocates only the minimal KV cache needed for one batch.
         llm_kwargs.setdefault("enforce_eager", True)
+        dtype_str = _DTYPE_TO_STR.get(dtype, "bfloat16")
+        llm_kwargs.setdefault("dtype", dtype_str)
         self.llm = LLM(model_name, **llm_kwargs)
 
         arch: str = self.llm.apply_model(_get_arch_name)[0]
@@ -449,6 +522,8 @@ class HookedVLLMModel:
                 f"Supported: {sorted(ARCH_CONFIGS)}"
             )
         self._arch = arch
+        self._tp: int = llm_kwargs.get("tensor_parallel_size", 1)
+        self.dtype = dtype
         # ActivationsStore calls _get_model_device(model) which falls back to
         # next(model.parameters()).device.  vLLM always runs on CUDA so we
         # expose a device property to satisfy that check without needing
@@ -490,34 +565,55 @@ class HookedVLLMModel:
             path = path_tpl if layer is None else path_tpl.format(layer=layer)
             hook_specs.append((hook_name, path, extractor, is_pre, gather_fn))
 
-        # Register hooks inside the worker process(es).
-        self.llm.apply_model(
-            partial(
-                _register_hooks,
-                hook_specs=hook_specs,
-                total_tokens=total_tokens,
-                stop_at_layer=stop_at_layer,
-            )
+        prompts = [{"prompt_token_ids": batch_tokens[i].tolist()} for i in range(B)]
+        register = partial(
+            _register_hooks,
+            hook_specs=hook_specs,
+            total_tokens=total_tokens,
+            stop_at_layer=stop_at_layer,
         )
 
-        # Run inference.  max_tokens=1 keeps decode overhead minimal.
-        prompts = [{"prompt_token_ids": batch_tokens[i].tolist()} for i in range(B)]
-        try:
-            self.llm.generate(prompts, SamplingParams(max_tokens=1), use_tqdm=False)
-        finally:
-            results = self.llm.apply_model(_collect_and_cleanup)
+        if self._tp == 1:
+            # TP=1: UniProcExecutor calls apply_model in-process; Python objects
+            # are returned directly — zero serialisation, zero PCIe transfer.
+            self.llm.apply_model(register)
+            try:
+                self.llm.generate(prompts, SamplingParams(max_tokens=1), use_tqdm=False)
+            finally:
+                results = self.llm.apply_model(_collect_and_cleanup)
 
-        # Build per-hook activations.
-        # - gather_fn=None: post-allreduce; rank-0's capture is already full.
-        # - gather_fn callable: sharded; call gather_fn(shards) to reconstruct.
-        activations: dict[str, torch.Tensor] = {}
-        for hook_name, _path, _extractor, _is_pre, gather_fn in hook_specs:
-            if gather_fn is None or len(results) == 1:
+            activations: dict[str, torch.Tensor] = {}
+            for hook_name, _path, _extractor, _is_pre, gather_fn in hook_specs:
                 raw = results[0][hook_name]
-            else:
-                shards = [r[hook_name] for r in results if hook_name in r]
-                raw = gather_fn(shards)
-            activations[hook_name] = raw[:total_tokens].view(B, S, -1)
+                activations[hook_name] = raw[:total_tokens].view(B, S, -1)
+        else:
+            # TP>1: MultiprocExecutor uses ZMQ to transfer apply_model returns.
+            # Serialising large CUDA tensors as CPU bytes is ~800 ms for 128 MB.
+            # Instead, _collect_and_pin uses ForkingPickler to create CUDA IPC
+            # handle bytes (~64 B per tensor, μs over ZMQ).  Main process
+            # reconstructs zero-copy CUDA tensors via pickle.loads, then calls
+            # _release_pinned so the worker can free its GPU reference.
+            self.llm.apply_model(register)
+            try:
+                self.llm.generate(prompts, SamplingParams(max_tokens=1), use_tqdm=False)
+            finally:
+                ipc_bytes_per_rank: list[bytes] = self.llm.apply_model(_collect_and_pin)
+
+            try:
+                all_caps: list[dict[str, torch.Tensor]] = [
+                    pickle.loads(b) for b in ipc_bytes_per_rank
+                ]
+                activations = {}
+                for hook_name, _path, _extractor, _is_pre, gather_fn in hook_specs:
+                    if gather_fn is None:
+                        raw = all_caps[0][hook_name]
+                    else:
+                        shards = [c[hook_name] for c in all_caps if hook_name in c]
+                        raw = gather_fn(shards)
+                    activations[hook_name] = raw[:total_tokens].view(B, S, -1)
+            finally:
+                self.llm.apply_model(_release_pinned)
+
         return None, activations
 
     def to_tokens(

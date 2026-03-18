@@ -368,13 +368,11 @@ class ActivationsStore:
         # We assume that all necessary BOS/EOS/SEP tokens have been added during pretokenization.
         if self.is_dataset_tokenized:
             for row in self._iterate_raw_dataset():
-                yield torch.tensor(
-                    row[
-                        : self.context_size
-                    ],  # If self.context_size = None, this line simply returns the whole row
-                    dtype=torch.long,
-                    device=self.device,
-                    requires_grad=False,
+                yield (
+                    row[: self.context_size]  # If self.context_size = None, this line simply returns the whole row
+                    .detach()
+                    .clone()
+                    .to(dtype=torch.long, device=self.device)
                 )
         # If the dataset isn't tokenized, we'll tokenize, concat, and batch on the fly
         else:

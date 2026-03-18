@@ -127,7 +127,7 @@ def _train_all_hooks(
             model_path, local_files_only=True, use_fast=True
         )
         hf_model = AutoModelForCausalLM.from_pretrained(
-            model_path, dtype=torch.bfloat16, local_files_only=True
+            model_path, torch_dtype=torch.bfloat16, local_files_only=True
         )
         model = HookedTransformer.from_pretrained_no_processing(
             hooked_model_name, hf_model=hf_model, tokenizer=tokenizer,

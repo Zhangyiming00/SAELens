@@ -131,7 +131,7 @@ def run_training(args: argparse.Namespace) -> None:
             args.model_path, local_files_only=True, use_fast=True
         )
         hf_model = AutoModelForCausalLM.from_pretrained(
-            args.model_path, dtype=torch.bfloat16, local_files_only=True
+            args.model_path, torch_dtype=torch.bfloat16, local_files_only=True
         )
         model = HookedTransformer.from_pretrained_no_processing(
             args.hooked_model_name, hf_model=hf_model, tokenizer=tokenizer,
