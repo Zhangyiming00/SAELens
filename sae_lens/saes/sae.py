@@ -502,6 +502,24 @@ class SAE(HookedRootModule, Generic[T_SAE_CONFIG], ABC):
     def process_state_dict_for_loading(self, state_dict: dict[str, Any]) -> None:
         pass
 
+    # overwrite this in subclasses to modify named optimizer state in-place
+    # before saving or after loading.
+    def process_named_optimizer_state_for_saving(
+        self, optimizer_state: dict[str, dict[str, Any]]
+    ) -> None:
+        pass
+
+    def process_named_optimizer_state_for_loading(
+        self, optimizer_state: dict[str, dict[str, Any]]
+    ) -> None:
+        pass
+
+    def sync_tensor_parallel_gradients(self) -> None:
+        pass
+
+    def clip_grad_norm_(self, max_norm: float) -> torch.Tensor:
+        return torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm)
+
     @torch.no_grad()
     def fold_W_dec_norm(self):
         """Fold decoder norms into encoder."""

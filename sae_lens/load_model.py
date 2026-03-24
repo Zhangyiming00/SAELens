@@ -65,6 +65,65 @@ def load_model(
     raise ValueError(f"Unknown model class: {model_class_name}")
 
 
+class TokenizerOnlyModel:
+    """Minimal tokenizer-backed model interface for non-vLLM ranks."""
+
+    tokenizer: PreTrainedTokenizerBase
+    device: torch.device
+
+    def __init__(
+        self, tokenizer: PreTrainedTokenizerBase, device: str | torch.device
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.device = torch.device(device)
+
+    def to_tokens(
+        self,
+        input: str | list[str],
+        prepend_bos: bool | None = USE_DEFAULT_VALUE,
+        padding_side: Literal["left", "right"] | None = USE_DEFAULT_VALUE,
+        move_to_device: bool = True,
+        truncate: bool = True,
+    ) -> torch.Tensor:
+        if prepend_bos is not False:
+            raise ValueError(
+                "Only works with prepend_bos=False, to match ActivationsStore usage"
+            )
+
+        if padding_side is not None:
+            raise ValueError(
+                "Only works with padding_side=None, to match ActivationsStore usage"
+            )
+
+        if truncate is not False:
+            raise ValueError(
+                "Only works with truncate=False, to match ActivationsStore usage"
+            )
+
+        if move_to_device is not False:
+            raise ValueError(
+                "Only works with move_to_device=False, to match ActivationsStore usage"
+            )
+
+        tokens = self.tokenizer(
+            input,
+            return_tensors="pt",
+            truncation=False,
+            max_length=None,
+        )["input_ids"]
+        if hasattr(self.tokenizer, "add_bos_token") and self.tokenizer.add_bos_token:
+            tokens = get_tokens_with_bos_removed(self.tokenizer, tokens)  # type: ignore[arg-type]
+        return tokens  # type: ignore[return-value]
+
+
+def load_tokenizer_only_model(
+    model_name: str,
+    device: str | torch.device,
+) -> TokenizerOnlyModel:
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    return TokenizerOnlyModel(tokenizer, device)
+
+
 class HookedProxyLM(HookedRootModule):
     """
     A HookedRootModule that wraps a Huggingface AutoModelForCausalLM.

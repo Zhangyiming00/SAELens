@@ -1,9 +1,14 @@
 import contextlib
+import json
 import math
+import os
+import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Generic, Protocol
 
 import torch
+import torch.distributed as dist
 import wandb
 from safetensors.torch import save_file
 from torch.optim import Adam
@@ -13,7 +18,9 @@ from sae_lens import __version__
 from sae_lens.config import SAETrainerConfig
 from sae_lens.constants import (
     ACTIVATION_SCALER_CFG_FILENAME,
+    MSE_HISTORY_FILENAME,
     SPARSITY_FILENAME,
+    TIMING_HISTORY_FILENAME,
     TRAINER_STATE_FILENAME,
 )
 from sae_lens.saes.sae import (
@@ -28,6 +35,19 @@ from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.optim import CoefficientScheduler, get_lr_scheduler
 from sae_lens.training.types import DataProvider
 from sae_lens.util import path_or_tmp_dir
+
+
+def _debug_prefix_tp(msg: str) -> None:
+    if os.environ.get("SAELENS_DEBUG_PREFIX_TP") != "1":
+        return
+    if dist.is_initialized():
+        rank = dist.get_rank()
+    else:
+        rank = -1
+    line = f"[prefix-debug rank{rank}] {msg}\n"
+    with open(f"/tmp/saelens_debug_rank{rank}.log", "a") as f:
+        f.write(line)
+    print(line, end="", flush=True)
 
 
 def _log_feature_sparsity(
@@ -70,6 +90,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         data_provider: DataProvider,
         evaluator: Evaluator[T_TRAINING_SAE] | None = None,
         save_checkpoint_fn: SaveCheckpointFn | None = None,
+        dp_group: dist.ProcessGroup | None = None,
     ) -> None:
         self.sae = sae
         self.data_provider = data_provider
@@ -77,12 +98,28 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self.activation_scaler = ActivationScaler()
         self.save_checkpoint_fn = save_checkpoint_fn
         self.cfg = cfg
+        self.dp_group = dp_group
 
         self.n_training_steps: int = 0
         self.n_training_samples: int = 0
         self.started_fine_tuning: bool = False
+        self.mse_history_path: Path | None = None
+        self.timing_history_path: Path | None = None
 
         _update_sae_lens_training_version(self.sae)
+
+        if self._should_write_training_metrics():
+            assert self.cfg.output_path is not None
+            output_path = Path(self.cfg.output_path)
+            output_path.mkdir(exist_ok=True, parents=True)
+            self.mse_history_path = output_path / MSE_HISTORY_FILENAME
+            self.mse_history_path.write_text("")
+        if self._should_write_timing_metrics():
+            assert self.cfg.output_path is not None
+            output_path = Path(self.cfg.output_path)
+            output_path.mkdir(exist_ok=True, parents=True)
+            self.timing_history_path = output_path / TIMING_HISTORY_FILENAME
+            self.timing_history_path.write_text("")
 
         self.checkpoint_thresholds = []
         if self.cfg.n_checkpoints > 0:
@@ -170,16 +207,32 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         # Train loop
         while self.n_training_samples < self.cfg.total_training_samples:
             # Do a training step.
+            if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
+                _debug_prefix_tp(
+                    f"trainer next() start samples={self.n_training_samples}"
+                )
+            self._maybe_synchronize_timing()
+            vllm_t0 = time.perf_counter()
             batch = next(self.data_provider).to(self.sae.device)
+            self._maybe_synchronize_timing()
+            vllm_time_s = time.perf_counter() - vllm_t0
+            if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
+                _debug_prefix_tp(f"trainer next() done batch={tuple(batch.shape)}")
             self.n_training_samples += batch.shape[0]
             scaled_batch = self.activation_scaler(batch)
 
+            self._maybe_synchronize_timing()
+            sae_t0 = time.perf_counter()
             step_output = self._train_step(sae=self.sae, sae_in=scaled_batch)
+            self._maybe_synchronize_timing()
+            sae_time_s = time.perf_counter() - sae_t0
 
             if self.cfg.logger.log_to_wandb:
                 self._log_train_step(step_output)
                 self._run_and_log_evals()
 
+            self._record_mse_if_needed(step_output)
+            self._record_timing_if_needed(vllm_time_s, sae_time_s)
             self._checkpoint_if_needed()
             self.n_training_steps += 1
             self._update_pbar(step_output, pbar)
@@ -202,6 +255,13 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         checkpoint_name: str,
         wandb_aliases: list[str] | None = None,
     ) -> None:
+        # With TP, all ranks in DP replica 0 must participate in the save collectives,
+        # but only TP rank 0 writes files. Other DP replicas return early.
+        tp_group = getattr(self.sae, "_tp_group", None)
+        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+        dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
+        if dp_rank != 0:
+            return
         checkpoint_path = None
         if self.cfg.checkpoint_path is not None or self.cfg.logger.log_to_wandb:
             with path_or_tmp_dir(self.cfg.checkpoint_path) as base_checkpoint_path:
@@ -215,7 +275,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
                 self.save_trainer_state(checkpoint_path)
 
-                if self.cfg.logger.log_to_wandb:
+                if self.cfg.logger.log_to_wandb and tp_rank == 0:
                     self.cfg.logger.log(
                         self,
                         weights_path,
@@ -224,7 +284,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                         wandb_aliases=wandb_aliases,
                     )
 
-        if self.save_checkpoint_fn is not None:
+        if self.save_checkpoint_fn is not None and tp_rank == 0:
             self.save_checkpoint_fn(checkpoint_path=checkpoint_path)
 
     def save_trainer_state(self, checkpoint_path: Path) -> None:
@@ -233,9 +293,15 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             name: scheduler.state_dict()
             for name, scheduler in self.coefficient_schedulers.items()
         }
+        optimizer_state_by_name = self._build_named_optimizer_state_for_save()
+        tp_group = getattr(self.sae, "_tp_group", None)
+        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+        if tp_rank != 0:
+            return
         torch.save(
             {
                 "optimizer": self.optimizer.state_dict(),
+                "optimizer_by_name": optimizer_state_by_name,
                 "lr_scheduler": self.lr_scheduler.state_dict(),
                 "n_training_samples": self.n_training_samples,
                 "n_training_steps": self.n_training_steps,
@@ -254,7 +320,10 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         checkpoint_path = Path(checkpoint_path)
         self.activation_scaler.load(checkpoint_path / ACTIVATION_SCALER_CFG_FILENAME)
         state_dict = torch.load(checkpoint_path / TRAINER_STATE_FILENAME)
-        self.optimizer.load_state_dict(state_dict["optimizer"])
+        if "optimizer_by_name" in state_dict:
+            self._load_named_optimizer_state(state_dict["optimizer_by_name"])
+        else:
+            self.optimizer.load_state_dict(state_dict["optimizer"])
         self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
         self.n_training_samples = state_dict["n_training_samples"]
         self.n_training_steps = state_dict["n_training_steps"]
@@ -265,12 +334,50 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         for name, scheduler_state_dict in state_dict["coefficient_schedulers"].items():
             self.coefficient_schedulers[name].load_state_dict(scheduler_state_dict)
 
+    def _build_named_optimizer_state_for_save(self) -> dict[str, dict[str, Any]]:
+        optimizer_state_by_name: dict[str, dict[str, Any]] = {}
+        for name, param in self.sae.named_parameters():
+            state = self.optimizer.state.get(param)
+            if not state:
+                continue
+            optimizer_state_by_name[name] = {
+                key: value.detach().clone() if torch.is_tensor(value) else deepcopy(value)
+                for key, value in state.items()
+            }
+        self.sae.process_named_optimizer_state_for_saving(optimizer_state_by_name)
+        return optimizer_state_by_name
+
+    def _load_named_optimizer_state(
+        self, optimizer_state_by_name: dict[str, dict[str, Any]]
+    ) -> None:
+        optimizer_state_by_name = deepcopy(optimizer_state_by_name)
+        self.sae.process_named_optimizer_state_for_loading(optimizer_state_by_name)
+        self.optimizer.state.clear()
+
+        named_params = dict(self.sae.named_parameters())
+        for name, state in optimizer_state_by_name.items():
+            if name not in named_params:
+                continue
+            param = named_params[name]
+            loaded_state: dict[str, Any] = {}
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    target_dtype = (
+                        param.dtype if value.is_floating_point() and value.ndim > 0 else value.dtype
+                    )
+                    loaded_state[key] = value.to(device=param.device, dtype=target_dtype)
+                else:
+                    loaded_state[key] = deepcopy(value)
+            self.optimizer.state[param] = loaded_state
+
     def _train_step(
         self,
         sae: T_TRAINING_SAE,
         sae_in: torch.Tensor,
     ) -> TrainStepOutput:
         sae.train()
+        if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
+            _debug_prefix_tp("train_step forward start")
 
         # log and then reset the feature sparsity every feature_sampling_window steps
         if (self.n_training_steps + 1) % self.cfg.feature_sampling_window == 0:
@@ -302,18 +409,34 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 self.n_forward_passes_since_fired[did_fire] = 0
                 self.act_freq_scores += firing_feats.sum(0)
                 self.n_frac_active_samples += self.cfg.train_batch_size_samples
+        if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
+            _debug_prefix_tp("train_step forward done")
 
         # Grad scaler will rescale gradients if autocast is enabled
         self.grad_scaler.scale(
             train_step_output.loss
         ).backward()  # loss.backward() if not autocasting
+        if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
+            _debug_prefix_tp("backward done")
         self.grad_scaler.unscale_(self.optimizer)  # needed to clip correctly
+        # AllReduce gradients across DP group for consistent parameter updates.
+        if self.dp_group is not None:
+            dp_size = dist.get_world_size(self.dp_group)
+            for param in self.sae.parameters():
+                if param.grad is not None:
+                    dist.all_reduce(param.grad, group=self.dp_group)
+                    param.grad /= dp_size
+        sae.sync_tensor_parallel_gradients()
+        if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
+            _debug_prefix_tp("grad sync done")
         # TODO: Work out if grad norm clipping should be in config / how to test it.
-        torch.nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
+        sae.clip_grad_norm_(1.0)
         self.grad_scaler.step(
             self.optimizer
         )  # just ctx.optimizer.step() if not autocasting
         self.grad_scaler.update()
+        if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
+            _debug_prefix_tp("optimizer step done")
 
         self.optimizer.zero_grad()
         self.lr_scheduler.step()
@@ -327,6 +450,77 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             self.cfg.logger.log_to_wandb
             and (self.n_training_steps + 1) % self.cfg.logger.wandb_log_frequency == 0
         )
+
+    def _should_write_training_metrics(self) -> bool:
+        if self.cfg.output_path is None or self.cfg.save_mse_every_n_steps <= 0:
+            return False
+        tp_group = getattr(self.sae, "_tp_group", None)
+        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+        dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
+        return tp_rank == 0 and dp_rank == 0
+
+    def _should_write_timing_metrics(self) -> bool:
+        if self.cfg.output_path is None or self.cfg.save_timing_every_n_steps <= 0:
+            return False
+        tp_group = getattr(self.sae, "_tp_group", None)
+        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+        dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
+        return tp_rank == 0 and dp_rank == 0
+
+    def _maybe_synchronize_timing(self) -> None:
+        if not self.cfg.synchronize_timing:
+            return
+        if not self.sae.device.type.startswith("cuda"):
+            return
+        torch.cuda.synchronize(self.sae.device)
+
+    @torch.no_grad()
+    def _record_mse_if_needed(self, step_output: TrainStepOutput) -> None:
+        if self.mse_history_path is None:
+            return
+        if (self.n_training_steps + 1) % self.cfg.save_mse_every_n_steps != 0:
+            return
+
+        mse_loss = step_output.losses.get("mse_loss")
+        if mse_loss is None:
+            mse_loss = (step_output.sae_out - step_output.sae_in).pow(2).mean()
+
+        record = {
+            "step": self.n_training_steps + 1,
+            "n_training_samples": self.n_training_samples,
+            "mse_loss": _unwrap_item(mse_loss),
+            "overall_loss": _unwrap_item(step_output.loss),
+        }
+        if "auxiliary_reconstruction_loss" in step_output.losses:
+            record["auxiliary_reconstruction_loss"] = _unwrap_item(
+                step_output.losses["auxiliary_reconstruction_loss"]
+            )
+
+        with open(self.mse_history_path, "a") as f:
+            json.dump(record, f)
+            f.write("\n")
+
+    @torch.no_grad()
+    def _record_timing_if_needed(
+        self,
+        vllm_time_s: float,
+        sae_time_s: float,
+    ) -> None:
+        if self.timing_history_path is None:
+            return
+        if (self.n_training_steps + 1) % self.cfg.save_timing_every_n_steps != 0:
+            return
+
+        record = {
+            "step": self.n_training_steps + 1,
+            "n_training_samples": self.n_training_samples,
+            "vllm_time_s": vllm_time_s,
+            "sae_time_s": sae_time_s,
+            "step_time_s": vllm_time_s + sae_time_s,
+        }
+        with open(self.timing_history_path, "a") as f:
+            json.dump(record, f)
+            f.write("\n")
 
     @torch.no_grad()
     def _log_train_step(self, step_output: TrainStepOutput):

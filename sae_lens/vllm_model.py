@@ -49,6 +49,7 @@ from multiprocessing.reduction import ForkingPickler
 from typing import Any, Callable
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from transformer_lens.utils import USE_DEFAULT_VALUE, get_tokens_with_bos_removed
 from transformers import PreTrainedTokenizerBase
@@ -70,6 +71,24 @@ try:
 except ImportError:
     LLM = None  # type: ignore[assignment,misc]
     SamplingParams = None  # type: ignore[assignment,misc]
+
+
+def _get_vllm_tp_device_group() -> dist.ProcessGroup | None:
+    """Return vLLM's tensor-parallel device group when available."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group as get_vllm_tp_group
+    except ImportError:
+        return None
+
+    try:
+        return get_vllm_tp_group().device_group
+    except AssertionError:
+        return None
+
+
+def _in_torchrun() -> bool:
+    """Return True if this process was launched by torchrun / torch.distributed.launch."""
+    return all(k in os.environ for k in ("RANK", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"))
 
 _DTYPE_TO_STR: dict[torch.dtype, str] = {
     torch.bfloat16: "bfloat16",
@@ -513,7 +532,24 @@ class HookedVLLMModel:
         llm_kwargs.setdefault("enforce_eager", True)
         dtype_str = _DTYPE_TO_STR.get(dtype, "bfloat16")
         llm_kwargs.setdefault("dtype", dtype_str)
+
+        # When launched under torchrun (RANK/LOCAL_RANK/MASTER_ADDR/MASTER_PORT
+        # are in the environment), vLLM must NOT spawn its own TP worker
+        # processes — that creates nested multiprocessing which deadlocks
+        # waiting for inner workers to become ready.  Instead, use
+        # "external_launcher": each torchrun rank creates its own LLM
+        # instance backed by ExecutorWithExternalLauncher (a UniProcExecutor)
+        # that runs the model inline.  All torchrun ranks call generate()
+        # simultaneously and TP communication happens via the already-
+        # initialised torch.distributed process group.
+        tp = llm_kwargs.get("tensor_parallel_size", 1)
+        if tp > 1 and _in_torchrun():
+            llm_kwargs.setdefault("distributed_executor_backend", "external_launcher")
+
         self.llm = LLM(model_name, **llm_kwargs)
+        self._is_external_launcher = (
+            llm_kwargs.get("distributed_executor_backend") == "external_launcher"
+        )
 
         arch: str = self.llm.apply_model(_get_arch_name)[0]
         if arch not in ARCH_CONFIGS:
@@ -573,18 +609,34 @@ class HookedVLLMModel:
             stop_at_layer=stop_at_layer,
         )
 
-        if self._tp == 1:
-            # TP=1: UniProcExecutor calls apply_model in-process; Python objects
-            # are returned directly — zero serialisation, zero PCIe transfer.
+        if self._tp == 1 or self._is_external_launcher:
+            # UniProcExecutor (tp=1) or external_launcher: apply_model runs
+            # inline in the current process; results[0] is the local captures.
+            #
+            # For external_launcher with TP>1 all torchrun ranks call
+            # generate() simultaneously — TP communication happens via NCCL.
+            # Post-allreduce hooks already hold the full tensor on every rank.
+            # Sharded hooks need dist.all_gather across the TP ranks.
             self.llm.apply_model(register)
             try:
                 self.llm.generate(prompts, SamplingParams(max_tokens=1), use_tqdm=False)
             finally:
                 results = self.llm.apply_model(_collect_and_cleanup)
 
+            local_caps = results[0]
             activations: dict[str, torch.Tensor] = {}
             for hook_name, _path, _extractor, _is_pre, gather_fn in hook_specs:
-                raw = results[0][hook_name]
+                raw = local_caps[hook_name]
+                if gather_fn is not None and self._is_external_launcher and dist.is_initialized():
+                    tp_group = _get_vllm_tp_device_group()
+                    if tp_group is None:
+                        raise RuntimeError(
+                            "vLLM TP group is not initialized under external_launcher"
+                        )
+                    world_size = dist.get_world_size(tp_group)
+                    shards = [torch.zeros_like(raw) for _ in range(world_size)]
+                    dist.all_gather(shards, raw.contiguous(), group=tp_group)
+                    raw = gather_fn(shards)
                 activations[hook_name] = raw[:total_tokens].view(B, S, -1)
         else:
             # TP>1: MultiprocExecutor uses ZMQ to transfer apply_model returns.

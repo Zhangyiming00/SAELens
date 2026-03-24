@@ -1,4 +1,5 @@
 import json
+import os
 import signal
 import sys
 from collections.abc import Sequence
@@ -7,6 +8,7 @@ from pathlib import Path
 from typing import Any, Generic
 
 import torch
+import torch.distributed as dist
 import wandb
 from safetensors.torch import save_file
 from simple_parsing import ArgumentParser
@@ -19,8 +21,17 @@ from sae_lens.constants import (
     RUNNER_CFG_FILENAME,
     SPARSITY_FILENAME,
 )
+from sae_lens.distributed import (
+    get_dp_group,
+    get_tp_group,
+    get_vllm_world_ranks,
+    init_distributed,
+    is_sae_active,
+    is_vllm_active,
+    preinit_vllm_distributed,
+)
 from sae_lens.evals import EvalConfig, run_evals
-from sae_lens.load_model import load_model
+from sae_lens.load_model import load_model, load_tokenizer_only_model
 from sae_lens.registry import SAE_TRAINING_CLASS_REGISTRY
 from sae_lens.saes.sae import (
     T_TRAINING_SAE,
@@ -32,6 +43,7 @@ from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.activations_store import ActivationsStore
 from sae_lens.training.sae_trainer import SAETrainer
 from sae_lens.training.types import DataProvider
+from sae_lens.util import temporary_seed
 
 
 class InterruptedException(Exception):
@@ -102,7 +114,7 @@ class LanguageModelSAETrainingRunner:
 
     cfg: LanguageModelSAERunnerConfig[Any]
     model: HookedRootModule
-    sae: TrainingSAE[Any]
+    sae: TrainingSAE[Any] | None
     activations_store: ActivationsStore
 
     def __init__(
@@ -112,6 +124,11 @@ class LanguageModelSAETrainingRunner:
         override_model: HookedRootModule | None = None,
         override_sae: TrainingSAE[Any] | None = None,
         resume_from_checkpoint: Path | str | None = None,
+        tp_size: int = 1,
+        shared_tp_size: int | None = None,
+        vllm_tp_size: int | None = None,
+        sae_tp_size: int | None = None,
+        dp_size: int = 1,
     ):
         if override_dataset is not None:
             logger.warning(
@@ -123,14 +140,108 @@ class LanguageModelSAETrainingRunner:
             )
 
         self.cfg = cfg
+        self.dp_size = dp_size
+        inferred_cfg_vllm_tp_size = int(
+            self.cfg.model_from_pretrained_kwargs.get("tensor_parallel_size", 1)
+        )
+        self.shared_tp_size = shared_tp_size
+        if (
+            self.shared_tp_size is None
+            and sae_tp_size is None
+            and vllm_tp_size is None
+            and tp_size > 1
+        ):
+            # Backward-compatible shared-TP semantics.
+            self.shared_tp_size = tp_size
+
+        if self.shared_tp_size is not None:
+            self.sae_tp_size = self.shared_tp_size
+            self.vllm_tp_size = self.shared_tp_size
+            if (
+                "tensor_parallel_size" in self.cfg.model_from_pretrained_kwargs
+                and inferred_cfg_vllm_tp_size != self.shared_tp_size
+            ):
+                raise ValueError(
+                    "shared_tp_size does not match "
+                    "cfg.model_from_pretrained_kwargs['tensor_parallel_size']"
+                )
+        else:
+            self.sae_tp_size = tp_size if sae_tp_size is None else sae_tp_size
+            self.vllm_tp_size = (
+                inferred_cfg_vllm_tp_size if vllm_tp_size is None else vllm_tp_size
+            )
+            if (
+                "tensor_parallel_size" in self.cfg.model_from_pretrained_kwargs
+                and inferred_cfg_vllm_tp_size != self.vllm_tp_size
+            ):
+                raise ValueError(
+                    "vllm_tp_size does not match "
+                    "cfg.model_from_pretrained_kwargs['tensor_parallel_size']"
+                )
+
+        # Initialize distributed process groups for SAE TP/DP.
+        # With torchrun, dist.init_process_group is already called; skip it.
+        if self.vllm_tp_size > 1 or self.sae_tp_size > 1 or dp_size > 1:
+            if not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
+            if self.shared_tp_size is not None:
+                init_distributed(
+                    shared_tp_size=self.shared_tp_size,
+                    dp_size=dp_size,
+                )
+            else:
+                init_distributed(
+                    sae_tp_size=self.sae_tp_size,
+                    vllm_tp_size=self.vllm_tp_size,
+                    dp_size=dp_size,
+                )
+
+        self.sae_active = is_sae_active() if dist.is_initialized() else True
+        self.vllm_active = is_vllm_active() if dist.is_initialized() else True
+        # uses_split_roles is a system-wide property: some ranks are vLLM-only
+        # or SAE-only.  It is True whenever the two TP sizes differ.
+        self.uses_split_roles = self.vllm_tp_size != self.sae_tp_size
+
+        if dist.is_initialized():
+            os.environ["SAELENS_VLLM_WORLD_RANKS"] = ",".join(
+                str(rank) for rank in get_vllm_world_ranks()
+            )
+
+        # When sae_tp > vllm_tp, some ranks will never create an LLM() but
+        # PyTorch requires every rank to participate in dist.new_group() calls.
+        # Pre-initialize vLLM parallel state on ALL ranks so LLM() construction
+        # on vLLM-active ranks skips group creation (finding it already done).
+        if dist.is_initialized() and self.sae_tp_size > self.vllm_tp_size:
+            preinit_vllm_distributed(get_vllm_world_ranks(), self.vllm_tp_size)
+
+        if self.uses_split_roles:
+            if self.cfg.logger.log_to_wandb:
+                raise ValueError(
+                    "Prefix-overlap training currently requires log_to_wandb=False."
+                )
+            if self.cfg.n_eval_batches > 0:
+                raise ValueError(
+                    "Prefix-overlap training currently requires n_eval_batches=0."
+                )
+            if self.cfg.sae.normalize_activations == "expected_average_only_in":
+                raise ValueError(
+                    "Prefix-overlap training does not yet support "
+                    "normalize_activations='expected_average_only_in'."
+                )
 
         if override_model is None:
-            self.model = load_model(
-                self.cfg.model_class_name,
-                self.cfg.model_name,
-                device=self.cfg.device,
-                model_from_pretrained_kwargs=self.cfg.model_from_pretrained_kwargs,
-            )
+            if self.vllm_active:
+                self.model = load_model(
+                    self.cfg.model_class_name,
+                    self.cfg.model_name,
+                    device=self.cfg.device,
+                    model_from_pretrained_kwargs=self.cfg.model_from_pretrained_kwargs,
+                )
+            else:
+                self.model = load_tokenizer_only_model(
+                    self.cfg.model_name,
+                    self.cfg.device,
+                )
         else:
             self.model = override_model
 
@@ -140,26 +251,46 @@ class LanguageModelSAETrainingRunner:
             override_dataset=override_dataset,
         )
 
-        if override_sae is None:
-            if self.cfg.from_pretrained_path is not None:
-                self.sae = TrainingSAE.load_from_disk(
-                    self.cfg.from_pretrained_path, self.cfg.device
-                )
+        if self.sae_active:
+            if override_sae is None:
+                with temporary_seed(self.cfg.seed):
+                    if self.cfg.from_pretrained_path is not None:
+                        self.sae = TrainingSAE.load_from_disk(
+                            self.cfg.from_pretrained_path, self.cfg.device
+                        )
+                    else:
+                        self.sae = TrainingSAE.from_dict(
+                            TrainingSAEConfig.from_dict(
+                                self.cfg.get_training_sae_cfg_dict(),
+                            ).to_dict()
+                        )
             else:
-                self.sae = TrainingSAE.from_dict(
-                    TrainingSAEConfig.from_dict(
-                        self.cfg.get_training_sae_cfg_dict(),
-                    ).to_dict()
-                )
+                self.sae = override_sae
+            self.sae.to(self.cfg.device)
         else:
-            self.sae = override_sae
+            self.sae = None
 
-        self.sae.to(self.cfg.device)
+        # Shard SAE weights across TP ranks if applicable.
+        if self.sae is not None and self.sae_tp_size > 1:
+            tp_group = get_tp_group()
+            if tp_group is not None and hasattr(self.sae, "shard_weights"):
+                self.sae.shard_weights(tp_group)
 
     def run(self):
         """
         Run the training of the SAE.
         """
+        if not self.sae_active:
+            if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
+                rank = dist.get_rank() if dist.is_initialized() else -1
+                line = f"[prefix-debug rank{rank}] entering helper loop\n"
+                with open(f"/tmp/saelens_debug_rank{rank}.log", "a") as f:
+                    f.write(line)
+                print(line, end="", flush=True)
+            self._run_vllm_helper_loop()
+            return None
+
+        assert self.sae is not None
         self._set_sae_metadata()
         if self.cfg.logger.log_to_wandb:
             wandb.init(
@@ -178,12 +309,18 @@ class LanguageModelSAETrainingRunner:
             model_kwargs=self.cfg.model_kwargs,
         )
 
+        sae_dp_group = get_dp_group()
         trainer = SAETrainer(
             sae=self.sae,
             data_provider=self.activations_store,
             evaluator=evaluator,
             save_checkpoint_fn=self.save_checkpoint,
             cfg=self.cfg.to_sae_trainer_config(),
+            dp_group=(
+                sae_dp_group
+                if sae_dp_group is not None and dist.get_world_size(sae_dp_group) > 1
+                else None
+            ),
         )
 
         if self.cfg.resume_from_checkpoint is not None:
@@ -207,16 +344,51 @@ class LanguageModelSAETrainingRunner:
 
         return sae
 
+    def _run_vllm_helper_loop(self) -> None:
+        n_training_samples = 0
+        while n_training_samples < self.cfg.total_training_tokens:
+            if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
+                rank = dist.get_rank() if dist.is_initialized() else -1
+                line = (
+                    f"[prefix-debug rank{rank}] helper next() start samples={n_training_samples}\n"
+                )
+                with open(f"/tmp/saelens_debug_rank{rank}.log", "a") as f:
+                    f.write(line)
+                print(line, end="", flush=True)
+            batch = next(self.activations_store)
+            n_training_samples += batch.shape[0]
+            if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
+                rank = dist.get_rank() if dist.is_initialized() else -1
+                line = (
+                    f"[prefix-debug rank{rank}] helper next() done samples={n_training_samples}\n"
+                )
+                with open(f"/tmp/saelens_debug_rank{rank}.log", "a") as f:
+                    f.write(line)
+                print(line, end="", flush=True)
+
     def save_final_sae(
         self,
         sae: TrainingSAE[Any],
         output_path: str,
         log_feature_sparsity: torch.Tensor | None = None,
     ):
+        tp_group = getattr(sae, "_tp_group", None)
+        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+        dp_group = get_dp_group()
+        dp_rank = (
+            dist.get_rank(dp_group)
+            if dp_group is not None and dist.get_world_size(dp_group) > 1
+            else 0
+        )
+        if dp_rank != 0:
+            return
+
         base_output_path = Path(output_path)
         base_output_path.mkdir(exist_ok=True, parents=True)
 
         weights_path, cfg_path = sae.save_inference_model(str(base_output_path))
+        if tp_rank != 0:
+            return
 
         sparsity_path = None
         if log_feature_sparsity is not None:
@@ -237,6 +409,7 @@ class LanguageModelSAETrainingRunner:
             )
 
     def _set_sae_metadata(self):
+        assert self.sae is not None
         self.sae.cfg.metadata.dataset_path = self.cfg.dataset_path
         self.sae.cfg.metadata.hook_name = self.cfg.hook_name
         self.sae.cfg.metadata.model_name = self.cfg.model_name
@@ -272,7 +445,7 @@ class LanguageModelSAETrainingRunner:
                 mode=self.cfg.llm_compilation_mode,
             )  # type: ignore
 
-        if self.cfg.compile_sae:
+        if self.cfg.compile_sae and self.sae is not None:
             backend = "aot_eager" if self.cfg.device == "mps" else "inductor"
 
             self.sae.training_forward_pass = torch.compile(  # type: ignore
@@ -309,6 +482,17 @@ class LanguageModelSAETrainingRunner:
         checkpoint_path: Path | None,
     ) -> None:
         if checkpoint_path is None:
+            return
+        sae = self.sae
+        tp_group = getattr(sae, "_tp_group", None) if sae is not None else None
+        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+        dp_group = get_dp_group()
+        dp_rank = (
+            dist.get_rank(dp_group)
+            if dp_group is not None and dist.get_world_size(dp_group) > 1
+            else 0
+        )
+        if tp_rank != 0 or dp_rank != 0:
             return
 
         self.activations_store.save_to_checkpoint(checkpoint_path)

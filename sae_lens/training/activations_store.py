@@ -9,6 +9,7 @@ from typing import Any, Literal, cast
 
 import datasets
 import torch
+import torch.distributed as dist
 from datasets import Dataset, DatasetDict, IterableDataset, load_dataset
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
@@ -25,6 +26,13 @@ from sae_lens.config import (
     LanguageModelSAERunnerConfig,
 )
 from sae_lens.constants import ACTIVATIONS_STORE_STATE_FILENAME
+from sae_lens.distributed import (
+    get_vllm_root_rank,
+    get_vllm_tp_group,
+    get_worker_cpu_group,
+    get_worker_group,
+    is_vllm_active,
+)
 from sae_lens.pretokenize_runner import get_special_token_from_cfg
 from sae_lens.saes.sae import SAE, T_SAE_CONFIG, T_TRAINING_SAE_CONFIG
 from sae_lens.tokenization_and_batching import concat_and_batch_sequences
@@ -229,16 +237,19 @@ class ActivationsStore:
         if model_kwargs is None:
             model_kwargs = {}
         self.model_kwargs = model_kwargs
-        self.dataset = (
-            load_dataset(
-                dataset,
-                split="train",
-                streaming=streaming,  # type: ignore
-                trust_remote_code=dataset_trust_remote_code,  # type: ignore
-            )
-            if isinstance(dataset, str)
-            else dataset
-        )
+        if isinstance(dataset, str):
+            dataset_path = Path(dataset)
+            if dataset_path.exists() and dataset_path.is_dir():
+                self.dataset = datasets.load_from_disk(str(dataset_path))
+            else:
+                self.dataset = load_dataset(
+                    dataset,
+                    split="train",
+                    streaming=streaming,  # type: ignore
+                    trust_remote_code=dataset_trust_remote_code,  # type: ignore
+                )
+        else:
+            self.dataset = dataset
 
         if isinstance(dataset, (Dataset, DatasetDict)):
             self.dataset = cast(Dataset | DatasetDict, self.dataset)
@@ -470,6 +481,45 @@ class ActivationsStore:
         """
         if not batch_size:
             batch_size = self.store_batch_size_prompts
+        worker_group = get_worker_group() if dist.is_initialized() else None
+        worker_cpu_group = get_worker_cpu_group() if dist.is_initialized() else None
+        if worker_group is not None and worker_cpu_group is not None:
+            src_rank = get_vllm_root_rank()
+            _debug_prefix_tp(f"get_batch_tokens start batch_size={batch_size} src={src_rank}")
+            epoch_end = torch.zeros(1, dtype=torch.int32)
+            if dist.get_rank() == src_rank:
+                try:
+                    batch_tokens = self._get_batch_tokens_local(
+                        batch_size=batch_size,
+                        raise_at_epoch_end=raise_at_epoch_end,
+                    ).cpu()
+                except StopIteration:
+                    epoch_end.fill_(1)
+                    batch_tokens = torch.empty(
+                        (batch_size, self.context_size),
+                        dtype=torch.long,
+                    )
+            else:
+                batch_tokens = torch.empty(
+                    (batch_size, self.context_size),
+                    dtype=torch.long,
+                )
+            dist.broadcast(epoch_end, src=src_rank, group=worker_cpu_group)
+            if epoch_end.item():
+                _debug_prefix_tp("get_batch_tokens epoch_end")
+                raise StopIteration
+            dist.broadcast(batch_tokens, src=src_rank, group=worker_cpu_group)
+            _debug_prefix_tp("get_batch_tokens done")
+            return batch_tokens.to(self._get_runtime_device())
+
+        return self._get_batch_tokens_local(
+            batch_size=batch_size,
+            raise_at_epoch_end=raise_at_epoch_end,
+        ).to(_get_model_device(self.model))
+
+    def _get_batch_tokens_local(
+        self, batch_size: int, raise_at_epoch_end: bool = False
+    ) -> torch.Tensor:
         sequences = []
         # the sequences iterator yields fully formed tokens of size context_size, so we just need to cat these into a batch
         for _ in range(batch_size):
@@ -483,7 +533,7 @@ class ActivationsStore:
                     )
                 sequences.append(next(self.iterable_sequences))
 
-        return torch.stack(sequences, dim=0).to(_get_model_device(self.model))
+        return torch.stack(sequences, dim=0)
 
     @torch.no_grad()
     def get_activations(self, batch_tokens: torch.Tensor):
@@ -492,10 +542,37 @@ class ActivationsStore:
 
         d_in may result from a concatenated head dimension.
         """
+        worker_group = get_worker_group() if dist.is_initialized() else None
+        worker_cpu_group = get_worker_cpu_group() if dist.is_initialized() else None
+        if worker_group is None or worker_cpu_group is None:
+            return self._get_activations_local(batch_tokens)
+
+        src_rank = get_vllm_root_rank()
+        n_context = self.training_context_size
+        if is_vllm_active():
+            _debug_prefix_tp("get_activations local run_with_cache start")
+            # Normalize to the activation-store dtype before the CPU broadcast so
+            # split-role SAE-only ranks allocate a matching receive buffer.
+            stacked_activations = self._get_activations_local(batch_tokens).to(
+                device="cpu", dtype=self.dtype
+            )
+            _debug_prefix_tp("get_activations local run_with_cache done")
+        else:
+            stacked_activations = torch.empty(
+                (batch_tokens.shape[0], n_context, self.d_in),
+                dtype=self.dtype,
+            )
+            _debug_prefix_tp("get_activations waiting for broadcast")
+        dist.broadcast(stacked_activations, src=src_rank, group=worker_cpu_group)
+        _debug_prefix_tp("get_activations broadcast done")
+        return stacked_activations.to(self.device)
+
+    def _get_activations_local(self, batch_tokens: torch.Tensor) -> torch.Tensor:
+        model_device = _get_model_device(self.model)
         with torch.autocast(
-            device_type="cuda",
+            device_type=model_device.type,
             dtype=torch.bfloat16,
-            enabled=self.autocast_lm,
+            enabled=self.autocast_lm and model_device.type != "cpu",
         ):
             layerwise_activations_cache = self.model.run_with_cache(
                 batch_tokens,
@@ -511,9 +588,37 @@ class ActivationsStore:
             :, slice(*self.seqpos_slice)
         ]
 
-        n_batches, n_context = layerwise_activations.shape[:2]
+        if (
+            dist.is_initialized()
+            and is_vllm_active()
+            and layerwise_activations.shape[-1] != self.d_in
+        ):
+            vllm_tp_group = get_vllm_tp_group()
+            if vllm_tp_group is None:
+                raise RuntimeError(
+                    "vLLM TP group is not initialized but activation gathering is required."
+                )
+            world_size = dist.get_world_size(vllm_tp_group)
+            if layerwise_activations.shape[-1] * world_size != self.d_in:
+                raise RuntimeError(
+                    "Activation width does not match SAE input width after vLLM TP gather. "
+                    f"Got local width={layerwise_activations.shape[-1]}, "
+                    f"tp_world_size={world_size}, expected d_in={self.d_in}."
+                )
+            shards = [torch.empty_like(layerwise_activations) for _ in range(world_size)]
+            dist.all_gather(
+                shards,
+                layerwise_activations.contiguous(),
+                group=vllm_tp_group,
+            )
+            layerwise_activations = torch.cat(shards, dim=-1)
 
-        stacked_activations = torch.zeros((n_batches, n_context, self.d_in))
+        n_batches, n_context = layerwise_activations.shape[:2]
+        stacked_activations = torch.zeros(
+            (n_batches, n_context, self.d_in),
+            dtype=layerwise_activations.dtype,
+            device=layerwise_activations.device,
+        )
 
         if self.hook_head_index is not None:
             stacked_activations[:, :] = layerwise_activations[
@@ -527,6 +632,11 @@ class ActivationsStore:
             stacked_activations[:, :] = layerwise_activations
 
         return stacked_activations
+
+    def _get_runtime_device(self) -> torch.device:
+        if is_vllm_active():
+            return _get_model_device(self.model)
+        return self.device
 
     def _load_raw_llm_batch_from_cached(
         self,
@@ -613,7 +723,9 @@ class ActivationsStore:
         batch_tokens = self.get_batch_tokens(raise_at_epoch_end=raise_on_epoch_end).to(
             _get_model_device(self.model)
         )
-        activations = self.get_activations(batch_tokens).to(self.device)
+        activations = self.get_activations(batch_tokens).to(
+            device=self.device, dtype=self.dtype
+        )
 
         # handle seqpos_slice, this is done for activations in get_activations
         batch_tokens = batch_tokens[:, slice(*self.seqpos_slice)]
@@ -736,6 +848,8 @@ def validate_pretokenized_dataset_tokenizer(
     """
     Helper to validate that the tokenizer used to pretokenize the dataset matches the model tokenizer.
     """
+    if Path(dataset_path).exists():
+        return
     try:
         tokenization_cfg_path = hf_hub_download(
             dataset_path, "sae_lens.json", repo_type="dataset"
@@ -782,3 +896,16 @@ def _filter_buffer_acts(
 
     mask = torch.isin(tokens, exclude_tokens)
     return activations[~mask]
+
+
+def _debug_prefix_tp(msg: str) -> None:
+    if os.environ.get("SAELENS_DEBUG_PREFIX_TP") != "1":
+        return
+    if dist.is_initialized():
+        rank = dist.get_rank()
+    else:
+        rank = -1
+    line = f"[prefix-debug rank{rank}] {msg}\n"
+    with open(f"/tmp/saelens_debug_rank{rank}.log", "a") as f:
+        f.write(line)
+    print(line, end="", flush=True)

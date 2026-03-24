@@ -204,6 +204,8 @@ docs/pretrained_saes/
 
 # SAE config cache for docs generation
 docs/.sae_config_cache/
-convergence_results/
-results/*.csv
-results/*.png
+results/
+scripts/scritps/
+scripts/tests/
+scripts/run_sae_runner_gpu.py
+*.tar.gz
