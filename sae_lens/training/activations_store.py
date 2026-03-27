@@ -7,10 +7,8 @@ from collections.abc import Generator, Iterator
 from pathlib import Path
 from typing import Any, Literal, cast
 
-import datasets
 import torch
 import torch.distributed as dist
-from datasets import Dataset, DatasetDict, IterableDataset, load_dataset
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 from requests import HTTPError
@@ -19,6 +17,8 @@ from tqdm.auto import tqdm
 from transformer_lens.hook_points import HookedRootModule
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+import datasets
+from datasets import Dataset, DatasetDict, IterableDataset, load_dataset
 from sae_lens import logger
 from sae_lens.config import (
     CacheActivationsRunnerConfig,
@@ -27,11 +27,18 @@ from sae_lens.config import (
 )
 from sae_lens.constants import ACTIVATIONS_STORE_STATE_FILENAME
 from sae_lens.distributed import (
+    get_sae_tp_group,
+    get_sae_tp_size,
+    get_vllm_dp_p2p_group,
+    get_vllm_dp_rank,
+    get_vllm_dp_size,
     get_vllm_root_rank,
     get_vllm_tp_group,
+    get_vllm_tp_size,
     get_worker_cpu_group,
     get_worker_group,
     is_vllm_active,
+    is_vllm_dp_root,
 )
 from sae_lens.pretokenize_runner import get_special_token_from_cfg
 from sae_lens.saes.sae import SAE, T_SAE_CONFIG, T_TRAINING_SAE_CONFIG
@@ -103,6 +110,8 @@ class ActivationsStore:
         cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG]
         | CacheActivationsRunnerConfig,
         override_dataset: HfDataset | None = None,
+        dataset_shard_index: int = 0,
+        dataset_shard_count: int = 1,
     ) -> ActivationsStore:
         if isinstance(cfg, CacheActivationsRunnerConfig):
             return cls.from_cache_activations(model, cfg)
@@ -157,6 +166,8 @@ class ActivationsStore:
             disable_concat_sequences=cfg.disable_concat_sequences,
             sequence_separator_token=cfg.sequence_separator_token,
             activations_mixing_fraction=cfg.activations_mixing_fraction,
+            dataset_shard_index=dataset_shard_index,
+            dataset_shard_count=dataset_shard_count,
         )
 
     @classmethod
@@ -232,6 +243,8 @@ class ActivationsStore:
         disable_concat_sequences: bool = False,
         sequence_separator_token: int | Literal["bos", "eos", "sep"] | None = "bos",
         activations_mixing_fraction: float = 0.5,
+        dataset_shard_index: int = 0,
+        dataset_shard_count: int = 1,
     ):
         self.model = model
         if model_kwargs is None:
@@ -282,6 +295,8 @@ class ActivationsStore:
             sequence_separator_token
         )
         self.activations_mixing_fraction = activations_mixing_fraction
+        self._dataset_shard_index = dataset_shard_index
+        self._dataset_shard_count = dataset_shard_count
 
         self.n_dataset_processed = 0
 
@@ -372,9 +387,28 @@ class ActivationsStore:
             yield tokens
 
     def _iterate_tokenized_sequences(self) -> Generator[torch.Tensor, None, None]:
+        """Generator which iterates over full sequence of context_size tokens.
+
+        When dataset_shard_count > 1, yields every shard_count-th sequence
+        starting at shard_index (strided sharding for vLLM DP).
         """
-        Generator which iterates over full sequence of context_size tokens
-        """
+        base_iter = self._iterate_tokenized_sequences_unsharded()
+        shard_idx = self._dataset_shard_index
+        shard_count = self._dataset_shard_count
+
+        if shard_count <= 1:
+            yield from base_iter
+            return
+
+        # Strided sharding: skip to our starting offset, then stride.
+        for i, seq in enumerate(base_iter):
+            if i % shard_count == shard_idx:
+                yield seq
+
+    def _iterate_tokenized_sequences_unsharded(
+        self,
+    ) -> Generator[torch.Tensor, None, None]:
+        """Base iterator over tokenized sequences (no sharding)."""
         # If the datset is pretokenized, we will slice the dataset to the length of the context window if needed. Otherwise, no further processing is needed.
         # We assume that all necessary BOS/EOS/SEP tokens have been added during pretokenization.
         if self.is_dataset_tokenized:
@@ -749,9 +783,151 @@ class ActivationsStore:
         )
 
     def _iterate_filtered_activations(self) -> Generator[torch.Tensor, None, None]:
+        """Iterate over filtered LLM activation batches.
+
+        When vllm_dp_size > 1 and this rank is sae_active, gathers raw batches
+        from all vLLM DP groups via P2P send/recv and yields them one producer
+        at a time.
+
+        This keeps rank 0 from materializing a single large concatenated batch
+        before handing data to the mixing buffer. The mixing buffer still sees
+        the same total stream of activations, just in smaller chunks.
         """
-        Iterate over filtered LLM activation batches.
-        """
+        vllm_dp_size = get_vllm_dp_size() if dist.is_initialized() else 1
+        if vllm_dp_size <= 1:
+            yield from self._iterate_filtered_activations_single()
+            return
+
+        # vLLM DP mode: gather raw batches from all DP groups.
+        from sae_lens.distributed import is_sae_active
+
+        rank = dist.get_rank()
+        vllm_dp_rank = get_vllm_dp_rank()
+        vllm_tp_size = get_vllm_tp_size()
+        sae_tp_size = get_sae_tp_size()
+        sae_tp_group = get_sae_tp_group()
+        p2p_group = get_vllm_dp_p2p_group()
+        if p2p_group is None:
+            raise RuntimeError(
+                "vLLM DP P2P group is not initialized; refusing to fall back to the default process group."
+            )
+
+        while True:
+            try:
+                raw_acts, raw_tokens = self.get_raw_llm_batch(
+                    raise_on_epoch_end=True
+                )
+            except StopIteration:
+                warnings.warn(
+                    "All samples in the training dataset have been exhausted, beginning new epoch."
+                )
+                raw_acts, raw_tokens = self.get_raw_llm_batch()
+            _debug_prefix_tp(
+                f"vllm_dp raw batch acts={tuple(raw_acts.shape)} "
+                f"tokens={None if raw_tokens is None else tuple(raw_tokens.shape)}"
+            )
+            # Use CPU tensors for the dedicated Gloo P2P path.
+            runtime_device = self.device
+            tp_runtime_device = _get_model_device(self.model)
+            raw_acts = raw_acts.to("cpu").contiguous()
+            if raw_tokens is not None:
+                raw_tokens = raw_tokens.to("cpu").contiguous()
+
+            # Step 1: Non-zero DP roots send their raw batch to SAE root (rank 0)
+            # via P2P. This must complete BEFORE any SAE TP broadcasts, because
+            # rank 0 needs to recv before it can broadcast, and SAE TP follower
+            # ranks that are also vLLM DP helpers must finish sending before they
+            # can participate in SAE TP broadcasts.
+            if is_vllm_dp_root() and vllm_dp_rank > 0:
+                _debug_prefix_tp("vllm_dp helper send start")
+                dist.send(raw_acts, dst=0, group=p2p_group)
+                if raw_tokens is not None:
+                    dist.send(raw_tokens, dst=0, group=p2p_group)
+                _debug_prefix_tp("vllm_dp helper send done")
+
+            # Step 2: Rank 0 collects all helper batches via P2P recv, then
+            # broadcasts each batch (own + helpers) to the SAE TP group.
+            # SAE TP follower ranks participate in the broadcasts.
+            #
+            # The ordering is: rank 0 recvs ALL helper batches first, then
+            # broadcasts them in sequence. This avoids deadlock when a rank is
+            # both a vLLM DP helper (needs to send before rank 0 can proceed)
+            # and an SAE TP follower (needs to participate in broadcasts).
+            if rank == 0:
+                # Collect helper batches first so P2P sends can complete.
+                helper_batches: list[tuple[torch.Tensor, torch.Tensor | None]] = []
+                for k in range(1, vllm_dp_size):
+                    src = k * vllm_tp_size
+                    recv_acts = torch.empty_like(raw_acts)
+                    _debug_prefix_tp(f"vllm_dp root recv start src={src}")
+                    dist.recv(recv_acts, src=src, group=p2p_group)
+                    recv_tokens = None
+                    if raw_tokens is not None:
+                        recv_tokens = torch.empty_like(raw_tokens)
+                        dist.recv(recv_tokens, src=src, group=p2p_group)
+                    _debug_prefix_tp(f"vllm_dp root recv done src={src}")
+                    helper_batches.append((recv_acts, recv_tokens))
+
+                # Now broadcast own batch + helper batches to SAE TP group.
+                all_batches = [(raw_acts, raw_tokens)] + helper_batches
+                for batch_acts, batch_tokens in all_batches:
+                    if sae_tp_size > 1 and sae_tp_group is not None:
+                        batch_acts = batch_acts.to(tp_runtime_device)
+                        batch_tokens = (
+                            batch_tokens.to(tp_runtime_device)
+                            if batch_tokens is not None
+                            else None
+                        )
+                        _debug_prefix_tp("vllm_dp root tp broadcast start")
+                        dist.broadcast(batch_acts, src=0, group=sae_tp_group)
+                        if batch_tokens is not None:
+                            dist.broadcast(batch_tokens, src=0, group=sae_tp_group)
+                        _debug_prefix_tp("vllm_dp root tp broadcast done")
+                        yield _filter_buffer_acts(
+                            (batch_acts, batch_tokens),
+                            self.exclude_special_tokens,
+                        )
+                    else:
+                        yield _filter_buffer_acts(
+                            (
+                                batch_acts.to(runtime_device),
+                                batch_tokens.to(runtime_device)
+                                if batch_tokens is not None
+                                else None,
+                            ),
+                            self.exclude_special_tokens,
+                        )
+            elif is_sae_active() and sae_tp_size > 1 and sae_tp_group is not None:
+                # SAE TP follower: participate in all vllm_dp_size broadcasts
+                # (own batch from rank 0 + each helper batch).
+                combined_shape_acts = list(raw_acts.shape)
+                combined_shape_tokens = list(raw_tokens.shape) if raw_tokens is not None else None
+                for _ in range(vllm_dp_size):
+                    helper_acts = torch.empty(
+                        combined_shape_acts,
+                        dtype=raw_acts.dtype,
+                        device=tp_runtime_device,
+                    )
+                    _debug_prefix_tp("vllm_dp tp follower broadcast wait")
+                    dist.broadcast(helper_acts, src=0, group=sae_tp_group)
+                    helper_tokens = None
+                    if combined_shape_tokens is not None:
+                        helper_tokens = torch.empty(
+                            combined_shape_tokens,
+                            dtype=raw_tokens.dtype,  # type: ignore[union-attr]
+                            device=tp_runtime_device,
+                        )
+                        dist.broadcast(helper_tokens, src=0, group=sae_tp_group)
+                    _debug_prefix_tp("vllm_dp tp follower broadcast done")
+                    yield _filter_buffer_acts(
+                        (helper_acts, helper_tokens),
+                        self.exclude_special_tokens,
+                    )
+
+    def _iterate_filtered_activations_single(
+        self,
+    ) -> Generator[torch.Tensor, None, None]:
+        """Original single-producer filtered activations iterator."""
         while True:
             try:
                 yield self.get_filtered_llm_batch(raise_on_epoch_end=True)
@@ -894,6 +1070,8 @@ def _filter_buffer_acts(
     if tokens is None or exclude_tokens is None:
         return activations
 
+    if exclude_tokens.device != tokens.device:
+        exclude_tokens = exclude_tokens.to(tokens.device)
     mask = torch.isin(tokens, exclude_tokens)
     return activations[~mask]
 

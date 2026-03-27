@@ -86,6 +86,19 @@ def _get_vllm_tp_device_group() -> dist.ProcessGroup | None:
         return None
 
 
+def _get_vllm_tp_rank() -> int | None:
+    """Return vLLM's tensor-parallel rank when available."""
+    try:
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+    except ImportError:
+        return None
+
+    try:
+        return int(get_tensor_model_parallel_rank())
+    except AssertionError:
+        return None
+
+
 def _in_torchrun() -> bool:
     """Return True if this process was launched by torchrun / torch.distributed.launch."""
     return all(k in os.environ for k in ("RANK", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"))
@@ -415,12 +428,22 @@ def _register_hooks(
         model._sae_handles.append(handle)  # type: ignore[attr-defined]
 
 
+def _finalize_captures(
+    capture_lists: dict[str, list[torch.Tensor]],
+) -> dict[str, torch.Tensor]:
+    """Finalize chunked captures without copying when only one chunk exists."""
+    captures: dict[str, torch.Tensor] = {}
+    for name, chunks in capture_lists.items():
+        if len(chunks) == 1:
+            captures[name] = chunks[0]
+        else:
+            captures[name] = torch.cat(chunks, dim=0)
+    return captures
+
+
 def _collect_and_cleanup(model: nn.Module) -> dict[str, torch.Tensor]:
     """Collect captured activations and remove all hooks from the model."""
-    captures = {
-        k: torch.cat(v, dim=0)
-        for k, v in model._sae_captures.items()  # type: ignore[attr-defined]
-    }
+    captures = _finalize_captures(model._sae_captures)  # type: ignore[attr-defined]
     for handle in model._sae_handles:  # type: ignore[attr-defined]
         handle.remove()
     del model._sae_captures, model._sae_handles  # type: ignore[attr-defined]
@@ -467,16 +490,43 @@ def _collect_and_pin(model: nn.Module) -> bytes:
     Main process reconstructs zero-copy CUDA tensors via pickle.loads.
     """
     global _CUDA_IPC_PINNED
-    captures = {
-        k: torch.cat(v, dim=0)
-        for k, v in model._sae_captures.items()  # type: ignore[attr-defined]
-    }
+    captures = _finalize_captures(model._sae_captures)  # type: ignore[attr-defined]
     for handle in model._sae_handles:  # type: ignore[attr-defined]
         handle.remove()
     del model._sae_captures, model._sae_handles  # type: ignore[attr-defined]
     if hasattr(model.model, "_sae_stop_at_layer"):
         del model.model._sae_stop_at_layer  # type: ignore[attr-defined]
     _CUDA_IPC_PINNED = captures  # prevent GC until _release_pinned is called
+    buf = io.BytesIO()
+    ForkingPickler(buf, 2).dump(captures)
+    return buf.getvalue()
+
+
+def _collect_and_pin_selective(
+    model: nn.Module,
+    rank0_only_hooks: tuple[str, ...],
+) -> bytes:
+    """
+    Collect GPU activations and only return rank-0 copies for full-tensor hooks.
+
+    Hooks in ``rank0_only_hooks`` are post-allreduce tensors that are identical on
+    every TP rank. Non-zero TP ranks drop them before serialisation so the main
+    process does not redundantly reconstruct duplicate full tensors.
+    """
+    tp_rank = _get_vllm_tp_rank()
+    captures = _finalize_captures(model._sae_captures)  # type: ignore[attr-defined]
+    if tp_rank not in (None, 0):
+        for hook_name in rank0_only_hooks:
+            captures.pop(hook_name, None)
+
+    for handle in model._sae_handles:  # type: ignore[attr-defined]
+        handle.remove()
+    del model._sae_captures, model._sae_handles  # type: ignore[attr-defined]
+    if hasattr(model.model, "_sae_stop_at_layer"):
+        del model.model._sae_stop_at_layer  # type: ignore[attr-defined]
+
+    global _CUDA_IPC_PINNED
+    _CUDA_IPC_PINNED = captures
     buf = io.BytesIO()
     ForkingPickler(buf, 2).dump(captures)
     return buf.getvalue()
@@ -532,6 +582,7 @@ class HookedVLLMModel:
         llm_kwargs.setdefault("enforce_eager", True)
         dtype_str = _DTYPE_TO_STR.get(dtype, "bfloat16")
         llm_kwargs.setdefault("dtype", dtype_str)
+        explicit_device = llm_kwargs.get("device")
 
         # When launched under torchrun (RANK/LOCAL_RANK/MASTER_ADDR/MASTER_PORT
         # are in the environment), vLLM must NOT spawn its own TP worker
@@ -564,7 +615,11 @@ class HookedVLLMModel:
         # next(model.parameters()).device.  vLLM always runs on CUDA so we
         # expose a device property to satisfy that check without needing
         # model.parameters().
-        self.device = torch.device("cuda")
+        self.device = (
+            torch.device(explicit_device)
+            if explicit_device is not None
+            else torch.device("cuda")
+        )
 
     def run_with_cache(
         self,
@@ -645,21 +700,37 @@ class HookedVLLMModel:
             # handle bytes (~64 B per tensor, μs over ZMQ).  Main process
             # reconstructs zero-copy CUDA tensors via pickle.loads, then calls
             # _release_pinned so the worker can free its GPU reference.
+            rank0_only_hooks = tuple(
+                hook_name
+                for hook_name, _path, _extractor, _is_pre, gather_fn in hook_specs
+                if gather_fn is None
+            )
+            collect = partial(
+                _collect_and_pin_selective,
+                rank0_only_hooks=rank0_only_hooks,
+            )
+
             self.llm.apply_model(register)
             try:
                 self.llm.generate(prompts, SamplingParams(max_tokens=1), use_tqdm=False)
             finally:
-                ipc_bytes_per_rank: list[bytes] = self.llm.apply_model(_collect_and_pin)
+                ipc_bytes_per_rank: list[bytes] = self.llm.apply_model(collect)
 
             try:
-                all_caps: list[dict[str, torch.Tensor]] = [
-                    pickle.loads(b) for b in ipc_bytes_per_rank
-                ]
                 activations = {}
+                needs_all_ranks = any(gather_fn is not None for *_rest, gather_fn in hook_specs)
+                rank0_caps = pickle.loads(ipc_bytes_per_rank[0])
+                all_caps: list[dict[str, torch.Tensor]] | None = None
+                if needs_all_ranks:
+                    all_caps = [rank0_caps] + [
+                        pickle.loads(b) for b in ipc_bytes_per_rank[1:]
+                    ]
+
                 for hook_name, _path, _extractor, _is_pre, gather_fn in hook_specs:
                     if gather_fn is None:
-                        raw = all_caps[0][hook_name]
+                        raw = rank0_caps[hook_name]
                     else:
+                        assert all_caps is not None
                         shards = [c[hook_name] for c in all_caps if hook_name in c]
                         raw = gather_fn(shards)
                     activations[hook_name] = raw[:total_tokens].view(B, S, -1)

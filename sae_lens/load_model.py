@@ -59,7 +59,10 @@ def load_model(
         from sae_lens.vllm_model import HookedVLLMModel
 
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        return HookedVLLMModel(model_name, tokenizer, **model_from_pretrained_kwargs)  # type: ignore
+        vllm_kwargs = dict(model_from_pretrained_kwargs)
+        if device is not None:
+            vllm_kwargs.setdefault("device", str(device))
+        return HookedVLLMModel(model_name, tokenizer, **vllm_kwargs)  # type: ignore
 
     # pragma: no cover
     raise ValueError(f"Unknown model class: {model_class_name}")

@@ -24,10 +24,14 @@ from sae_lens.constants import (
 from sae_lens.distributed import (
     get_dp_group,
     get_tp_group,
+    get_vllm_dp_p2p_group,
+    get_vllm_dp_rank,
+    get_vllm_dp_size,
     get_vllm_world_ranks,
     init_distributed,
     is_sae_active,
     is_vllm_active,
+    is_vllm_dp_root,
     preinit_vllm_distributed,
 )
 from sae_lens.evals import EvalConfig, run_evals
@@ -129,6 +133,7 @@ class LanguageModelSAETrainingRunner:
         vllm_tp_size: int | None = None,
         sae_tp_size: int | None = None,
         dp_size: int = 1,
+        vllm_dp_size: int = 1,
     ):
         if override_dataset is not None:
             logger.warning(
@@ -141,6 +146,7 @@ class LanguageModelSAETrainingRunner:
 
         self.cfg = cfg
         self.dp_size = dp_size
+        self.vllm_dp_size = vllm_dp_size
         inferred_cfg_vllm_tp_size = int(
             self.cfg.model_from_pretrained_kwargs.get("tensor_parallel_size", 1)
         )
@@ -181,7 +187,7 @@ class LanguageModelSAETrainingRunner:
 
         # Initialize distributed process groups for SAE TP/DP.
         # With torchrun, dist.init_process_group is already called; skip it.
-        if self.vllm_tp_size > 1 or self.sae_tp_size > 1 or dp_size > 1:
+        if self.vllm_tp_size > 1 or self.sae_tp_size > 1 or dp_size > 1 or vllm_dp_size > 1:
             if not dist.is_initialized():
                 dist.init_process_group(backend="nccl")
             if self.shared_tp_size is not None:
@@ -193,25 +199,28 @@ class LanguageModelSAETrainingRunner:
                 init_distributed(
                     sae_tp_size=self.sae_tp_size,
                     vllm_tp_size=self.vllm_tp_size,
+                    vllm_dp_size=vllm_dp_size,
                     dp_size=dp_size,
                 )
 
         self.sae_active = is_sae_active() if dist.is_initialized() else True
         self.vllm_active = is_vllm_active() if dist.is_initialized() else True
         # uses_split_roles is a system-wide property: some ranks are vLLM-only
-        # or SAE-only.  It is True whenever the two TP sizes differ.
-        self.uses_split_roles = self.vllm_tp_size != self.sae_tp_size
+        # or SAE-only.
+        self.uses_split_roles = (
+            self.vllm_tp_size != self.sae_tp_size or vllm_dp_size > 1
+        )
 
         if dist.is_initialized():
             os.environ["SAELENS_VLLM_WORLD_RANKS"] = ",".join(
                 str(rank) for rank in get_vllm_world_ranks()
             )
 
-        # When sae_tp > vllm_tp, some ranks will never create an LLM() but
-        # PyTorch requires every rank to participate in dist.new_group() calls.
-        # Pre-initialize vLLM parallel state on ALL ranks so LLM() construction
-        # on vLLM-active ranks skips group creation (finding it already done).
-        if dist.is_initialized() and self.sae_tp_size > self.vllm_tp_size:
+        # Pre-initialize vLLM parallel state when needed to avoid deadlock
+        # on dist.new_group() calls that non-vLLM ranks would never enter.
+        if dist.is_initialized() and (
+            self.sae_tp_size > self.vllm_tp_size or vllm_dp_size > 1
+        ):
             preinit_vllm_distributed(get_vllm_world_ranks(), self.vllm_tp_size)
 
         if self.uses_split_roles:
@@ -227,6 +236,16 @@ class LanguageModelSAETrainingRunner:
                 raise ValueError(
                     "Prefix-overlap training does not yet support "
                     "normalize_activations='expected_average_only_in'."
+                )
+
+        if vllm_dp_size > 1:
+            if self.cfg.resume_from_checkpoint is not None:
+                raise ValueError(
+                    "resume_from_checkpoint is not supported with vllm_dp_size > 1"
+                )
+            if self.cfg.use_cached_activations:
+                raise ValueError(
+                    "use_cached_activations is not supported with vllm_dp_size > 1"
                 )
 
         if override_model is None:
@@ -245,10 +264,19 @@ class LanguageModelSAETrainingRunner:
         else:
             self.model = override_model
 
+        # Determine dataset shard params for vLLM DP.
+        ds_shard_index = 0
+        ds_shard_count = 1
+        if dist.is_initialized() and vllm_dp_size > 1:
+            ds_shard_index = get_vllm_dp_rank()
+            ds_shard_count = vllm_dp_size
+
         self.activations_store = ActivationsStore.from_config(
             self.model,
             self.cfg,
             override_dataset=override_dataset,
+            dataset_shard_index=ds_shard_index,
+            dataset_shard_count=ds_shard_count,
         )
 
         if self.sae_active:
@@ -345,22 +373,73 @@ class LanguageModelSAETrainingRunner:
         return sae
 
     def _run_vllm_helper_loop(self) -> None:
+        """Pump activations for helper-only ranks (vllm_active and not sae_active).
+
+        With vllm_dp > 1, helper DP root ranks (vllm_dp_rank > 0, vllm_tp_rank == 0)
+        also send their raw batch to SAE root (rank 0) via NCCL P2P.
+        """
+        import math
+
+        vllm_dp_size = get_vllm_dp_size() if dist.is_initialized() else 1
+        is_dp_root = is_vllm_dp_root() if dist.is_initialized() else False
+        vllm_dp_rank = get_vllm_dp_rank() if dist.is_initialized() else 0
+        batch_size = self.cfg.store_batch_size_prompts
+        ctx_size = self.activations_store.training_context_size
+
+        # Approximate number of raw batches this helper should produce.
+        if vllm_dp_size > 1:
+            tokens_per_batch = batch_size * ctx_size
+            target_batches = math.ceil(
+                self.cfg.total_training_tokens / (tokens_per_batch * vllm_dp_size)
+            )
+        else:
+            target_batches = None  # Legacy: use token count
+
+        n_batches_done = 0
         n_training_samples = 0
-        while n_training_samples < self.cfg.total_training_tokens:
+        while True:
+            if target_batches is not None and n_batches_done >= target_batches:
+                break
+            if target_batches is None and n_training_samples >= self.cfg.total_training_tokens:
+                break
+
             if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
                 rank = dist.get_rank() if dist.is_initialized() else -1
                 line = (
-                    f"[prefix-debug rank{rank}] helper next() start samples={n_training_samples}\n"
+                    f"[prefix-debug rank{rank}] helper batch start n={n_batches_done}\n"
                 )
                 with open(f"/tmp/saelens_debug_rank{rank}.log", "a") as f:
                     f.write(line)
                 print(line, end="", flush=True)
-            batch = next(self.activations_store)
-            n_training_samples += batch.shape[0]
+
+            if vllm_dp_size > 1:
+                # Directly call get_raw_llm_batch to participate in intra-group
+                # broadcasts. Do NOT go through mixing buffer.
+                raw_acts, raw_tokens = self.activations_store.get_raw_llm_batch()
+                n_batches_done += 1
+
+                # Helper DP root: send raw batch to SAE root.
+                if is_dp_root and vllm_dp_rank > 0:
+                    p2p_group = get_vllm_dp_p2p_group()
+                    if p2p_group is None:
+                        raise RuntimeError(
+                            "vLLM DP P2P group is not initialized; refusing to fall back to the default process group."
+                        )
+                    raw_acts = raw_acts.to("cpu").contiguous()
+                    dist.send(raw_acts, dst=0, group=p2p_group)
+                    if raw_tokens is not None:
+                        raw_tokens = raw_tokens.to("cpu").contiguous()
+                        dist.send(raw_tokens, dst=0, group=p2p_group)
+            else:
+                # Legacy: go through mixing buffer to stay in sync with
+                # existing split-role broadcasts.
+                batch = next(self.activations_store)
+                n_training_samples += batch.shape[0]
+
             if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
                 rank = dist.get_rank() if dist.is_initialized() else -1
                 line = (
-                    f"[prefix-debug rank{rank}] helper next() done samples={n_training_samples}\n"
+                    f"[prefix-debug rank{rank}] helper batch done n={n_batches_done}\n"
                 )
                 with open(f"/tmp/saelens_debug_rank{rank}.log", "a") as f:
                     f.write(line)

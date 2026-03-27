@@ -32,6 +32,8 @@ def _reset_distributed_state() -> None:
     distributed_mod._worker_size = 1
     distributed_mod._vllm_tp_rank = -1
     distributed_mod._vllm_tp_size = 1
+    distributed_mod._vllm_dp_rank = 0
+    distributed_mod._vllm_dp_size = 1
     distributed_mod._sae_active = True
     distributed_mod._vllm_active = True
 
@@ -255,3 +257,193 @@ def test_preinit_nonmember_gets_null_coordinator():
         assert ps._PP.world_size == 0
     finally:
         ps._WORLD, ps._TP, ps._DCP, ps._PCP, ps._PP, ps._DP = saved
+
+
+# ---------------------------------------------------------------------------
+# vLLM DP helpers
+# ---------------------------------------------------------------------------
+
+
+def _run_init_dp(
+    rank: int,
+    world_size: int,
+    sae_tp: int,
+    vllm_tp: int,
+    vllm_dp: int,
+) -> None:
+    mock_group = MagicMock()
+    with (
+        patch("sae_lens.distributed.dist.is_initialized", return_value=True),
+        patch("sae_lens.distributed.dist.get_world_size", return_value=world_size),
+        patch("sae_lens.distributed.dist.get_rank", return_value=rank),
+        patch("sae_lens.distributed.dist.new_group", return_value=mock_group),
+    ):
+        init_distributed(
+            sae_tp_size=sae_tp,
+            vllm_tp_size=vllm_tp,
+            vllm_dp_size=vllm_dp,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Config 5: vllm_tp=2, vllm_dp=3, sae_tp=1 → world_size=6
+# ---------------------------------------------------------------------------
+
+
+def test_vllm_dp_config5_rank0_both_active():
+    _run_init_dp(rank=0, world_size=6, sae_tp=1, vllm_tp=2, vllm_dp=3)
+    assert distributed_mod._sae_active is True
+    assert distributed_mod._vllm_active is True
+    assert distributed_mod._vllm_dp_rank == 0
+    assert distributed_mod._vllm_tp_rank == 0
+    assert distributed_mod._sae_tp_rank == 0
+
+
+def test_vllm_dp_config5_rank1_vllm_only():
+    _run_init_dp(rank=1, world_size=6, sae_tp=1, vllm_tp=2, vllm_dp=3)
+    assert distributed_mod._sae_active is False
+    assert distributed_mod._vllm_active is True
+    assert distributed_mod._vllm_dp_rank == 0
+    assert distributed_mod._vllm_tp_rank == 1
+
+
+def test_vllm_dp_config5_rank2_helper_root():
+    _run_init_dp(rank=2, world_size=6, sae_tp=1, vllm_tp=2, vllm_dp=3)
+    assert distributed_mod._sae_active is False
+    assert distributed_mod._vllm_active is True
+    assert distributed_mod._vllm_dp_rank == 1
+    assert distributed_mod._vllm_tp_rank == 0
+
+
+def test_vllm_dp_config5_rank5_helper_nonroot():
+    _run_init_dp(rank=5, world_size=6, sae_tp=1, vllm_tp=2, vllm_dp=3)
+    assert distributed_mod._sae_active is False
+    assert distributed_mod._vllm_active is True
+    assert distributed_mod._vllm_dp_rank == 2
+    assert distributed_mod._vllm_tp_rank == 1
+
+
+# ---------------------------------------------------------------------------
+# Config 6: vllm_tp=1, vllm_dp=2, sae_tp=2 → world_size=2 (full overlap)
+# ---------------------------------------------------------------------------
+
+
+def test_vllm_dp_config6_rank0_both_active():
+    _run_init_dp(rank=0, world_size=2, sae_tp=2, vllm_tp=1, vllm_dp=2)
+    assert distributed_mod._sae_active is True
+    assert distributed_mod._vllm_active is True
+    assert distributed_mod._vllm_dp_rank == 0
+    assert distributed_mod._sae_tp_rank == 0
+
+
+def test_vllm_dp_config6_rank1_both_active():
+    _run_init_dp(rank=1, world_size=2, sae_tp=2, vllm_tp=1, vllm_dp=2)
+    assert distributed_mod._sae_active is True
+    assert distributed_mod._vllm_active is True
+    assert distributed_mod._vllm_dp_rank == 1
+    assert distributed_mod._sae_tp_rank == 1
+
+
+# ---------------------------------------------------------------------------
+# Config 7: vllm_tp=1, vllm_dp=4, sae_tp=1 → world_size=4 (no TP)
+# ---------------------------------------------------------------------------
+
+
+def test_vllm_dp_config7_rank0():
+    _run_init_dp(rank=0, world_size=4, sae_tp=1, vllm_tp=1, vllm_dp=4)
+    assert distributed_mod._sae_active is True
+    assert distributed_mod._vllm_dp_rank == 0
+
+
+def test_vllm_dp_config7_rank3():
+    _run_init_dp(rank=3, world_size=4, sae_tp=1, vllm_tp=1, vllm_dp=4)
+    assert distributed_mod._sae_active is False
+    assert distributed_mod._vllm_dp_rank == 3
+
+
+# ---------------------------------------------------------------------------
+# vLLM DP accessor tests
+# ---------------------------------------------------------------------------
+
+
+def test_vllm_dp_accessors():
+    _run_init_dp(rank=2, world_size=6, sae_tp=1, vllm_tp=2, vllm_dp=3)
+    from sae_lens.distributed import (
+        get_vllm_dp_rank,
+        get_vllm_dp_size,
+        get_vllm_root_rank,
+        get_vllm_world_ranks,
+        is_vllm_dp_root,
+    )
+
+    assert get_vllm_dp_rank() == 1
+    assert get_vllm_dp_size() == 3
+    assert is_vllm_dp_root() is True
+    assert get_vllm_root_rank() == 2
+    assert get_vllm_world_ranks() == [0, 1, 2, 3, 4, 5]
+
+
+def test_vllm_dp_nonroot_is_not_dp_root():
+    _run_init_dp(rank=3, world_size=6, sae_tp=1, vllm_tp=2, vllm_dp=3)
+    from sae_lens.distributed import is_vllm_dp_root
+
+    assert is_vllm_dp_root() is False
+
+
+# ---------------------------------------------------------------------------
+# vLLM DP backward compatibility (vllm_dp=1 matches legacy)
+# ---------------------------------------------------------------------------
+
+
+def test_vllm_dp1_matches_legacy():
+    _run_init_dp(rank=0, world_size=2, sae_tp=1, vllm_tp=2, vllm_dp=1)
+    assert distributed_mod._vllm_dp_size == 1
+    assert distributed_mod._vllm_dp_rank == 0
+    assert distributed_mod._sae_active is True
+    assert distributed_mod._vllm_active is True
+    assert distributed_mod._vllm_tp_rank == 0
+
+
+# ---------------------------------------------------------------------------
+# vLLM DP validation errors
+# ---------------------------------------------------------------------------
+
+
+def test_vllm_dp_rejects_dp_size_gt1():
+    with pytest.raises(ValueError, match="vllm_dp_size > 1 and dp_size > 1"):
+        mock_group = MagicMock()
+        with (
+            patch("sae_lens.distributed.dist.is_initialized", return_value=True),
+            patch("sae_lens.distributed.dist.get_world_size", return_value=4),
+            patch("sae_lens.distributed.dist.get_rank", return_value=0),
+            patch("sae_lens.distributed.dist.new_group", return_value=mock_group),
+        ):
+            init_distributed(
+                sae_tp_size=1, vllm_tp_size=1, vllm_dp_size=2, dp_size=2
+            )
+
+
+def test_vllm_dp_rejects_shared_tp_size():
+    with pytest.raises(ValueError, match="shared_tp_size is incompatible"):
+        mock_group = MagicMock()
+        with (
+            patch("sae_lens.distributed.dist.is_initialized", return_value=True),
+            patch("sae_lens.distributed.dist.get_world_size", return_value=4),
+            patch("sae_lens.distributed.dist.get_rank", return_value=0),
+            patch("sae_lens.distributed.dist.new_group", return_value=mock_group),
+        ):
+            init_distributed(shared_tp_size=2, vllm_dp_size=2)
+
+
+def test_vllm_dp_rejects_sae_tp_too_large():
+    with pytest.raises(ValueError, match="sae_tp_size=.*not supported"):
+        mock_group = MagicMock()
+        with (
+            patch("sae_lens.distributed.dist.is_initialized", return_value=True),
+            patch("sae_lens.distributed.dist.get_world_size", return_value=4),
+            patch("sae_lens.distributed.dist.get_rank", return_value=0),
+            patch("sae_lens.distributed.dist.new_group", return_value=mock_group),
+        ):
+            init_distributed(
+                sae_tp_size=3, vllm_tp_size=1, vllm_dp_size=2
+            )

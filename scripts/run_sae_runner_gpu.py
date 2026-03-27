@@ -32,6 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from transformers import AutoConfig
 
 from sae_lens.config import LanguageModelSAERunnerConfig, LoggingConfig
@@ -44,12 +45,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", default="/data/models/Llama-3.1-8B")
     parser.add_argument("--dataset-path", default="../datasets/fineweb-edu-10BT_tokenized_llama31_ctx2048")
     parser.add_argument("--hook-name", default="blocks.21.hook_resid_post")
-    parser.add_argument("--d-sae", type=int, default=131072)
+    parser.add_argument("--d-sae", type=int, default=32768*3)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--vllm-tp-size", type=int, default=1)
     parser.add_argument("--sae-tp-size", type=int, default=1)
-    parser.add_argument("--training-tokens", type=int, default=2048*100)
+    parser.add_argument("--vllm-dp-size", type=int, default=1)
+    parser.add_argument("--training-tokens", type=int, default=2048*400)
     parser.add_argument("--train-batch-size-tokens", type=int, default=2048)
     parser.add_argument("--context-size", type=int, default=2048)
     parser.add_argument("--store-batch-size-prompts", type=int, default=4)
@@ -62,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/res11/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/res3.5/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
     parser.add_argument("--save-mse-every-n-steps", type=int, default=1)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=1)
@@ -99,7 +101,7 @@ def main() -> None:
         raise ValueError("--context-size must be >= 1")
     if args.train_batch_size_tokens < 1:
         raise ValueError("--train-batch-size-tokens must be >= 1")
-    expected_world_size = max(vllm_tp_size, sae_tp_size)
+    expected_world_size = max(vllm_tp_size * args.vllm_dp_size, sae_tp_size)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if expected_world_size > 1 and world_size == 1:
         raise ValueError(
@@ -183,8 +185,8 @@ def main() -> None:
         f"{args.training_tokens} train_batch_size_tokens={args.train_batch_size_tokens}"
     )
     print(
-        f"  vllm_tp_size={vllm_tp_size} sae_tp_size={sae_tp_size} "
-        f"output_path={args.output_path}"
+        f"  vllm_tp_size={vllm_tp_size} vllm_dp_size={args.vllm_dp_size} "
+        f"sae_tp_size={sae_tp_size} output_path={args.output_path}"
     )
     if args.save_mse_every_n_steps > 0:
         print(f"  save_mse_every_n_steps={args.save_mse_every_n_steps}")
@@ -197,9 +199,14 @@ def main() -> None:
         cfg=cfg,
         vllm_tp_size=vllm_tp_size,
         sae_tp_size=sae_tp_size,
+        vllm_dp_size=args.vllm_dp_size,
         dp_size=1,
     )
-    runner.run()
+    try:
+        runner.run()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

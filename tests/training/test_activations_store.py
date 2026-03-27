@@ -899,3 +899,70 @@ def test_activations_store_from_sae_allows_null_context_size_with_override(
     )
 
     assert store.context_size == custom_context_size
+
+
+# ---------------------------------------------------------------------------
+# Dataset sharding tests (for vLLM DP)
+# ---------------------------------------------------------------------------
+
+
+def test_dataset_sharding_strided_no_overlap():
+    tokens = [torch.arange(8) + i * 8 for i in range(12)]
+    dataset = Dataset.from_dict({"tokens": [t.tolist() for t in tokens]})
+
+    model = load_model_cached("tiny-stories-1M")
+    cfg = build_runner_cfg(
+        model_name="tiny-stories-1M",
+        context_size=8,
+        dataset_path="dummy",
+    )
+
+    store_0 = ActivationsStore.from_config(
+        model, cfg, override_dataset=dataset,
+        dataset_shard_index=0, dataset_shard_count=3,
+    )
+    store_1 = ActivationsStore.from_config(
+        model, cfg, override_dataset=dataset,
+        dataset_shard_index=1, dataset_shard_count=3,
+    )
+    store_2 = ActivationsStore.from_config(
+        model, cfg, override_dataset=dataset,
+        dataset_shard_index=2, dataset_shard_count=3,
+    )
+
+    seqs_0 = [next(store_0.iterable_sequences) for _ in range(4)]
+    seqs_1 = [next(store_1.iterable_sequences) for _ in range(4)]
+    seqs_2 = [next(store_2.iterable_sequences) for _ in range(4)]
+
+    # Each shard should get 4 sequences (12 / 3)
+    # Shard 0: indices 0, 3, 6, 9
+    # Shard 1: indices 1, 4, 7, 10
+    # Shard 2: indices 2, 5, 8, 11
+    all_first_tokens = set()
+    for seqs in [seqs_0, seqs_1, seqs_2]:
+        for s in seqs:
+            all_first_tokens.add(s[0].item())
+
+    # All 12 sequences should be covered (no overlap, full coverage)
+    assert len(all_first_tokens) == 12
+
+
+def test_dataset_sharding_count_1_returns_all():
+    tokens = [torch.arange(4) + i * 4 for i in range(6)]
+    dataset = Dataset.from_dict({"tokens": [t.tolist() for t in tokens]})
+
+    model = load_model_cached("tiny-stories-1M")
+    cfg = build_runner_cfg(
+        model_name="tiny-stories-1M",
+        context_size=4,
+        dataset_path="dummy",
+    )
+
+    store = ActivationsStore.from_config(
+        model, cfg, override_dataset=dataset,
+        dataset_shard_index=0, dataset_shard_count=1,
+    )
+
+    seqs = [next(store.iterable_sequences) for _ in range(6)]
+    first_tokens = [s[0].item() for s in seqs]
+    assert len(set(first_tokens)) == 6

@@ -641,7 +641,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self,
         step_output: TrainStepOutput,
         pbar: tqdm,  # type: ignore
-        update_interval: int = 100,
+        update_interval: int = 8,
     ):
         if self.n_training_steps % update_interval == 0:
             loss_strs = " | ".join(
