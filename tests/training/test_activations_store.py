@@ -3,6 +3,7 @@ import tempfile
 from collections.abc import Iterable
 from math import ceil
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ from sae_lens.load_model import load_model
 from sae_lens.pretokenize_runner import pretokenize_dataset
 from sae_lens.saes.sae import SAE
 from sae_lens.saes.standard_sae import StandardSAEConfig, StandardTrainingSAEConfig
+from sae_lens.shard_routing import ShardRoute
 from sae_lens.training.activations_store import (
     ActivationsStore,
     _filter_buffer_acts,
@@ -966,3 +968,151 @@ def test_dataset_sharding_count_1_returns_all():
     seqs = [next(store.iterable_sequences) for _ in range(6)]
     first_tokens = [s[0].item() for s in seqs]
     assert len(set(first_tokens)) == 6
+
+
+def test_run_producer_phase2_v2_non_root_participates_without_sending(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = ActivationsStore.__new__(ActivationsStore)
+    calls: list[bool] = []
+    barrier_calls: list[object] = []
+
+    def fake_get_raw_llm_batch(*, raise_on_epoch_end: bool = False):
+        calls.append(raise_on_epoch_end)
+        return torch.ones(2, 3), None
+
+    monkeypatch.setattr(store, "get_raw_llm_batch", fake_get_raw_llm_batch)
+
+    import sae_lens.distributed_v2 as v2
+    import torch.distributed as dist
+
+    monkeypatch.setattr(v2, "is_producer", lambda: True)
+    monkeypatch.setattr(v2, "get_vllm_tp_rank", lambda: 1)
+    monkeypatch.setattr(v2, "get_vllm_tp_group", lambda: "tp")
+    monkeypatch.setattr(v2, "get_vllm_tp_size", lambda: 2)
+    monkeypatch.setattr(dist, "barrier", lambda group: barrier_calls.append(group))
+    monkeypatch.setattr(
+        dist,
+        "send",
+        lambda *args, **kwargs: pytest.fail("producer TP non-root must not send"),
+    )
+
+    local_slices, outgoing = store._run_producer_phase2_v2()
+
+    assert calls == [True]
+    assert barrier_calls == ["tp"]
+    assert local_slices == {}
+    assert outgoing == {}
+
+
+def test_run_producer_phase2_and_phase4_v2_root_send_only_remote_routes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = ActivationsStore.__new__(ActivationsStore)
+    raw_acts = torch.arange(12, dtype=torch.float32).view(6, 2)
+
+    def fake_get_raw_llm_batch(*, raise_on_epoch_end: bool = False):
+        assert raise_on_epoch_end is True
+        return raw_acts, None
+
+    monkeypatch.setattr(store, "get_raw_llm_batch", fake_get_raw_llm_batch)
+
+    import sae_lens.distributed_v2 as v2
+    import torch.distributed as dist
+
+    routes = [
+        ShardRoute(producer_idx=0, consumer_idx=0, row_start=0, row_end=2),
+        ShardRoute(producer_idx=0, consumer_idx=1, row_start=2, row_end=6),
+    ]
+    sent: list[dict[str, Any]] = []
+    barrier_calls: list[object] = []
+
+    monkeypatch.setattr(v2, "is_producer", lambda: True)
+    monkeypatch.setattr(v2, "get_vllm_tp_rank", lambda: 0)
+    monkeypatch.setattr(v2, "get_vllm_tp_group", lambda: "tp")
+    monkeypatch.setattr(v2, "get_vllm_tp_size", lambda: 2)
+    monkeypatch.setattr(v2, "get_producer_idx", lambda: 0)
+    monkeypatch.setattr(v2, "get_routing_table", lambda: routes)
+    monkeypatch.setattr(v2, "get_producer_tp_root", lambda p: 0)
+    monkeypatch.setattr(v2, "get_consumer_tp_root", lambda c: 0 if c == 0 else 3)
+    monkeypatch.setattr(v2, "get_p2p_group", lambda c: f"g{c}")
+    monkeypatch.setattr(dist, "barrier", lambda group: barrier_calls.append(group))
+    monkeypatch.setattr(
+        dist,
+        "send",
+        lambda tensor, dst, group: sent.append(
+            {"tensor": tensor.clone(), "dst": dst, "group": group}
+        ),
+    )
+
+    local_slices, outgoing = store._run_producer_phase2_v2()
+
+    assert torch.equal(local_slices[0], raw_acts[:2].contiguous().cpu())
+    assert torch.equal(outgoing[0], raw_acts[:2].contiguous().cpu())
+    assert torch.equal(outgoing[1], raw_acts[2:6].contiguous().cpu())
+    assert barrier_calls == ["tp"]
+    assert len(sent) == 1
+    assert sent[0]["dst"] == 3
+    assert sent[0]["group"] == "g1"
+    assert sent[0]["tensor"].dtype == torch.int64
+    assert sent[0]["tensor"].tolist() == [4, 2]
+
+    store._run_producer_phase4_v2(outgoing)
+
+    assert len(sent) == 2
+    assert sent[1]["dst"] == 3
+    assert sent[1]["group"] == "g1"
+    assert torch.equal(sent[1]["tensor"], raw_acts[2:6].contiguous().cpu())
+
+
+def test_activations_store_consumer_only_is_recv_only():
+    class DummyModel:
+        tokenizer = None
+
+    dataset = Dataset.from_list([{"tokens": list(range(16))}] * 8)
+    cfg = build_runner_cfg(
+        context_size=16,
+        store_batch_size_prompts=2,
+        train_batch_size_tokens=8,
+        dataset_path="dummy",
+    )
+
+    store = ActivationsStore.from_config(
+        DummyModel(),
+        cfg,
+        override_dataset=dataset,
+        consumer_only=True,
+    )
+
+    assert store._consumer_only is True
+    assert store.iterable_sequences is None
+    assert store.cached_activation_dataset is None
+    assert store.is_dataset_tokenized is True
+    assert store.tokens_column == "tokens"
+
+    with pytest.raises(RuntimeError, match="recv-only"):
+        store.get_batch_tokens()
+
+
+def test_activations_store_v2_loader_respects_train_batch_size_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = ActivationsStore.__new__(ActivationsStore)
+    store.n_batches_in_buffer = 2
+    store.training_context_size = 4
+    store.train_batch_size_tokens = 4
+    store.activations_mixing_fraction = 0.0
+
+    def fake_iterate_filtered_activations_v2():
+        yield torch.arange(12, dtype=torch.float32).view(12, 1)
+
+    monkeypatch.setattr(store, "_iterate_filtered_activations_v2", fake_iterate_filtered_activations_v2)
+
+    import sae_lens.distributed_v2 as v2_mod
+
+    monkeypatch.setattr(v2_mod, "_initialized", True)
+
+    batches = list(store.get_data_loader())
+
+    assert [tuple(batch.shape) for batch in batches] == [(4, 1), (4, 1), (4, 1)]
+    assert torch.equal(torch.cat(batches, dim=0).squeeze(-1), torch.arange(12, dtype=torch.float32))

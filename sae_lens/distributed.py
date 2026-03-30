@@ -1,13 +1,17 @@
-"""Distributed training utilities for prefix-overlap vLLM TP + SAE TP + DP.
+"""Distributed training utilities for prefix-overlap vLLM TP + SAE TP + SAE DP.
 
-Supports two parallelism modes:
+Supports three parallelism modes:
 
-1. **Prefix-overlap (legacy)**: ``vllm_dp_size=1``.
-   ``replica_size = max(vllm_tp, sae_tp)``, ``world = replica_size * dp_size``.
+1. **1:1 / local overlap**: ``vllm_dp_size=1``, ``sae_dp_size=1``.
+   ``replica_size = max(vllm_tp, sae_tp)``, ``world = replica_size``.
 
-2. **vLLM Data Parallel**: ``vllm_dp_size > 1``, ``dp_size == 1``.
+2. **m:1 / vLLM DP fan-in**: ``vllm_dp_size>1``, ``sae_dp_size=1``.
    Multiple independent vLLM instances feed one SAE trainer.
    ``world = max(vllm_tp * vllm_dp, sae_tp)``.
+
+3. **m:m / matched DP**: ``vllm_dp_size==sae_dp_size>1``.
+   Each vLLM DP replica feeds one SAE DP replica; SAE replicas sync gradients.
+   ``world = max(vllm_tp, sae_tp) * sae_dp_size``.
 """
 
 from __future__ import annotations
@@ -26,51 +30,45 @@ _worker_cpu_group: dist.ProcessGroup | None = None
 _vllm_dp_p2p_group: dist.ProcessGroup | None = None  # Gloo group for vLLM DP P2P
 _sae_tp_rank: int = 0
 _sae_tp_size: int = 1
-_dp_rank: int = 0
-_dp_size: int = 1
+_sae_dp_rank: int = 0
+_sae_dp_size: int = 1
 _worker_rank: int = 0
 _worker_size: int = 1
+_cluster_block: int = 1  # ranks per cluster in fan-in (mn:m) topology
 _vllm_tp_rank: int = -1
 _vllm_tp_size: int = 1
 _vllm_dp_rank: int = 0
 _vllm_dp_size: int = 1
 _sae_active: bool = True
 _vllm_active: bool = True
+_layout_mode: str = "local_overlap"
 
 
 def init_distributed(
     tp_size: int | None = None,
-    dp_size: int = 1,
+    sae_dp_size: int = 1,
     *,
     sae_tp_size: int | None = None,
     vllm_tp_size: int = 1,
     vllm_dp_size: int = 1,
     shared_tp_size: int | None = None,
 ) -> None:
-    """Initialize process groups for vLLM TP + SAE TP (+ optional vLLM DP).
+    """Initialize process groups for vLLM TP + SAE TP (+ optional DP).
 
-    When ``vllm_dp_size == 1`` (default), this behaves identically to the
-    legacy prefix-overlap layout.
+    Supported topologies:
 
-    When ``vllm_dp_size > 1``, multiple independent vLLM TP groups are
-    created, each producing activations that are gathered to a single SAE
-    trainer (sae_dp fixed at 1).
-
-    Process grid layout (vllm_dp > 1):
-
-    - world_size = max(vllm_tp_size * vllm_dp_size, sae_tp_size)
-    - vLLM DP group k owns ranks [k*vllm_tp, (k+1)*vllm_tp)
-    - SAE occupies ranks [0, sae_tp_size)
-    - Ranks can be both vLLM-active and SAE-active (overlap)
+    - 1:1: ``vllm_dp_size = sae_dp_size = 1``
+    - m:1: ``vllm_dp_size > 1, sae_dp_size = 1``
+    - m:m: ``vllm_dp_size = sae_dp_size > 1``
 
     Must be called after torch.distributed.init_process_group().
     """
     global _sae_tp_group, _sae_dp_group, _vllm_tp_group, _worker_group, _worker_cpu_group
     global _vllm_dp_p2p_group
-    global _sae_tp_rank, _sae_tp_size, _dp_rank, _dp_size
-    global _worker_rank, _worker_size, _vllm_tp_rank, _vllm_tp_size
+    global _sae_tp_rank, _sae_tp_size, _sae_dp_rank, _sae_dp_size
+    global _worker_rank, _worker_size, _cluster_block, _vllm_tp_rank, _vllm_tp_size
     global _vllm_dp_rank, _vllm_dp_size
-    global _sae_active, _vllm_active
+    global _sae_active, _vllm_active, _layout_mode
 
     if shared_tp_size is None and tp_size is not None and sae_tp_size is None:
         shared_tp_size = tp_size
@@ -93,60 +91,90 @@ def init_distributed(
     if sae_tp_size is None:
         sae_tp_size = 1
 
-    if vllm_dp_size > 1 and dp_size > 1:
+    if sae_dp_size < 1:
+        raise ValueError(f"sae_dp_size must be >= 1, got {sae_dp_size}")
+    if vllm_dp_size < 1:
+        raise ValueError(f"vllm_dp_size must be >= 1, got {vllm_dp_size}")
+
+    if sae_dp_size > 1 and vllm_dp_size == 1:
         raise ValueError(
-            "vllm_dp_size > 1 and dp_size > 1 simultaneously is not supported"
+            "sae_dp_size > 1 requires vllm_dp_size > 1; 1:m is not supported"
         )
-    if vllm_dp_size > 1 and sae_tp_size > vllm_tp_size * vllm_dp_size:
+    if vllm_dp_size > 1 and sae_dp_size > 1:
+        large = max(vllm_dp_size, sae_dp_size)
+        small = min(vllm_dp_size, sae_dp_size)
+        if large % small != 0:
+            raise ValueError(
+                "vllm_dp_size and sae_dp_size must be integer multiples of each other; "
+                f"got vllm_dp_size={vllm_dp_size}, sae_dp_size={sae_dp_size}"
+            )
+        if sae_dp_size > vllm_dp_size:
+            raise ValueError(
+                "m:mn topology (sae_dp_size > vllm_dp_size) is not yet supported"
+            )
+    fan_in_topology = vllm_dp_size > sae_dp_size
+    matched_dp_topology = vllm_dp_size == sae_dp_size and vllm_dp_size > 1
+
+    if fan_in_topology and sae_tp_size > vllm_tp_size * vllm_dp_size:
         raise ValueError(
             f"sae_tp_size={sae_tp_size} > vllm_tp_size*vllm_dp_size="
-            f"{vllm_tp_size * vllm_dp_size} is not supported with vllm_dp > 1"
+            f"{vllm_tp_size * vllm_dp_size} is not supported with vllm_dp > sae_dp"
         )
 
     assert dist.is_initialized(), "Call dist.init_process_group() before init_distributed()"
     world_size = dist.get_world_size()
 
-    if vllm_dp_size > 1:
-        # vLLM DP mode: multiple vLLM groups → one SAE.
-        expected_world_size = max(vllm_tp_size * vllm_dp_size, sae_tp_size)
+    if fan_in_topology:
+        # mn:m cluster model: vllm_dp = n * sae_dp, each cluster has n vLLM replicas → 1 SAE.
+        # n=1, sae_dp=1 is the legacy m:1 case (special case of this model).
+        expected_world_size = max(vllm_tp_size * vllm_dp_size, sae_tp_size * sae_dp_size)
     else:
-        # Legacy prefix-overlap mode.
-        expected_world_size = max(vllm_tp_size, sae_tp_size) * dp_size
+        replica_size = max(vllm_tp_size, sae_tp_size)
+        expected_world_size = replica_size * sae_dp_size
 
     assert world_size == expected_world_size, (
         f"world_size={world_size} != expected={expected_world_size} "
         f"(vllm_tp={vllm_tp_size}, vllm_dp={vllm_dp_size}, "
-        f"sae_tp={sae_tp_size}, dp={dp_size})"
+        f"sae_tp={sae_tp_size}, sae_dp={sae_dp_size})"
     )
 
     rank = dist.get_rank()
     _sae_tp_size = sae_tp_size
-    _dp_size = dp_size
+    _sae_dp_size = sae_dp_size
     _vllm_tp_size = vllm_tp_size
     _vllm_dp_size = vllm_dp_size
     _vllm_dp_p2p_group = None
 
-    if vllm_dp_size > 1:
-        # ---- vLLM DP mode ----
-        total_vllm_ranks = vllm_tp_size * vllm_dp_size
-        _vllm_active = rank < total_vllm_ranks
-        _sae_active = rank < sae_tp_size
-        _dp_rank = 0  # sae_dp fixed at 1
+    if fan_in_topology:
+        # ---- mn:m fan-in topology (generalisation of m:1) ----
+        # n vLLM replicas per cluster, each cluster feeds one SAE replica.
+        # n=vllm_dp_size when sae_dp_size==1 (legacy m:1 is a special case).
+        _layout_mode = "vllm_dp_fan_in"
+        n = vllm_dp_size // sae_dp_size
+        block = max(n * vllm_tp_size, sae_tp_size)  # ranks per cluster
 
+        c = rank // block   # cluster index == sae_dp_rank
+        w = rank % block    # offset within cluster
+
+        _sae_dp_rank = c
+        _sae_active = w < sae_tp_size
+        _sae_tp_rank = w if _sae_active else -1
+        _vllm_active = w < n * vllm_tp_size
         if _vllm_active:
-            _vllm_dp_rank = rank // vllm_tp_size
-            _vllm_tp_rank = rank % vllm_tp_size
+            _vllm_dp_rank = c * n + w // vllm_tp_size
+            _vllm_tp_rank = w % vllm_tp_size
         else:
             _vllm_dp_rank = -1
             _vllm_tp_rank = -1
-
-        _sae_tp_rank = rank if _sae_active else -1
         _worker_size = vllm_tp_size
+        _cluster_block = block
         _worker_rank = _vllm_tp_rank if _vllm_active else -1
 
-        # vLLM TP group per DP group.
+        # vLLM TP group for each vLLM DP replica.
         for vdp in range(vllm_dp_size):
-            base = vdp * vllm_tp_size
+            cc = vdp // n
+            j = vdp % n
+            base = cc * block + j * vllm_tp_size
             ranks = list(range(base, base + vllm_tp_size))
             group = dist.new_group(ranks)
             cpu_group = dist.new_group(ranks, backend="gloo")
@@ -155,63 +183,69 @@ def init_distributed(
                 _worker_group = group
                 _worker_cpu_group = cpu_group
 
-        # SAE TP group (single, sae_dp=1).
-        # dist.new_group must be called by ALL ranks for correctness.
-        sae_ranks = list(range(sae_tp_size))
-        sae_group = dist.new_group(sae_ranks)
-        if _sae_active:
-            _sae_tp_group = sae_group
+        # SAE TP group for each SAE replica (cluster).
+        for cc in range(sae_dp_size):
+            base = cc * block
+            sae_ranks = list(range(base, base + sae_tp_size))
+            group = dist.new_group(sae_ranks)
+            if _sae_active and _sae_dp_rank == cc:
+                _sae_tp_group = group
+
+        # SAE DP group: same sae_tp_rank across all clusters.
+        for sae_tp_r in range(sae_tp_size):
+            dp_ranks = [cc * block + sae_tp_r for cc in range(sae_dp_size)]
+            group = dist.new_group(dp_ranks)
+            if _sae_active and _sae_tp_rank == sae_tp_r:
+                _sae_dp_group = group
 
         # Dedicated Gloo group for vLLM DP P2P activation transfer.
         # Keep this path off NCCL entirely: vLLM's parallel-state setup can
         # leave additional NCCL P2P communicators in an invalid device state.
         all_ranks = list(range(world_size))
         _vllm_dp_p2p_group = dist.new_group(all_ranks, backend="gloo")
-
-        # No SAE DP group needed (sae_dp=1).
-        _sae_dp_group = None
     else:
-        # ---- Legacy prefix-overlap mode (unchanged) ----
+        # ---- Local overlap / matched DP topology ----
+        _layout_mode = "matched_dp" if matched_dp_topology else "local_overlap"
         replica_size = max(vllm_tp_size, sae_tp_size)
         _worker_size = replica_size
-        _dp_rank = rank // replica_size
+        _sae_dp_rank = rank // replica_size
         _worker_rank = rank % replica_size
         _sae_active = _worker_rank < sae_tp_size
         _vllm_active = _worker_rank < vllm_tp_size
         _sae_tp_rank = _worker_rank if _sae_active else -1
         _vllm_tp_rank = _worker_rank if _vllm_active else -1
-        _vllm_dp_rank = 0
-        _vllm_dp_size = 1
+        _vllm_dp_rank = _sae_dp_rank if matched_dp_topology else 0
+        _vllm_dp_size = sae_dp_size if matched_dp_topology else 1
 
-        # Active worker group for each DP replica.
-        for dp_r in range(dp_size):
-            base = dp_r * replica_size
+        # Active worker group for each replica.
+        for replica_r in range(sae_dp_size):
+            base = replica_r * replica_size
             ranks = list(range(base, base + replica_size))
             group = dist.new_group(ranks)
             cpu_group = dist.new_group(ranks, backend="gloo")
-            if _dp_rank == dp_r:
+            if _sae_dp_rank == replica_r:
                 _worker_group = group
                 _worker_cpu_group = cpu_group
 
         # SAE TP group: prefix [0, sae_tp_size) inside each replica.
-        for dp_r in range(dp_size):
-            base = dp_r * replica_size
+        for replica_r in range(sae_dp_size):
+            base = replica_r * replica_size
             ranks = list(range(base, base + sae_tp_size))
             group = dist.new_group(ranks)
-            if _dp_rank == dp_r and _sae_active:
+            if _sae_dp_rank == replica_r and _sae_active:
                 _sae_tp_group = group
 
         # vLLM TP group: prefix [0, vllm_tp_size) inside each replica.
-        for dp_r in range(dp_size):
-            base = dp_r * replica_size
+        for replica_r in range(sae_dp_size):
+            base = replica_r * replica_size
             ranks = list(range(base, base + vllm_tp_size))
             group = dist.new_group(ranks)
-            if _dp_rank == dp_r and _vllm_active:
+            if _sae_dp_rank == replica_r and _vllm_active:
                 _vllm_tp_group = group
 
         # SAE DP group: same local SAE rank across replicas.
         for sae_tp_r in range(sae_tp_size):
-            ranks = [dp_r * replica_size + sae_tp_r for dp_r in range(dp_size)]
+            ranks = [replica_r * replica_size + sae_tp_r for replica_r in range(sae_dp_size)]
             group = dist.new_group(ranks)
             if _sae_active and _sae_tp_rank == sae_tp_r:
                 _sae_dp_group = group
@@ -246,22 +280,22 @@ def is_vllm_active() -> bool:
 
 
 def get_replica_base_rank() -> int:
-    return _dp_rank * _worker_size
+    return _sae_dp_rank * _worker_size
 
 
 def get_vllm_root_rank() -> int:
     """Root rank of this rank's vLLM DP group."""
-    if _vllm_dp_size > 1:
+    if _layout_mode == "vllm_dp_fan_in":
         return _vllm_dp_rank * _vllm_tp_size
     return get_replica_base_rank()
 
 
 def get_vllm_world_ranks() -> list[int]:
-    if _vllm_dp_size > 1:
+    if _layout_mode == "vllm_dp_fan_in":
         return list(range(_vllm_tp_size * _vllm_dp_size))
     return [
         dp_r * _worker_size + local_rank
-        for dp_r in range(_dp_size)
+        for dp_r in range(_sae_dp_size)
         for local_rank in range(_vllm_tp_size)
     ]
 
@@ -306,12 +340,22 @@ def get_tp_size() -> int:
     return get_sae_tp_size()
 
 
+def get_sae_dp_rank() -> int:
+    return _sae_dp_rank
+
+
 def get_dp_rank() -> int:
-    return _dp_rank
+    """Backward-compatible alias for the SAE DP rank."""
+    return get_sae_dp_rank()
+
+
+def get_sae_dp_size() -> int:
+    return _sae_dp_size
 
 
 def get_dp_size() -> int:
-    return _dp_size
+    """Backward-compatible alias for the SAE DP size."""
+    return get_sae_dp_size()
 
 
 def get_vllm_tp_rank() -> int:
@@ -333,6 +377,17 @@ def get_vllm_dp_size() -> int:
 def is_vllm_dp_root() -> bool:
     """True if this rank is the root (TP rank 0) of its vLLM DP group."""
     return _vllm_active and _vllm_tp_rank == 0
+
+
+def get_sae_root_rank() -> int:
+    """Global rank of the SAE TP root (sae_tp_rank=0) in this rank's cluster.
+
+    In fan-in (mn:m) topology this is the first rank of the cluster (c * block).
+    In matched DP / local overlap it is the first rank of the replica.
+    """
+    if _layout_mode == "vllm_dp_fan_in":
+        return _sae_dp_rank * _cluster_block
+    return _sae_dp_rank * _worker_size
 
 
 def get_vllm_dp_p2p_group() -> dist.ProcessGroup | None:

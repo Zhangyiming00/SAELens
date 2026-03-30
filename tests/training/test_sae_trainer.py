@@ -1,9 +1,11 @@
 import json
 from pathlib import Path
 from typing import Any, Callable
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 from datasets import Dataset
 from transformer_lens import HookedTransformer
 
@@ -166,6 +168,50 @@ def test_train_step__sparsity_updates_based_on_feature_act_sparsity(
         == 0
     )
     assert train_output.feature_acts is feature_acts
+
+
+def test_train_step_matches_baseline_when_dp_gradients_are_averaged(
+    cfg: LanguageModelSAERunnerConfig[StandardTrainingSAEConfig],
+) -> None:
+    sae_in = torch.randn(4, cfg.sae.d_in)
+    initial_sae = StandardTrainingSAE.from_dict(cfg.get_training_sae_cfg_dict())
+    initial_state = initial_sae.state_dict()
+
+    baseline_sae = StandardTrainingSAE.from_dict(cfg.get_training_sae_cfg_dict())
+    baseline_sae.load_state_dict(initial_state)
+    baseline_trainer = SAETrainer(
+        cfg=cfg.to_sae_trainer_config(),
+        sae=baseline_sae,
+        data_provider=iter([]),
+    )
+    baseline_trainer._train_step(sae=baseline_sae, sae_in=sae_in)
+
+    dp_sae = StandardTrainingSAE.from_dict(cfg.get_training_sae_cfg_dict())
+    dp_sae.load_state_dict(initial_state)
+    dp_trainer = SAETrainer(
+        cfg=cfg.to_sae_trainer_config(),
+        sae=dp_sae,
+        data_provider=iter([]),
+        dp_group=MagicMock(),
+    )
+
+    def _fake_all_reduce(
+        tensor: torch.Tensor, op: object = dist.ReduceOp.SUM, group: object | None = None
+    ) -> None:
+        del group
+        # Simulate sum-allreduce for gradients; MAX for did_fire (0/1 int) is a no-op mul by 1.
+        tensor.mul_(2)
+
+    with (
+        patch("sae_lens.training.sae_trainer.dist.get_world_size", return_value=2),
+        patch("sae_lens.training.sae_trainer.dist.all_reduce", side_effect=_fake_all_reduce),
+    ):
+        dp_trainer._train_step(sae=dp_sae, sae_in=sae_in)
+
+    for baseline_param, dp_param in zip(
+        baseline_sae.parameters(), dp_sae.parameters(), strict=True
+    ):
+        assert_close(baseline_param, dp_param)
 
 
 def test_log_feature_sparsity__handles_zeroes_by_default_fp32() -> None:

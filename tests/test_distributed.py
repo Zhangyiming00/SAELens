@@ -24,18 +24,21 @@ def _reset_distributed_state() -> None:
     distributed_mod._vllm_tp_group = None
     distributed_mod._worker_group = None
     distributed_mod._worker_cpu_group = None
+    distributed_mod._vllm_dp_p2p_group = None
     distributed_mod._sae_tp_rank = 0
     distributed_mod._sae_tp_size = 1
-    distributed_mod._dp_rank = 0
-    distributed_mod._dp_size = 1
+    distributed_mod._sae_dp_rank = 0
+    distributed_mod._sae_dp_size = 1
     distributed_mod._worker_rank = 0
     distributed_mod._worker_size = 1
+    distributed_mod._cluster_block = 1
     distributed_mod._vllm_tp_rank = -1
     distributed_mod._vllm_tp_size = 1
     distributed_mod._vllm_dp_rank = 0
     distributed_mod._vllm_dp_size = 1
     distributed_mod._sae_active = True
     distributed_mod._vllm_active = True
+    distributed_mod._layout_mode = "local_overlap"
 
 
 @pytest.fixture(autouse=True)
@@ -68,7 +71,7 @@ def test_config1_rank0_both_active():
     assert distributed_mod._vllm_active is True
     assert distributed_mod._sae_tp_rank == 0
     assert distributed_mod._vllm_tp_rank == 0
-    assert distributed_mod._dp_rank == 0
+    assert distributed_mod._sae_dp_rank == 0
     assert distributed_mod._worker_rank == 0
 
 
@@ -270,6 +273,7 @@ def _run_init_dp(
     sae_tp: int,
     vllm_tp: int,
     vllm_dp: int,
+    sae_dp: int = 1,
 ) -> None:
     mock_group = MagicMock()
     with (
@@ -282,6 +286,7 @@ def _run_init_dp(
             sae_tp_size=sae_tp,
             vllm_tp_size=vllm_tp,
             vllm_dp_size=vllm_dp,
+            sae_dp_size=sae_dp,
         )
 
 
@@ -405,21 +410,97 @@ def test_vllm_dp1_matches_legacy():
 
 
 # ---------------------------------------------------------------------------
-# vLLM DP validation errors
+# Matched DP (m:m) topology
 # ---------------------------------------------------------------------------
 
 
-def test_vllm_dp_rejects_dp_size_gt1():
-    with pytest.raises(ValueError, match="vllm_dp_size > 1 and dp_size > 1"):
+def test_matched_dp_rank0_both_active():
+    _run_init_dp(rank=0, world_size=4, sae_tp=1, vllm_tp=2, vllm_dp=2, sae_dp=2)
+    assert distributed_mod._layout_mode == "matched_dp"
+    assert distributed_mod._sae_active is True
+    assert distributed_mod._vllm_active is True
+    assert distributed_mod._sae_dp_rank == 0
+    assert distributed_mod._vllm_dp_rank == 0
+    assert distributed_mod._vllm_tp_rank == 0
+
+
+def test_matched_dp_rank1_vllm_only():
+    _run_init_dp(rank=1, world_size=4, sae_tp=1, vllm_tp=2, vllm_dp=2, sae_dp=2)
+    assert distributed_mod._sae_active is False
+    assert distributed_mod._vllm_active is True
+    assert distributed_mod._sae_dp_rank == 0
+    assert distributed_mod._vllm_dp_rank == 0
+    assert distributed_mod._vllm_tp_rank == 1
+
+
+def test_matched_dp_rank2_both_active_second_replica():
+    _run_init_dp(rank=2, world_size=4, sae_tp=1, vllm_tp=2, vllm_dp=2, sae_dp=2)
+    assert distributed_mod._sae_active is True
+    assert distributed_mod._vllm_active is True
+    assert distributed_mod._sae_dp_rank == 1
+    assert distributed_mod._vllm_dp_rank == 1
+    assert distributed_mod._vllm_tp_rank == 0
+
+
+def test_matched_dp_accessors_use_replica_layout():
+    _run_init_dp(rank=2, world_size=4, sae_tp=1, vllm_tp=2, vllm_dp=2, sae_dp=2)
+    from sae_lens.distributed import (
+        get_sae_dp_rank,
+        get_sae_dp_size,
+        get_vllm_dp_rank,
+        get_vllm_dp_size,
+        get_vllm_root_rank,
+        get_vllm_world_ranks,
+        is_vllm_dp_root,
+    )
+
+    assert get_sae_dp_rank() == 1
+    assert get_sae_dp_size() == 2
+    assert get_vllm_dp_rank() == 1
+    assert get_vllm_dp_size() == 2
+    assert is_vllm_dp_root() is True
+    assert get_vllm_root_rank() == 2
+    assert get_vllm_world_ranks() == [0, 1, 2, 3]
+
+
+def test_matched_dp_accessors_handle_noncontiguous_vllm_world_ranks():
+    _run_init_dp(rank=2, world_size=4, sae_tp=2, vllm_tp=1, vllm_dp=2, sae_dp=2)
+    from sae_lens.distributed import get_vllm_root_rank, get_vllm_world_ranks
+
+    assert get_vllm_root_rank() == 2
+    assert get_vllm_world_ranks() == [0, 2]
+
+
+# ---------------------------------------------------------------------------
+# Validation errors
+# ---------------------------------------------------------------------------
+
+
+def test_rejects_sae_dp_without_vllm_dp():
+    with pytest.raises(ValueError, match="sae_dp_size > 1 requires vllm_dp_size > 1"):
         mock_group = MagicMock()
         with (
             patch("sae_lens.distributed.dist.is_initialized", return_value=True),
-            patch("sae_lens.distributed.dist.get_world_size", return_value=4),
+            patch("sae_lens.distributed.dist.get_world_size", return_value=2),
             patch("sae_lens.distributed.dist.get_rank", return_value=0),
             patch("sae_lens.distributed.dist.new_group", return_value=mock_group),
         ):
             init_distributed(
-                sae_tp_size=1, vllm_tp_size=1, vllm_dp_size=2, dp_size=2
+                sae_tp_size=1, vllm_tp_size=1, vllm_dp_size=1, sae_dp_size=2
+            )
+
+
+def test_rejects_mismatched_dp_sizes():
+    with pytest.raises(ValueError, match="must be integer multiples"):
+        mock_group = MagicMock()
+        with (
+            patch("sae_lens.distributed.dist.is_initialized", return_value=True),
+            patch("sae_lens.distributed.dist.get_world_size", return_value=6),
+            patch("sae_lens.distributed.dist.get_rank", return_value=0),
+            patch("sae_lens.distributed.dist.new_group", return_value=mock_group),
+        ):
+            init_distributed(
+                sae_tp_size=1, vllm_tp_size=1, vllm_dp_size=3, sae_dp_size=2
             )
 
 
@@ -447,3 +528,219 @@ def test_vllm_dp_rejects_sae_tp_too_large():
             init_distributed(
                 sae_tp_size=3, vllm_tp_size=1, vllm_dp_size=2
             )
+
+
+# ---------------------------------------------------------------------------
+# mn:m topology tests
+# ---------------------------------------------------------------------------
+
+
+def _run_init_mn_m(
+    rank: int,
+    world_size: int,
+    sae_tp: int,
+    vllm_tp: int,
+    vllm_dp: int,
+    sae_dp: int,
+) -> None:
+    mock_group = MagicMock()
+    with (
+        patch("sae_lens.distributed.dist.is_initialized", return_value=True),
+        patch("sae_lens.distributed.dist.get_world_size", return_value=world_size),
+        patch("sae_lens.distributed.dist.get_rank", return_value=rank),
+        patch("sae_lens.distributed.dist.new_group", return_value=mock_group),
+    ):
+        init_distributed(
+            sae_tp_size=sae_tp,
+            vllm_tp_size=vllm_tp,
+            vllm_dp_size=vllm_dp,
+            sae_dp_size=sae_dp,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Case A: vllm_dp=4, sae_dp=2, vllm_tp=2, sae_tp=1 → world=8
+# n=2, block=4
+# cluster 0: ranks 0-3, cluster 1: ranks 4-7
+# rank 0: vllm_dp=0,tp=0  sae_dp=0,tp=0  both active
+# rank 1: vllm_dp=0,tp=1                  vllm only
+# rank 2: vllm_dp=1,tp=0                  vllm only (helper root)
+# rank 3: vllm_dp=1,tp=1                  vllm only
+# rank 4: vllm_dp=2,tp=0  sae_dp=1,tp=0  both active
+# rank 7: vllm_dp=3,tp=1                  vllm only
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rank,exp_sae_active,exp_vllm_active,exp_sae_dp,exp_vllm_dp,exp_sae_tp,exp_vllm_tp",
+    [
+        (0, True,  True,  0, 0, 0, 0),
+        (1, False, True,  0, 0, -1, 1),
+        (2, False, True,  0, 1, -1, 0),
+        (3, False, True,  0, 1, -1, 1),
+        (4, True,  True,  1, 2, 0, 0),
+        (5, False, True,  1, 2, -1, 1),
+        (6, False, True,  1, 3, -1, 0),
+        (7, False, True,  1, 3, -1, 1),
+    ],
+)
+def test_mn_m_case_a_rank_roles(
+    rank, exp_sae_active, exp_vllm_active, exp_sae_dp, exp_vllm_dp, exp_sae_tp, exp_vllm_tp
+):
+    _run_init_mn_m(rank=rank, world_size=8, sae_tp=1, vllm_tp=2, vllm_dp=4, sae_dp=2)
+    assert distributed_mod._sae_active is exp_sae_active
+    assert distributed_mod._vllm_active is exp_vllm_active
+    assert distributed_mod._sae_dp_rank == exp_sae_dp
+    assert distributed_mod._vllm_dp_rank == exp_vllm_dp
+    assert distributed_mod._sae_tp_rank == exp_sae_tp
+    assert distributed_mod._vllm_tp_rank == exp_vllm_tp
+
+
+def test_mn_m_case_a_layout_mode():
+    _run_init_mn_m(rank=0, world_size=8, sae_tp=1, vllm_tp=2, vllm_dp=4, sae_dp=2)
+    assert distributed_mod._layout_mode == "vllm_dp_fan_in"
+
+
+def test_mn_m_case_a_sae_root_rank():
+    from sae_lens.distributed import get_sae_root_rank
+    # cluster 0 SAE root = rank 0
+    _run_init_mn_m(rank=0, world_size=8, sae_tp=1, vllm_tp=2, vllm_dp=4, sae_dp=2)
+    assert get_sae_root_rank() == 0
+    # cluster 1 SAE root = rank 4
+    _run_init_mn_m(rank=4, world_size=8, sae_tp=1, vllm_tp=2, vllm_dp=4, sae_dp=2)
+    assert get_sae_root_rank() == 4
+
+
+def test_mn_m_case_a_sae_dp_group_spans_clusters():
+    # SAE DP rank 0 (rank 0) and SAE DP rank 1 (rank 4) should share an sae_dp_group.
+    # We verify both ranks get a non-None sae_dp_group (both sae_active with sae_tp_rank=0).
+    _run_init_mn_m(rank=0, world_size=8, sae_tp=1, vllm_tp=2, vllm_dp=4, sae_dp=2)
+    assert distributed_mod._sae_dp_group is not None
+    _run_init_mn_m(rank=4, world_size=8, sae_tp=1, vllm_tp=2, vllm_dp=4, sae_dp=2)
+    assert distributed_mod._sae_dp_group is not None
+
+
+# ---------------------------------------------------------------------------
+# Case B: vllm_dp=4, sae_dp=2, vllm_tp=1, sae_tp=4 → world=8
+# n=2, block=max(2,4)=4
+# rank 0: w=0, both active, vllm_dp=0, sae_tp=0
+# rank 1: w=1, BOTH active (vllm+sae), vllm_dp=1, sae_tp=1
+# rank 2: w=2, sae only, sae_tp=2
+# rank 3: w=3, sae only, sae_tp=3
+# rank 4: both active, sae_dp=1, vllm_dp=2, sae_tp=0
+# rank 5: BOTH active, sae_dp=1, vllm_dp=3, sae_tp=1
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rank,exp_sae_active,exp_vllm_active,exp_sae_dp,exp_vllm_dp,exp_sae_tp,exp_vllm_tp",
+    [
+        (0, True,  True,  0, 0, 0,  0),
+        (1, True,  True,  0, 1, 1,  0),   # simultaneously vllm+sae active
+        (2, True,  False, 0, -1, 2, -1),
+        (3, True,  False, 0, -1, 3, -1),
+        (4, True,  True,  1, 2, 0,  0),
+        (5, True,  True,  1, 3, 1,  0),   # simultaneously vllm+sae active
+        (6, True,  False, 1, -1, 2, -1),
+        (7, True,  False, 1, -1, 3, -1),
+    ],
+)
+def test_mn_m_case_b_rank_roles(
+    rank, exp_sae_active, exp_vllm_active, exp_sae_dp, exp_vllm_dp, exp_sae_tp, exp_vllm_tp
+):
+    _run_init_mn_m(rank=rank, world_size=8, sae_tp=4, vllm_tp=1, vllm_dp=4, sae_dp=2)
+    assert distributed_mod._sae_active is exp_sae_active
+    assert distributed_mod._vllm_active is exp_vllm_active
+    assert distributed_mod._sae_dp_rank == exp_sae_dp
+    assert distributed_mod._vllm_dp_rank == exp_vllm_dp
+    assert distributed_mod._sae_tp_rank == exp_sae_tp
+    assert distributed_mod._vllm_tp_rank == exp_vllm_tp
+
+
+def test_mn_m_case_b_sae_root_rank():
+    from sae_lens.distributed import get_sae_root_rank
+    _run_init_mn_m(rank=2, world_size=8, sae_tp=4, vllm_tp=1, vllm_dp=4, sae_dp=2)
+    assert get_sae_root_rank() == 0  # rank 2 is in cluster 0, SAE root = 0
+    _run_init_mn_m(rank=6, world_size=8, sae_tp=4, vllm_tp=1, vllm_dp=4, sae_dp=2)
+    assert get_sae_root_rank() == 4  # rank 6 is in cluster 1, SAE root = 4
+
+
+# ---------------------------------------------------------------------------
+# Case C: vllm_dp=6, sae_dp=2, vllm_tp=1, sae_tp=1 → world=6 (n=3)
+# block=3; cluster 0: ranks 0,1,2; cluster 1: ranks 3,4,5
+# rank 0: sae_dp=0, vllm_dp=0 (cluster SAE root)
+# rank 1: vllm only, helper root, vllm_dp=1
+# rank 2: vllm only, helper root, vllm_dp=2
+# rank 3: sae_dp=1, vllm_dp=3
+# rank 4: vllm only, vllm_dp=4
+# rank 5: vllm only, vllm_dp=5
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rank,exp_sae_active,exp_vllm_active,exp_sae_dp,exp_vllm_dp",
+    [
+        (0, True,  True,  0, 0),
+        (1, False, True,  0, 1),
+        (2, False, True,  0, 2),
+        (3, True,  True,  1, 3),
+        (4, False, True,  1, 4),
+        (5, False, True,  1, 5),
+    ],
+)
+def test_mn_m_case_c_rank_roles(rank, exp_sae_active, exp_vllm_active, exp_sae_dp, exp_vllm_dp):
+    _run_init_mn_m(rank=rank, world_size=6, sae_tp=1, vllm_tp=1, vllm_dp=6, sae_dp=2)
+    assert distributed_mod._sae_active is exp_sae_active
+    assert distributed_mod._vllm_active is exp_vllm_active
+    assert distributed_mod._sae_dp_rank == exp_sae_dp
+    assert distributed_mod._vllm_dp_rank == exp_vllm_dp
+
+
+def test_mn_m_case_c_sae_dp_group():
+    # rank 0 (sae_dp=0) and rank 3 (sae_dp=1) both sae_active with sae_tp_rank=0
+    # → both should have a non-None sae_dp_group
+    _run_init_mn_m(rank=0, world_size=6, sae_tp=1, vllm_tp=1, vllm_dp=6, sae_dp=2)
+    assert distributed_mod._sae_dp_group is not None
+    _run_init_mn_m(rank=3, world_size=6, sae_tp=1, vllm_tp=1, vllm_dp=6, sae_dp=2)
+    assert distributed_mod._sae_dp_group is not None
+
+
+def test_mn_m_case_c_sae_root_rank():
+    from sae_lens.distributed import get_sae_root_rank
+    # All ranks in cluster 0 should return SAE root = 0
+    for r in [0, 1, 2]:
+        _run_init_mn_m(rank=r, world_size=6, sae_tp=1, vllm_tp=1, vllm_dp=6, sae_dp=2)
+        assert get_sae_root_rank() == 0, f"rank {r} failed"
+    # All ranks in cluster 1 should return SAE root = 3
+    for r in [3, 4, 5]:
+        _run_init_mn_m(rank=r, world_size=6, sae_tp=1, vllm_tp=1, vllm_dp=6, sae_dp=2)
+        assert get_sae_root_rank() == 3, f"rank {r} failed"
+
+
+# ---------------------------------------------------------------------------
+# mn:m validation errors
+# ---------------------------------------------------------------------------
+
+
+def test_mn_m_rejects_non_multiple_dp_sizes():
+    with pytest.raises(ValueError, match="integer multiples"):
+        mock_group = MagicMock()
+        with (
+            patch("sae_lens.distributed.dist.is_initialized", return_value=True),
+            patch("sae_lens.distributed.dist.get_world_size", return_value=6),
+            patch("sae_lens.distributed.dist.get_rank", return_value=0),
+            patch("sae_lens.distributed.dist.new_group", return_value=mock_group),
+        ):
+            init_distributed(sae_tp_size=1, vllm_tp_size=1, vllm_dp_size=4, sae_dp_size=3)
+
+
+def test_mn_m_rejects_m_mn_topology():
+    with pytest.raises(ValueError, match="m:mn topology.*not yet supported"):
+        mock_group = MagicMock()
+        with (
+            patch("sae_lens.distributed.dist.is_initialized", return_value=True),
+            patch("sae_lens.distributed.dist.get_world_size", return_value=4),
+            patch("sae_lens.distributed.dist.get_rank", return_value=0),
+            patch("sae_lens.distributed.dist.new_group", return_value=mock_group),
+        ):
+            init_distributed(sae_tp_size=1, vllm_tp_size=1, vllm_dp_size=2, sae_dp_size=4)

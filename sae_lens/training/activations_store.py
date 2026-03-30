@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import warnings
 from collections.abc import Generator, Iterator
 from pathlib import Path
@@ -27,7 +28,11 @@ from sae_lens.config import (
 )
 from sae_lens.constants import ACTIVATIONS_STORE_STATE_FILENAME
 from sae_lens.distributed import (
+    get_sae_dp_rank,
+    get_sae_dp_size,
+    get_sae_root_rank,
     get_sae_tp_group,
+    get_sae_tp_rank,
     get_sae_tp_size,
     get_vllm_dp_p2p_group,
     get_vllm_dp_rank,
@@ -112,6 +117,7 @@ class ActivationsStore:
         override_dataset: HfDataset | None = None,
         dataset_shard_index: int = 0,
         dataset_shard_count: int = 1,
+        consumer_only: bool = False,
     ) -> ActivationsStore:
         if isinstance(cfg, CacheActivationsRunnerConfig):
             return cls.from_cache_activations(model, cfg)
@@ -168,6 +174,7 @@ class ActivationsStore:
             activations_mixing_fraction=cfg.activations_mixing_fraction,
             dataset_shard_index=dataset_shard_index,
             dataset_shard_count=dataset_shard_count,
+            consumer_only=consumer_only,
         )
 
     @classmethod
@@ -245,11 +252,13 @@ class ActivationsStore:
         activations_mixing_fraction: float = 0.5,
         dataset_shard_index: int = 0,
         dataset_shard_count: int = 1,
+        consumer_only: bool = False,
     ):
         self.model = model
         if model_kwargs is None:
             model_kwargs = {}
         self.model_kwargs = model_kwargs
+        self._consumer_only = consumer_only
         if isinstance(dataset, str):
             dataset_path = Path(dataset)
             if dataset_path.exists() and dataset_path.is_dir():
@@ -297,64 +306,101 @@ class ActivationsStore:
         self.activations_mixing_fraction = activations_mixing_fraction
         self._dataset_shard_index = dataset_shard_index
         self._dataset_shard_count = dataset_shard_count
+        self._current_data_timing = {
+            "vllm_step_time_s": 0.0,
+            "transfer_time_s": 0.0,
+        }
+        self._last_data_timing = {
+            "vllm_step_time_s": 0.0,
+            "transfer_time_s": 0.0,
+        }
 
         self.n_dataset_processed = 0
 
-        # Check if dataset is tokenized
-        dataset_sample = next(iter(self.dataset))
-
-        # check if it's tokenized
-        if "tokens" in dataset_sample:
+        if consumer_only:
+            # Consumer-only ranks in shard-routing mode are recv-only.
+            # They must not inspect or iterate the dataset locally.
             self.is_dataset_tokenized = True
             self.tokens_column = "tokens"
-        elif "input_ids" in dataset_sample:
-            self.is_dataset_tokenized = True
-            self.tokens_column = "input_ids"
-        elif "text" in dataset_sample:
-            self.is_dataset_tokenized = False
-            self.tokens_column = "text"
-        elif "problem" in dataset_sample:
-            self.is_dataset_tokenized = False
-            self.tokens_column = "problem"
         else:
-            raise ValueError(
-                "Dataset must have a 'tokens', 'input_ids', 'text', or 'problem' column."
-            )
-        if self.is_dataset_tokenized:
-            ds_context_size = len(dataset_sample[self.tokens_column])  # type: ignore
-            if ds_context_size < self.context_size:
+            dataset_sample = next(iter(self.dataset))
+
+            if "tokens" in dataset_sample:
+                self.is_dataset_tokenized = True
+                self.tokens_column = "tokens"
+            elif "input_ids" in dataset_sample:
+                self.is_dataset_tokenized = True
+                self.tokens_column = "input_ids"
+            elif "text" in dataset_sample:
+                self.is_dataset_tokenized = False
+                self.tokens_column = "text"
+            elif "problem" in dataset_sample:
+                self.is_dataset_tokenized = False
+                self.tokens_column = "problem"
+            else:
                 raise ValueError(
-                    f"""pretokenized dataset has context_size {ds_context_size}, but the provided context_size is {self.context_size}.
-                    The context_size {ds_context_size} is expected to be larger than or equal to the provided context size {self.context_size}."""
+                    "Dataset must have a 'tokens', 'input_ids', 'text', or 'problem' column."
                 )
-            if self.context_size != ds_context_size:
+            if self.is_dataset_tokenized:
+                ds_context_size = len(dataset_sample[self.tokens_column])  # type: ignore
+                if ds_context_size < self.context_size:
+                    raise ValueError(
+                        f"""pretokenized dataset has context_size {ds_context_size}, but the provided context_size is {self.context_size}.
+                        The context_size {ds_context_size} is expected to be larger than or equal to the provided context size {self.context_size}."""
+                    )
+                if self.context_size != ds_context_size:
+                    warnings.warn(
+                        f"""pretokenized dataset has context_size {ds_context_size}, but the provided context_size is {self.context_size}. Some data will be discarded in this case.""",
+                        RuntimeWarning,
+                    )
+                # TODO: investigate if this can work for iterable datasets, or if this is even worthwhile as a perf improvement
+                if hasattr(self.dataset, "set_format"):
+                    self.dataset.set_format(type="torch", columns=[self.tokens_column])  # type: ignore
+
+                if (
+                    isinstance(dataset, str)
+                    and hasattr(model, "tokenizer")
+                    and model.tokenizer is not None
+                ):
+                    validate_pretokenized_dataset_tokenizer(
+                        dataset_path=dataset,
+                        model_tokenizer=model.tokenizer,  # type: ignore
+                    )
+            else:
                 warnings.warn(
-                    f"""pretokenized dataset has context_size {ds_context_size}, but the provided context_size is {self.context_size}. Some data will be discarded in this case.""",
-                    RuntimeWarning,
+                    "Dataset is not tokenized. Pre-tokenizing will improve performance and allows for more control over special tokens. See https://decoderesearch.github.io/SAELens/training_saes/#pretokenizing-datasets for more info."
                 )
-            # TODO: investigate if this can work for iterable datasets, or if this is even worthwhile as a perf improvement
-            if hasattr(self.dataset, "set_format"):
-                self.dataset.set_format(type="torch", columns=[self.tokens_column])  # type: ignore
 
-            if (
-                isinstance(dataset, str)
-                and hasattr(model, "tokenizer")
-                and model.tokenizer is not None
-            ):
-                validate_pretokenized_dataset_tokenizer(
-                    dataset_path=dataset,
-                    model_tokenizer=model.tokenizer,  # type: ignore
-                )
-        else:
-            warnings.warn(
-                "Dataset is not tokenized. Pre-tokenizing will improve performance and allows for more control over special tokens. See https://decoderesearch.github.io/SAELens/training_saes/#pretokenizing-datasets for more info."
-            )
+        self.iterable_sequences = self._iterate_tokenized_sequences() if not consumer_only else None  # type: ignore[assignment]
 
-        self.iterable_sequences = self._iterate_tokenized_sequences()
-
-        self.cached_activation_dataset = self.load_cached_activation_dataset()
+        self.cached_activation_dataset = self.load_cached_activation_dataset() if not consumer_only else None
 
         # TODO add support for "mixed loading" (ie use cache until you run out, then switch over to streaming from HF)
+
+    def _reset_current_data_timing(self) -> None:
+        self._current_data_timing = {
+            "vllm_step_time_s": 0.0,
+            "transfer_time_s": 0.0,
+        }
+
+    def _add_data_timing(
+        self,
+        *,
+        vllm_step_time_s: float = 0.0,
+        transfer_time_s: float = 0.0,
+    ) -> None:
+        self._current_data_timing["vllm_step_time_s"] += vllm_step_time_s
+        self._current_data_timing["transfer_time_s"] += transfer_time_s
+
+    def consume_last_data_timing(self) -> dict[str, float]:
+        return dict(self._last_data_timing)
+
+    def _use_v2_phase_timing(self) -> bool:
+        try:
+            import sae_lens.distributed_v2 as v2_mod
+        except ImportError:
+            return False
+        return v2_mod._initialized
 
     def _iterate_raw_dataset(
         self,
@@ -513,15 +559,21 @@ class ActivationsStore:
 
         If raise_at_epoch_end is true we will reset the dataset at the end of each epoch and raise a StopIteration. Otherwise we will reset silently.
         """
+        if self._consumer_only:
+            raise RuntimeError(
+                "Consumer-only ActivationsStore is recv-only and cannot fetch batch tokens."
+            )
         if not batch_size:
             batch_size = self.store_batch_size_prompts
         worker_group = get_worker_group() if dist.is_initialized() else None
         worker_cpu_group = get_worker_cpu_group() if dist.is_initialized() else None
+        use_v2_phase_timing = self._use_v2_phase_timing()
         if worker_group is not None and worker_cpu_group is not None:
             src_rank = get_vllm_root_rank()
             _debug_prefix_tp(f"get_batch_tokens start batch_size={batch_size} src={src_rank}")
             epoch_end = torch.zeros(1, dtype=torch.int32)
             if dist.get_rank() == src_rank:
+                local_t0 = time.perf_counter()
                 try:
                     batch_tokens = self._get_batch_tokens_local(
                         batch_size=batch_size,
@@ -533,23 +585,40 @@ class ActivationsStore:
                         (batch_size, self.context_size),
                         dtype=torch.long,
                     )
+                if not use_v2_phase_timing:
+                    self._add_data_timing(
+                        vllm_step_time_s=time.perf_counter() - local_t0
+                    )
             else:
                 batch_tokens = torch.empty(
                     (batch_size, self.context_size),
                     dtype=torch.long,
                 )
+            transfer_t0 = time.perf_counter()
             dist.broadcast(epoch_end, src=src_rank, group=worker_cpu_group)
             if epoch_end.item():
+                if not use_v2_phase_timing:
+                    self._add_data_timing(
+                        transfer_time_s=time.perf_counter() - transfer_t0
+                    )
                 _debug_prefix_tp("get_batch_tokens epoch_end")
                 raise StopIteration
             dist.broadcast(batch_tokens, src=src_rank, group=worker_cpu_group)
+            if not use_v2_phase_timing:
+                self._add_data_timing(
+                    transfer_time_s=time.perf_counter() - transfer_t0
+                )
             _debug_prefix_tp("get_batch_tokens done")
             return batch_tokens.to(self._get_runtime_device())
 
-        return self._get_batch_tokens_local(
+        local_t0 = time.perf_counter()
+        batch_tokens = self._get_batch_tokens_local(
             batch_size=batch_size,
             raise_at_epoch_end=raise_at_epoch_end,
         ).to(_get_model_device(self.model))
+        if not use_v2_phase_timing:
+            self._add_data_timing(vllm_step_time_s=time.perf_counter() - local_t0)
+        return batch_tokens
 
     def _get_batch_tokens_local(
         self, batch_size: int, raise_at_epoch_end: bool = False
@@ -578,18 +647,26 @@ class ActivationsStore:
         """
         worker_group = get_worker_group() if dist.is_initialized() else None
         worker_cpu_group = get_worker_cpu_group() if dist.is_initialized() else None
+        use_v2_phase_timing = self._use_v2_phase_timing()
         if worker_group is None or worker_cpu_group is None:
-            return self._get_activations_local(batch_tokens)
+            local_t0 = time.perf_counter()
+            activations = self._get_activations_local(batch_tokens)
+            if not use_v2_phase_timing:
+                self._add_data_timing(vllm_step_time_s=time.perf_counter() - local_t0)
+            return activations
 
         src_rank = get_vllm_root_rank()
         n_context = self.training_context_size
         if is_vllm_active():
+            local_t0 = time.perf_counter()
             _debug_prefix_tp("get_activations local run_with_cache start")
             # Normalize to the activation-store dtype before the CPU broadcast so
             # split-role SAE-only ranks allocate a matching receive buffer.
             stacked_activations = self._get_activations_local(batch_tokens).to(
                 device="cpu", dtype=self.dtype
             )
+            if not use_v2_phase_timing:
+                self._add_data_timing(vllm_step_time_s=time.perf_counter() - local_t0)
             _debug_prefix_tp("get_activations local run_with_cache done")
         else:
             stacked_activations = torch.empty(
@@ -597,9 +674,13 @@ class ActivationsStore:
                 dtype=self.dtype,
             )
             _debug_prefix_tp("get_activations waiting for broadcast")
+        transfer_t0 = time.perf_counter()
         dist.broadcast(stacked_activations, src=src_rank, group=worker_cpu_group)
         _debug_prefix_tp("get_activations broadcast done")
-        return stacked_activations.to(self.device)
+        activations = stacked_activations.to(self.device)
+        if not use_v2_phase_timing:
+            self._add_data_timing(transfer_time_s=time.perf_counter() - transfer_t0)
+        return activations
 
     def _get_activations_local(self, batch_tokens: torch.Tensor) -> torch.Tensor:
         model_device = _get_model_device(self.model)
@@ -785,25 +866,29 @@ class ActivationsStore:
     def _iterate_filtered_activations(self) -> Generator[torch.Tensor, None, None]:
         """Iterate over filtered LLM activation batches.
 
-        When vllm_dp_size > 1 and this rank is sae_active, gathers raw batches
-        from all vLLM DP groups via P2P send/recv and yields them one producer
-        at a time.
+        When ``vllm_dp_size > sae_dp_size`` (mn:m fan-in), gathers raw batches
+        from each cluster's n vLLM DP groups via P2P send/recv and yields them
+        one producer at a time.  The legacy m:1 case is the special case n=vllm_dp_size,
+        sae_dp_size=1.
 
-        This keeps rank 0 from materializing a single large concatenated batch
+        This keeps each SAE root from materializing a single large concatenated batch
         before handing data to the mixing buffer. The mixing buffer still sees
         the same total stream of activations, just in smaller chunks.
         """
         vllm_dp_size = get_vllm_dp_size() if dist.is_initialized() else 1
-        if vllm_dp_size <= 1:
+        sae_dp_size = get_sae_dp_size() if dist.is_initialized() else 1
+        if vllm_dp_size <= sae_dp_size:
             yield from self._iterate_filtered_activations_single()
             return
 
-        # vLLM DP mode: gather raw batches from all DP groups.
+        # mn:m fan-in: each cluster has n = vllm_dp_size // sae_dp_size vLLM replicas.
         from sae_lens.distributed import is_sae_active
 
-        rank = dist.get_rank()
+        n = vllm_dp_size // sae_dp_size
         vllm_dp_rank = get_vllm_dp_rank()
         vllm_tp_size = get_vllm_tp_size()
+        sae_dp_rank = get_sae_dp_rank()
+        sae_tp_rank = get_sae_tp_rank()
         sae_tp_size = get_sae_tp_size()
         sae_tp_group = get_sae_tp_group()
         p2p_group = get_vllm_dp_p2p_group()
@@ -811,6 +896,13 @@ class ActivationsStore:
             raise RuntimeError(
                 "vLLM DP P2P group is not initialized; refusing to fall back to the default process group."
             )
+
+        # block size = ranks per cluster (same formula as distributed.py)
+        block = max(n * vllm_tp_size, sae_tp_size)
+        # SAE root of this cluster = first rank of this cluster
+        cluster_sae_root = sae_dp_rank * block
+        # First vllm_dp_rank in this cluster
+        cluster_first_vllm_dp = sae_dp_rank * n
 
         while True:
             try:
@@ -833,38 +925,40 @@ class ActivationsStore:
             if raw_tokens is not None:
                 raw_tokens = raw_tokens.to("cpu").contiguous()
 
-            # Step 1: Non-zero DP roots send their raw batch to SAE root (rank 0)
-            # via P2P. This must complete BEFORE any SAE TP broadcasts, because
-            # rank 0 needs to recv before it can broadcast, and SAE TP follower
-            # ranks that are also vLLM DP helpers must finish sending before they
-            # can participate in SAE TP broadcasts.
-            if is_vllm_dp_root() and vllm_dp_rank > 0:
-                _debug_prefix_tp("vllm_dp helper send start")
-                dist.send(raw_acts, dst=0, group=p2p_group)
+            # Step 1: Non-root vLLM DP roots within this cluster send their raw batch
+            # to the cluster's SAE root via P2P.  A rank is a "non-root helper root" if
+            # it is the TP root of its vLLM DP group AND it is not the cluster SAE root.
+            is_cluster_sae_root = (vllm_dp_rank == cluster_first_vllm_dp) and (sae_tp_rank == 0)
+            if is_vllm_dp_root() and not is_cluster_sae_root:
+                transfer_t0 = time.perf_counter()
+                _debug_prefix_tp(f"vllm_dp helper send start dst={cluster_sae_root}")
+                dist.send(raw_acts, dst=cluster_sae_root, group=p2p_group)
                 if raw_tokens is not None:
-                    dist.send(raw_tokens, dst=0, group=p2p_group)
+                    dist.send(raw_tokens, dst=cluster_sae_root, group=p2p_group)
+                self._add_data_timing(
+                    transfer_time_s=time.perf_counter() - transfer_t0
+                )
                 _debug_prefix_tp("vllm_dp helper send done")
 
-            # Step 2: Rank 0 collects all helper batches via P2P recv, then
-            # broadcasts each batch (own + helpers) to the SAE TP group.
-            # SAE TP follower ranks participate in the broadcasts.
-            #
-            # The ordering is: rank 0 recvs ALL helper batches first, then
-            # broadcasts them in sequence. This avoids deadlock when a rank is
-            # both a vLLM DP helper (needs to send before rank 0 can proceed)
-            # and an SAE TP follower (needs to participate in broadcasts).
-            if rank == 0:
+            # Step 2: SAE root of each cluster collects the n-1 helper batches from its
+            # cluster, then broadcasts all n batches to the SAE TP group.
+            # SAE TP follower ranks participate in the n broadcasts.
+            if sae_tp_rank == 0:
                 # Collect helper batches first so P2P sends can complete.
                 helper_batches: list[tuple[torch.Tensor, torch.Tensor | None]] = []
-                for k in range(1, vllm_dp_size):
-                    src = k * vllm_tp_size
+                for j in range(1, n):
+                    src = cluster_sae_root + j * vllm_tp_size
                     recv_acts = torch.empty_like(raw_acts)
+                    transfer_t0 = time.perf_counter()
                     _debug_prefix_tp(f"vllm_dp root recv start src={src}")
                     dist.recv(recv_acts, src=src, group=p2p_group)
                     recv_tokens = None
                     if raw_tokens is not None:
                         recv_tokens = torch.empty_like(raw_tokens)
                         dist.recv(recv_tokens, src=src, group=p2p_group)
+                    self._add_data_timing(
+                        transfer_time_s=time.perf_counter() - transfer_t0
+                    )
                     _debug_prefix_tp(f"vllm_dp root recv done src={src}")
                     helper_batches.append((recv_acts, recv_tokens))
 
@@ -878,10 +972,14 @@ class ActivationsStore:
                             if batch_tokens is not None
                             else None
                         )
+                        transfer_t0 = time.perf_counter()
                         _debug_prefix_tp("vllm_dp root tp broadcast start")
-                        dist.broadcast(batch_acts, src=0, group=sae_tp_group)
+                        dist.broadcast(batch_acts, src=cluster_sae_root, group=sae_tp_group)
                         if batch_tokens is not None:
-                            dist.broadcast(batch_tokens, src=0, group=sae_tp_group)
+                            dist.broadcast(batch_tokens, src=cluster_sae_root, group=sae_tp_group)
+                        self._add_data_timing(
+                            transfer_time_s=time.perf_counter() - transfer_t0
+                        )
                         _debug_prefix_tp("vllm_dp root tp broadcast done")
                         yield _filter_buffer_acts(
                             (batch_acts, batch_tokens),
@@ -898,18 +996,19 @@ class ActivationsStore:
                             self.exclude_special_tokens,
                         )
             elif is_sae_active() and sae_tp_size > 1 and sae_tp_group is not None:
-                # SAE TP follower: participate in all vllm_dp_size broadcasts
-                # (own batch from rank 0 + each helper batch).
+                # SAE TP follower: participate in all n broadcasts
+                # (own batch from cluster SAE root + each helper batch).
                 combined_shape_acts = list(raw_acts.shape)
                 combined_shape_tokens = list(raw_tokens.shape) if raw_tokens is not None else None
-                for _ in range(vllm_dp_size):
+                for _ in range(n):
                     helper_acts = torch.empty(
                         combined_shape_acts,
                         dtype=raw_acts.dtype,
                         device=tp_runtime_device,
                     )
+                    transfer_t0 = time.perf_counter()
                     _debug_prefix_tp("vllm_dp tp follower broadcast wait")
-                    dist.broadcast(helper_acts, src=0, group=sae_tp_group)
+                    dist.broadcast(helper_acts, src=cluster_sae_root, group=sae_tp_group)
                     helper_tokens = None
                     if combined_shape_tokens is not None:
                         helper_tokens = torch.empty(
@@ -917,7 +1016,10 @@ class ActivationsStore:
                             dtype=raw_tokens.dtype,  # type: ignore[union-attr]
                             device=tp_runtime_device,
                         )
-                        dist.broadcast(helper_tokens, src=0, group=sae_tp_group)
+                        dist.broadcast(helper_tokens, src=cluster_sae_root, group=sae_tp_group)
+                    self._add_data_timing(
+                        transfer_time_s=time.perf_counter() - transfer_t0
+                    )
                     _debug_prefix_tp("vllm_dp tp follower broadcast done")
                     yield _filter_buffer_acts(
                         (helper_acts, helper_tokens),
@@ -942,12 +1044,225 @@ class ActivationsStore:
                         "Unable to fill buffer after starting new epoch. Dataset may be too small."
                     )
 
+    def _iterate_filtered_activations_v2(self) -> Generator[torch.Tensor, None, None]:
+        """Unified shard-routing activation iterator for consumer ranks.
+
+        One global training step = each consumer receives all inbound slices,
+        assembles them into one local batch, and yields exactly once.
+
+        The phase ordering guarantees deadlock-freedom:
+          Phase 1 — consumer roots post metadata irecvs (non-blocking)
+          Phase 2 — producer roots generate batch + send metadata
+          Phase 3 — consumer roots wait metadata, post payload irecvs
+          Phase 4 — producer roots send cached payloads
+          Phase 5 — consumer roots wait payloads, assemble in route order
+          Phase 6 — consumer TP root broadcasts to TP followers (if sae_tp > 1)
+          Phase 7 — all consumer ranks yield assembled batch
+
+        Consumer-only ranks (self._consumer_only=True) never call get_raw_llm_batch().
+        Producer-only ranks never enter this method (handled by the runner helper loop).
+        """
+        import sae_lens.distributed_v2 as v2
+
+        routing = v2.get_routing_table()
+        i_am_producer = v2.is_producer()
+        i_am_consumer = v2.is_consumer()
+        i_am_producer_root = i_am_producer and v2.get_vllm_tp_rank() == 0
+        i_am_consumer_root = i_am_consumer and v2.get_sae_tp_rank() == 0
+        c = v2.get_consumer_idx() if i_am_consumer else -1
+
+        from sae_lens.shard_routing import routes_for_consumer, routes_for_producer
+
+        while True:
+            local_slices: dict[int, torch.Tensor] = {}   # producer_idx -> tensor
+            outgoing: dict[int, torch.Tensor] = {}       # consumer_idx -> slice tensor
+
+            # === PHASE 1: Consumer roots post metadata irecvs ===
+            meta_work: list[tuple[object, torch.Tensor | None, object | None]] = []
+            if i_am_consumer_root:
+                for route in routes_for_consumer(routing, c):
+                    p = route.producer_idx
+                    if v2.get_producer_tp_root(p) == v2.get_consumer_tp_root(c):
+                        meta_work.append((route, None, None))  # local: no irecv
+                    else:
+                        meta_buf = torch.zeros(2, dtype=torch.int64)
+                        w = dist.irecv(
+                            meta_buf,
+                            src=v2.get_producer_tp_root(p),
+                            group=v2.get_p2p_group(c),
+                        )
+                        meta_work.append((route, meta_buf, w))
+
+            # === PHASE 2: Producer roots generate batch + send metadata ===
+            # All producer TP ranks must participate in get_raw_llm_batch() for the
+            # model-parallel forward collective; only the root sends P2P metadata.
+            vllm_stage_t0 = time.perf_counter()
+            if i_am_producer:
+                local_slices, outgoing = self._run_producer_phase2_v2()
+
+            # === PHASE 3: Consumer roots wait metadata, post payload irecvs ===
+            payload_work: list[tuple[object, torch.Tensor, object | None]] = []
+            if i_am_consumer_root:
+                for route, meta_buf, w in meta_work:
+                    p = route.producer_idx  # type: ignore[union-attr]
+                    if v2.get_producer_tp_root(p) == v2.get_consumer_tp_root(c):
+                        payload_work.append((route, local_slices[p], None))
+                    else:
+                        w.wait()  # type: ignore[union-attr]
+                        n_rows = int(meta_buf[0])  # type: ignore[index]
+                        d_in = int(meta_buf[1])  # type: ignore[index]
+                        act_buf = torch.zeros(n_rows, d_in, dtype=self.dtype)
+                        w2 = dist.irecv(
+                            act_buf,
+                            src=v2.get_producer_tp_root(p),
+                            group=v2.get_p2p_group(c),
+                        )
+                        payload_work.append((route, act_buf, w2))
+            self._add_data_timing(vllm_step_time_s=time.perf_counter() - vllm_stage_t0)
+
+            # === PHASE 4: Producer roots send cached payloads ===
+            transfer_t0 = time.perf_counter()
+            if i_am_producer_root:
+                self._run_producer_phase4_v2(outgoing)
+
+            # === PHASE 5: Consumer roots wait payloads, assemble in route order ===
+            assembled: torch.Tensor | None = None
+            if i_am_consumer_root:
+                buf_map: dict[int, torch.Tensor] = {}
+                for route, buf, w2 in payload_work:
+                    if w2 is not None:
+                        w2.wait()  # type: ignore[union-attr]
+                    buf_map[route.producer_idx] = buf  # type: ignore[union-attr]
+
+                c_routes = routes_for_consumer(routing, c)
+                assembled = torch.cat(
+                    [buf_map[r.producer_idx] for r in c_routes], dim=0
+                ).to(self.device)
+
+                # === PHASE 6: Broadcast to SAE TP followers ===
+                sae_tp_group = v2.get_sae_tp_group()
+                sae_tp_size = v2.get_sae_tp_size()
+                if sae_tp_size > 1 and sae_tp_group is not None:
+                    shape_t = torch.tensor(list(assembled.shape), dtype=torch.int64, device=self.device)
+                    dist.broadcast(shape_t, src=v2.get_consumer_tp_root(c), group=sae_tp_group)
+                    dist.broadcast(assembled, src=v2.get_consumer_tp_root(c), group=sae_tp_group)
+
+            elif i_am_consumer and v2.get_sae_tp_size() > 1:
+                # SAE TP follower: receive broadcasts
+                sae_tp_group = v2.get_sae_tp_group()
+                routing_c = v2.get_consumer_idx()
+                n_sources = len(routes_for_consumer(routing, routing_c))
+                shape_t = torch.zeros(2, dtype=torch.int64, device=self.device)
+                dist.broadcast(shape_t, src=v2.get_consumer_tp_root(routing_c), group=sae_tp_group)
+                assembled = torch.empty(
+                    int(shape_t[0]), int(shape_t[1]), dtype=self.dtype, device=self.device
+                )
+                dist.broadcast(assembled, src=v2.get_consumer_tp_root(routing_c), group=sae_tp_group)
+
+            # === PHASE 7: All consumer ranks yield assembled batch ===
+            if assembled is not None:
+                self._add_data_timing(
+                    transfer_time_s=time.perf_counter() - transfer_t0
+                )
+                yield _filter_buffer_acts(
+                    (assembled, None), self.exclude_special_tokens
+                )
+
+    def _get_raw_llm_batch_with_epoch_restart(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        try:
+            return self.get_raw_llm_batch(raise_on_epoch_end=True)
+        except StopIteration:
+            warnings.warn(
+                "All samples in the training dataset have been exhausted, beginning new epoch."
+            )
+            return self.get_raw_llm_batch()
+
+    def _run_producer_phase2_v2(
+        self,
+    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+        """Run shard-routing phase 2 for one producer step.
+
+        All producer TP ranks participate in ``get_raw_llm_batch()``. Only the
+        producer TP root prepares slices and sends metadata for remote consumers.
+        """
+        import sae_lens.distributed_v2 as v2
+
+        from sae_lens.shard_routing import routes_for_producer
+
+        local_slices: dict[int, torch.Tensor] = {}
+        outgoing: dict[int, torch.Tensor] = {}
+        if not v2.is_producer():
+            return local_slices, outgoing
+
+        # Keep producer TP root and non-roots on the same generation step.
+        vllm_tp_group = v2.get_vllm_tp_group()
+        if vllm_tp_group is not None and v2.get_vllm_tp_size() > 1:
+            barrier_kwargs: dict[str, Any] = {"group": vllm_tp_group}
+            if torch.cuda.is_available():
+                barrier_kwargs["device_ids"] = [torch.cuda.current_device()]
+            dist.barrier(**barrier_kwargs)
+
+        if v2.get_vllm_tp_rank() != 0:
+            self._get_raw_llm_batch_with_epoch_restart()
+            return local_slices, outgoing
+
+        p = v2.get_producer_idx()
+        raw_acts, _ = self._get_raw_llm_batch_with_epoch_restart()
+        raw_cpu = raw_acts.to("cpu").contiguous()
+
+        for route in routes_for_producer(v2.get_routing_table(), p):
+            cc = route.consumer_idx
+            sl = raw_cpu[route.row_start:route.row_end].contiguous()
+            outgoing[cc] = sl
+            if v2.get_producer_tp_root(p) == v2.get_consumer_tp_root(cc):
+                local_slices[route.producer_idx] = sl
+            else:
+                n_rows, d_in = sl.shape
+                meta = torch.tensor([n_rows, d_in], dtype=torch.int64)
+                dist.send(
+                    meta,
+                    dst=v2.get_consumer_tp_root(cc),
+                    group=v2.get_p2p_group(cc),
+                )
+
+        return local_slices, outgoing
+
+    def _run_producer_phase4_v2(self, outgoing: dict[int, torch.Tensor]) -> None:
+        """Run shard-routing phase 4 for one producer step."""
+        import sae_lens.distributed_v2 as v2
+
+        from sae_lens.shard_routing import routes_for_producer
+
+        if not v2.is_producer() or v2.get_vllm_tp_rank() != 0:
+            return
+
+        p = v2.get_producer_idx()
+        for route in routes_for_producer(v2.get_routing_table(), p):
+            cc = route.consumer_idx
+            if v2.get_producer_tp_root(p) != v2.get_consumer_tp_root(cc):
+                dist.send(
+                    outgoing[cc],
+                    dst=v2.get_consumer_tp_root(cc),
+                    group=v2.get_p2p_group(cc),
+                )
+
     def get_data_loader(
         self,
     ) -> Iterator[Any]:
         """
         Return an auto-refilling stream of filtered and mixed activations.
         """
+        import sae_lens.distributed_v2 as v2_mod
+
+        if v2_mod._initialized:
+            return mixing_buffer(
+                buffer_size=self.n_batches_in_buffer * self.training_context_size,
+                batch_size=self.train_batch_size_tokens,
+                activations_loader=self._iterate_filtered_activations_v2(),
+                mix_fraction=self.activations_mixing_fraction,
+            )
         return mixing_buffer(
             buffer_size=self.n_batches_in_buffer * self.training_context_size,
             batch_size=self.train_batch_size_tokens,
@@ -963,7 +1278,10 @@ class ActivationsStore:
     def __next__(self) -> torch.Tensor:
         if self._dataloader is None:
             self._dataloader = self.get_data_loader()
-        return next(self._dataloader)
+        self._reset_current_data_timing()
+        batch = next(self._dataloader)
+        self._last_data_timing = dict(self._current_data_timing)
+        return batch
 
     def __iter__(self) -> Iterator[torch.Tensor]:
         return self
@@ -990,6 +1308,10 @@ class ActivationsStore:
 
         if "n_dataset_processed" in state_dict:
             target_n_dataset_processed = state_dict["n_dataset_processed"].item()
+
+            if self._consumer_only:
+                self.n_dataset_processed = target_n_dataset_processed
+                return
 
             # Only fast-forward if needed
 

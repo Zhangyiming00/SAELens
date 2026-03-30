@@ -45,13 +45,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", default="/data/models/Llama-3.1-8B")
     parser.add_argument("--dataset-path", default="../datasets/fineweb-edu-10BT_tokenized_llama31_ctx2048")
     parser.add_argument("--hook-name", default="blocks.21.hook_resid_post")
-    parser.add_argument("--d-sae", type=int, default=32768*3)
+    parser.add_argument("--d-sae", type=int, default=32768*2)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--vllm-tp-size", type=int, default=1)
     parser.add_argument("--sae-tp-size", type=int, default=1)
     parser.add_argument("--vllm-dp-size", type=int, default=1)
-    parser.add_argument("--training-tokens", type=int, default=2048*400)
+    parser.add_argument("--sae-dp-size", type=int, default=1)
+    parser.add_argument("--training-tokens", type=int, default=2048*40)
     parser.add_argument("--train-batch-size-tokens", type=int, default=2048)
     parser.add_argument("--context-size", type=int, default=2048)
     parser.add_argument("--store-batch-size-prompts", type=int, default=4)
@@ -64,12 +65,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/res3.5/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_1.08_routing/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
     parser.add_argument("--save-mse-every-n-steps", type=int, default=1)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=1)
-    parser.add_argument("--synchronize-timing", action="store_true")
+    parser.add_argument("--synchronize-timing", action="store_true", default=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use-shard-routing", action="store_true",default=True,
+                        help="Use unified shard-routing DP (supports arbitrary vllm_dp:sae_dp ratios).")
     return parser.parse_args()
 
 
@@ -97,11 +100,33 @@ def main() -> None:
         raise ValueError("--vllm-tp-size must be >= 1")
     if sae_tp_size < 1:
         raise ValueError("--sae-tp-size must be >= 1")
+    if args.vllm_dp_size < 1:
+        raise ValueError("--vllm-dp-size must be >= 1")
+    if args.sae_dp_size < 1:
+        raise ValueError("--sae-dp-size must be >= 1")
     if args.context_size < 1:
         raise ValueError("--context-size must be >= 1")
     if args.train_batch_size_tokens < 1:
         raise ValueError("--train-batch-size-tokens must be >= 1")
-    expected_world_size = max(vllm_tp_size * args.vllm_dp_size, sae_tp_size)
+    if args.sae_dp_size > 1 and args.vllm_dp_size == 1:
+        print(
+            f"[INFO] vllm_dp_size=1, sae_dp_size={args.sae_dp_size} (1:m topology) — "
+            "automatically enabling --use-shard-routing."
+        )
+        args.use_shard_routing = True
+    if not args.use_shard_routing and args.vllm_dp_size > 1 and args.sae_dp_size > 1:
+        large = max(args.vllm_dp_size, args.sae_dp_size)
+        small = min(args.vllm_dp_size, args.sae_dp_size)
+        needs_shard_routing = (large % small != 0) or (args.sae_dp_size > args.vllm_dp_size)
+        if needs_shard_routing:
+            print(
+                f"[INFO] vllm_dp_size={args.vllm_dp_size}, sae_dp_size={args.sae_dp_size} "
+                "is not an integer-multiple ratio — automatically enabling --use-shard-routing."
+            )
+            args.use_shard_routing = True
+    expected_world_size = max(
+        vllm_tp_size * args.vllm_dp_size, sae_tp_size * args.sae_dp_size
+    )
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if expected_world_size > 1 and world_size == 1:
         raise ValueError(
@@ -111,7 +136,7 @@ def main() -> None:
     if world_size not in (1, expected_world_size):
         raise ValueError(
             f"WORLD_SIZE={world_size} does not match "
-            f"max(vllm_tp_size, sae_tp_size)={expected_world_size}."
+            f"the expected world size {expected_world_size}."
         )
 
     min_n_batches_in_buffer = math.ceil(
@@ -125,6 +150,14 @@ def main() -> None:
     if n_batches_in_buffer * args.context_size < args.train_batch_size_tokens:
         raise ValueError(
             "n_batches_in_buffer * context_size must be >= train_batch_size_tokens"
+        )
+
+    training_tokens = args.training_tokens
+    if args.sae_dp_size > 1:
+        training_tokens = training_tokens // args.sae_dp_size
+        print(
+            f"[INFO] sae_dp_size={args.sae_dp_size}: scaling training_tokens "
+            f"{args.training_tokens} -> {training_tokens} per replica."
         )
 
     device = _resolve_device()
@@ -150,7 +183,7 @@ def main() -> None:
         streaming=False,
         is_dataset_tokenized=True,
         context_size=args.context_size,
-        training_tokens=args.training_tokens,
+        training_tokens=training_tokens,
         train_batch_size_tokens=args.train_batch_size_tokens,
         store_batch_size_prompts=args.store_batch_size_prompts,
         n_batches_in_buffer=n_batches_in_buffer,
@@ -186,7 +219,8 @@ def main() -> None:
     )
     print(
         f"  vllm_tp_size={vllm_tp_size} vllm_dp_size={args.vllm_dp_size} "
-        f"sae_tp_size={sae_tp_size} output_path={args.output_path}"
+        f"sae_tp_size={sae_tp_size} sae_dp_size={args.sae_dp_size} "
+        f"output_path={args.output_path}"
     )
     if args.save_mse_every_n_steps > 0:
         print(f"  save_mse_every_n_steps={args.save_mse_every_n_steps}")
@@ -200,7 +234,8 @@ def main() -> None:
         vllm_tp_size=vllm_tp_size,
         sae_tp_size=sae_tp_size,
         vllm_dp_size=args.vllm_dp_size,
-        dp_size=1,
+        sae_dp_size=args.sae_dp_size,
+        use_shard_routing=args.use_shard_routing,
     )
     try:
         runner.run()

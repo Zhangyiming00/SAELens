@@ -183,7 +183,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         resume_from_checkpoint (str | None): The path to the checkpoint to resume training from. (default is None).
         output_path (str | None): The path to save outputs. Set to None to disable output saving. (default is "output")
         save_mse_every_n_steps (int): Save an `mse_history.jsonl` record every N training steps. 0 disables it. (default is 0)
-        save_timing_every_n_steps (int): Save a `timing_history.jsonl` record every N training steps with separate activation-fetch and SAE-step wall times. 0 disables it. (default is 0)
+        save_timing_every_n_steps (int): Save a `timing_history.jsonl` record every N training steps with separate `vllm_step_time_s`, `transfer_time_s`, and `sae_time_s` wall times. 0 disables it. (default is 0)
         synchronize_timing (bool): If True, call `torch.cuda.synchronize()` around timed sections for accurate GPU timings. This changes observed runtime and should only be used for profiling. (default is False)
         verbose (bool): Whether to print verbose output. (default is True)
         model_kwargs (dict[str, Any]): Keyword arguments for `model.run_with_cache`

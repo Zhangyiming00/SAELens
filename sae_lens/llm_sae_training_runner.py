@@ -23,6 +23,8 @@ from sae_lens.constants import (
 )
 from sae_lens.distributed import (
     get_dp_group,
+    get_sae_dp_size,
+    get_sae_root_rank,
     get_tp_group,
     get_vllm_dp_p2p_group,
     get_vllm_dp_rank,
@@ -132,8 +134,9 @@ class LanguageModelSAETrainingRunner:
         shared_tp_size: int | None = None,
         vllm_tp_size: int | None = None,
         sae_tp_size: int | None = None,
-        dp_size: int = 1,
+        sae_dp_size: int = 1,
         vllm_dp_size: int = 1,
+        use_shard_routing: bool = True,
     ):
         if override_dataset is not None:
             logger.warning(
@@ -145,8 +148,9 @@ class LanguageModelSAETrainingRunner:
             )
 
         self.cfg = cfg
-        self.dp_size = dp_size
+        self.sae_dp_size = sae_dp_size
         self.vllm_dp_size = vllm_dp_size
+        self.use_shard_routing = use_shard_routing
         inferred_cfg_vllm_tp_size = int(
             self.cfg.model_from_pretrained_kwargs.get("tensor_parallel_size", 1)
         )
@@ -156,6 +160,7 @@ class LanguageModelSAETrainingRunner:
             and sae_tp_size is None
             and vllm_tp_size is None
             and tp_size > 1
+            and vllm_dp_size == 1
         ):
             # Backward-compatible shared-TP semantics.
             self.shared_tp_size = tp_size
@@ -187,41 +192,75 @@ class LanguageModelSAETrainingRunner:
 
         # Initialize distributed process groups for SAE TP/DP.
         # With torchrun, dist.init_process_group is already called; skip it.
-        if self.vllm_tp_size > 1 or self.sae_tp_size > 1 or dp_size > 1 or vllm_dp_size > 1:
+        if (
+            self.vllm_tp_size > 1
+            or self.sae_tp_size > 1
+            or sae_dp_size > 1
+            or vllm_dp_size > 1
+        ):
             if not dist.is_initialized():
                 dist.init_process_group(backend="nccl")
-            if self.shared_tp_size is not None:
+            if use_shard_routing:
+                from sae_lens.distributed_v2 import init_distributed_v2
+                batch_size = cfg.store_batch_size_prompts * len(
+                    range(cfg.context_size)[slice(*cfg.seqpos_slice)]
+                )
+                init_distributed_v2(
+                    P=vllm_dp_size,
+                    Q=sae_dp_size,
+                    vllm_tp_size=self.vllm_tp_size,
+                    sae_tp_size=self.sae_tp_size,
+                    batch_size=batch_size,
+                )
+            elif self.shared_tp_size is not None:
                 init_distributed(
                     shared_tp_size=self.shared_tp_size,
-                    dp_size=dp_size,
+                    sae_dp_size=sae_dp_size,
                 )
             else:
                 init_distributed(
                     sae_tp_size=self.sae_tp_size,
                     vllm_tp_size=self.vllm_tp_size,
                     vllm_dp_size=vllm_dp_size,
-                    dp_size=dp_size,
+                    sae_dp_size=sae_dp_size,
                 )
 
-        self.sae_active = is_sae_active() if dist.is_initialized() else True
-        self.vllm_active = is_vllm_active() if dist.is_initialized() else True
-        # uses_split_roles is a system-wide property: some ranks are vLLM-only
-        # or SAE-only.
-        self.uses_split_roles = (
-            self.vllm_tp_size != self.sae_tp_size or vllm_dp_size > 1
-        )
+        if use_shard_routing and dist.is_initialized():
+            import sae_lens.distributed_v2 as v2_mod
+            self.sae_active = v2_mod.is_consumer()
+            self.vllm_active = v2_mod.is_producer()
+            self.uses_split_roles = v2_mod.is_producer() != v2_mod.is_consumer()
+        else:
+            self.sae_active = is_sae_active() if dist.is_initialized() else True
+            self.vllm_active = is_vllm_active() if dist.is_initialized() else True
+            self.uses_split_roles = (
+                self.vllm_tp_size != self.sae_tp_size
+                or self.vllm_dp_size != self.sae_dp_size
+            )
+        self.uses_vllm_dp_fan_in = self.vllm_dp_size > self.sae_dp_size
+        self.uses_matched_dp = self.vllm_dp_size == self.sae_dp_size and self.vllm_dp_size > 1
 
         if dist.is_initialized():
+            if use_shard_routing:
+                import sae_lens.distributed_v2 as v2_mod
+                vllm_world_ranks = sorted(
+                    r for ranks in v2_mod._producer_world_ranks.values() for r in ranks
+                )
+            else:
+                vllm_world_ranks = get_vllm_world_ranks()
             os.environ["SAELENS_VLLM_WORLD_RANKS"] = ",".join(
-                str(rank) for rank in get_vllm_world_ranks()
+                str(rank) for rank in vllm_world_ranks
             )
 
         # Pre-initialize vLLM parallel state when needed to avoid deadlock
         # on dist.new_group() calls that non-vLLM ranks would never enter.
         if dist.is_initialized() and (
-            self.sae_tp_size > self.vllm_tp_size or vllm_dp_size > 1
+            use_shard_routing or self.sae_tp_size > self.vllm_tp_size or vllm_dp_size > 1
         ):
-            preinit_vllm_distributed(get_vllm_world_ranks(), self.vllm_tp_size)
+            if use_shard_routing:
+                preinit_vllm_distributed(vllm_world_ranks, self.vllm_tp_size)
+            else:
+                preinit_vllm_distributed(get_vllm_world_ranks(), self.vllm_tp_size)
 
         if self.uses_split_roles:
             if self.cfg.logger.log_to_wandb:
@@ -268,15 +307,23 @@ class LanguageModelSAETrainingRunner:
         ds_shard_index = 0
         ds_shard_count = 1
         if dist.is_initialized() and vllm_dp_size > 1:
-            ds_shard_index = get_vllm_dp_rank()
-            ds_shard_count = vllm_dp_size
+            if use_shard_routing:
+                import sae_lens.distributed_v2 as v2_mod
+                if v2_mod.is_producer():
+                    ds_shard_index = v2_mod.get_producer_idx()
+                    ds_shard_count = vllm_dp_size
+            else:
+                ds_shard_index = get_vllm_dp_rank()
+                ds_shard_count = vllm_dp_size
 
+        consumer_only = use_shard_routing and self.sae_active and not self.vllm_active
         self.activations_store = ActivationsStore.from_config(
             self.model,
             self.cfg,
             override_dataset=override_dataset,
             dataset_shard_index=ds_shard_index,
             dataset_shard_count=ds_shard_count,
+            consumer_only=consumer_only,
         )
 
         if self.sae_active:
@@ -300,7 +347,11 @@ class LanguageModelSAETrainingRunner:
 
         # Shard SAE weights across TP ranks if applicable.
         if self.sae is not None and self.sae_tp_size > 1:
-            tp_group = get_tp_group()
+            if self.use_shard_routing:
+                import sae_lens.distributed_v2 as v2_mod
+                tp_group = v2_mod.get_sae_tp_group()
+            else:
+                tp_group = get_tp_group()
             if tp_group is not None and hasattr(self.sae, "shard_weights"):
                 self.sae.shard_weights(tp_group)
 
@@ -308,6 +359,10 @@ class LanguageModelSAETrainingRunner:
         """
         Run the training of the SAE.
         """
+        if self.use_shard_routing and self.vllm_active and not self.sae_active:
+            self._run_producer_helper_loop_v2()
+            return None
+
         if not self.sae_active:
             if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
                 rank = dist.get_rank() if dist.is_initialized() else -1
@@ -338,6 +393,9 @@ class LanguageModelSAETrainingRunner:
         )
 
         sae_dp_group = get_dp_group()
+        if self.use_shard_routing:
+            import sae_lens.distributed_v2 as v2_mod
+            sae_dp_group = v2_mod.get_sae_dp_group()
         trainer = SAETrainer(
             sae=self.sae,
             data_provider=self.activations_store,
@@ -349,6 +407,7 @@ class LanguageModelSAETrainingRunner:
                 if sae_dp_group is not None and dist.get_world_size(sae_dp_group) > 1
                 else None
             ),
+            token_count_weighted_dp=self.use_shard_routing,
         )
 
         if self.cfg.resume_from_checkpoint is not None:
@@ -375,22 +434,28 @@ class LanguageModelSAETrainingRunner:
     def _run_vllm_helper_loop(self) -> None:
         """Pump activations for helper-only ranks (vllm_active and not sae_active).
 
-        With vllm_dp > 1, helper DP root ranks (vllm_dp_rank > 0, vllm_tp_rank == 0)
-        also send their raw batch to SAE root (rank 0) via NCCL P2P.
+        With m:1 fan-in, helper DP root ranks (vllm_dp_rank > 0, vllm_tp_rank == 0)
+        also send their raw batch to the cluster SAE root via Gloo P2P.
         """
         import math
 
         vllm_dp_size = get_vllm_dp_size() if dist.is_initialized() else 1
+        sae_dp_size = get_sae_dp_size() if dist.is_initialized() else 1
         is_dp_root = is_vllm_dp_root() if dist.is_initialized() else False
         vllm_dp_rank = get_vllm_dp_rank() if dist.is_initialized() else 0
         batch_size = self.cfg.store_batch_size_prompts
         ctx_size = self.activations_store.training_context_size
 
+        # n = vLLM replicas per cluster; each cluster feeds one SAE replica.
+        n = vllm_dp_size // sae_dp_size if sae_dp_size > 0 else vllm_dp_size
+
         # Approximate number of raw batches this helper should produce.
-        if vllm_dp_size > 1:
+        if self.uses_vllm_dp_fan_in:
             tokens_per_batch = batch_size * ctx_size
+            # Each helper produces total_tokens / (n * tokens_per_batch) batches,
+            # because the cluster's SAE root will yield n batches per outer iteration.
             target_batches = math.ceil(
-                self.cfg.total_training_tokens / (tokens_per_batch * vllm_dp_size)
+                self.cfg.total_training_tokens / (tokens_per_batch * n)
             )
         else:
             target_batches = None  # Legacy: use token count
@@ -412,24 +477,29 @@ class LanguageModelSAETrainingRunner:
                     f.write(line)
                 print(line, end="", flush=True)
 
-            if vllm_dp_size > 1:
+            if self.uses_vllm_dp_fan_in:
                 # Directly call get_raw_llm_batch to participate in intra-group
                 # broadcasts. Do NOT go through mixing buffer.
                 raw_acts, raw_tokens = self.activations_store.get_raw_llm_batch()
                 n_batches_done += 1
 
-                # Helper DP root: send raw batch to SAE root.
-                if is_dp_root and vllm_dp_rank > 0:
+                # Non-root helper DP root: send raw batch to cluster SAE root.
+                # The cluster SAE root is the rank of the first vLLM DP replica
+                # in this cluster (vllm_dp_rank % n == 0 → cluster root).
+                cluster_first_vllm_dp = (vllm_dp_rank // n) * n
+                is_cluster_sae_root_vllm = vllm_dp_rank == cluster_first_vllm_dp
+                if is_dp_root and not is_cluster_sae_root_vllm:
                     p2p_group = get_vllm_dp_p2p_group()
                     if p2p_group is None:
                         raise RuntimeError(
                             "vLLM DP P2P group is not initialized; refusing to fall back to the default process group."
                         )
+                    cluster_sae_root = get_sae_root_rank()
                     raw_acts = raw_acts.to("cpu").contiguous()
-                    dist.send(raw_acts, dst=0, group=p2p_group)
+                    dist.send(raw_acts, dst=cluster_sae_root, group=p2p_group)
                     if raw_tokens is not None:
                         raw_tokens = raw_tokens.to("cpu").contiguous()
-                        dist.send(raw_tokens, dst=0, group=p2p_group)
+                        dist.send(raw_tokens, dst=cluster_sae_root, group=p2p_group)
             else:
                 # Legacy: go through mixing buffer to stay in sync with
                 # existing split-role broadcasts.
@@ -444,6 +514,27 @@ class LanguageModelSAETrainingRunner:
                 with open(f"/tmp/saelens_debug_rank{rank}.log", "a") as f:
                     f.write(line)
                 print(line, end="", flush=True)
+
+    def _run_producer_helper_loop_v2(self) -> None:
+        """Producer-only loop for shard-routing mode (use_shard_routing=True).
+
+        All producer TP ranks participate in get_raw_llm_batch() each step.
+        Only the producer TP root (vllm_tp_rank == 0) sends metadata + payload slices
+        to each target consumer via the per-consumer Gloo P2P groups.
+        Exits after total_producer_steps steps to stay in lockstep with consumers.
+        """
+        import math
+
+        P = self.vllm_dp_size
+        batch_size = self.cfg.store_batch_size_prompts
+        ctx_size = self.activations_store.training_context_size
+        total_producer_steps = math.ceil(
+            self.cfg.total_training_tokens / (batch_size * ctx_size * P)
+        )
+
+        for _ in range(total_producer_steps):
+            _local_slices, outgoing = self.activations_store._run_producer_phase2_v2()
+            self.activations_store._run_producer_phase4_v2(outgoing)
 
     def save_final_sae(
         self,
