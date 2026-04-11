@@ -158,29 +158,30 @@ def test_init_v2_new_group_total_count_with_tp() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Gloo groups are per-consumer and deduplicated
+# P2P groups are per-consumer and deduplicated
 # ---------------------------------------------------------------------------
 
 
-def test_init_v2_gloo_groups_count_equals_Q() -> None:
-    """Exactly Q Gloo groups are created."""
+def test_init_v2_p2p_groups_count_equals_Q() -> None:
+    """Exactly Q NCCL P2P groups are created at the end of init."""
     calls = _run_init(0, 3, P=2, Q=3)
-    gloo_calls = [c for c in calls if c[1] == "gloo"]
-    assert len(gloo_calls) == 3  # Q = 3
+    p2p_calls = calls[-3:]
+    assert len(p2p_calls) == 3  # Q = 3
+    assert all(backend == "nccl" for _, backend in p2p_calls)
 
 
-def test_init_v2_gloo_groups_deduplicated_no_duplicate_rank() -> None:
+def test_init_v2_p2p_groups_deduplicated_no_duplicate_rank() -> None:
     """No rank appears twice in any P2P group."""
     calls = _run_init(0, 3, P=2, Q=3)
-    gloo_calls = [c for c in calls if c[1] == "gloo"]
-    for ranks, _ in gloo_calls:
-        assert len(ranks) == len(set(ranks)), f"Duplicate ranks in gloo group: {ranks}"
+    p2p_calls = calls[-3:]
+    for ranks, _ in p2p_calls:
+        assert len(ranks) == len(set(ranks)), f"Duplicate ranks in P2P group: {ranks}"
 
 
 def test_init_v2_p2p_membership_2_3() -> None:
-    """P=2, Q=3: verify Gloo group membership is correct for each consumer."""
+    """P=2, Q=3: verify P2P group membership is correct for each consumer."""
     calls = _run_init(0, 3, P=2, Q=3)
-    gloo_calls = [c for c in calls if c[1] == "gloo"]
+    p2p_calls = calls[-3:]
     # P=2, Q=3, vllm_tp=1, sae_tp=1
     # producer tp roots: p0→rank0, p1→rank1
     # consumer tp roots: c0→rank0, c1→rank1, c2→rank2
@@ -188,7 +189,7 @@ def test_init_v2_p2p_membership_2_3() -> None:
     # Group for c0: sources={p0}, members={c0_root=0, p0_root=0} → deduplicated → {0}
     # Group for c1: sources={p0,p1}, members={c1_root=1, p0_root=0, p1_root=1} → dedup → {0,1}
     # Group for c2: sources={p1}, members={c2_root=2, p1_root=1} → {1,2}
-    group_members = sorted([sorted(c[0]) for c in gloo_calls])
+    group_members = sorted([sorted(c[0]) for c in p2p_calls])
     assert [0] in group_members
     assert [0, 1] in group_members
     assert [1, 2] in group_members

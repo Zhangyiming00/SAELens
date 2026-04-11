@@ -19,6 +19,7 @@ from typing import (
 
 import einops
 import torch
+import torch.distributed as dist
 from numpy.typing import NDArray
 from safetensors.torch import load_file, save_file
 from torch import nn
@@ -517,7 +518,11 @@ class SAE(HookedRootModule, Generic[T_SAE_CONFIG], ABC):
     def sync_tensor_parallel_gradients(self) -> None:
         pass
 
-    def clip_grad_norm_(self, max_norm: float) -> torch.Tensor:
+    def clip_grad_norm_(
+        self,
+        max_norm: float,
+        dp_group: dist.ProcessGroup | None = None,
+    ) -> torch.Tensor:
         return torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm)
 
     @torch.no_grad()
@@ -919,6 +924,16 @@ class TrainingSAE(SAE[T_TRAINING_SAE_CONFIG], ABC):
         # is expected to handle reshaping before passing data to the SAE
         self.turn_off_forward_pass_hook_z_reshaping()
         self.mse_loss_fn = mse_loss
+
+    def forward(  # type: ignore[override]
+        self, x: torch.Tensor | TrainStepInput
+    ) -> torch.Tensor | TrainStepOutput:
+        """Forward pass: routes TrainStepInput to training_forward_pass (so FSDP's
+        parameter-gather lifecycle covers the full training computation), and plain
+        tensors to the standard inference path."""
+        if isinstance(x, TrainStepInput):
+            return self.training_forward_pass(x)
+        return super().forward(x)
 
     @abstractmethod
     def get_coefficients(self) -> dict[str, float | TrainCoefficientConfig]: ...

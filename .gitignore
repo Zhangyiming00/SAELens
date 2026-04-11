@@ -212,3 +212,4 @@ scripts/run_sae_runner_gpu.py
 scripts/scripts/
 
 scripts/run_sae_runner_*.sh
+scripts/profile_vllm_*

@@ -1,7 +1,7 @@
-"""Real distributed integration tests for the shard-routing protocol.
+"""Legacy CPU/Gloo integration tests for the old shard-routing P2P protocol.
 
-Uses torch.multiprocessing.spawn with the Gloo backend (CPU-only, no GPU required).
-Tests the full send/recv protocol: two phases of irecv-then-send for metadata and payload.
+Runtime shard routing is now NCCL-only and is validated with GPU torchrun smoke
+tests instead of CPU pytest workers.
 """
 
 from __future__ import annotations
@@ -28,6 +28,10 @@ from sae_lens.distributed_v2 import (
     get_vllm_tp_rank,
 )
 from sae_lens.shard_routing import routes_for_consumer, routes_for_producer
+
+pytestmark = pytest.mark.skip(
+    reason="Shard-routing P2P is NCCL-only; use GPU torchrun smoke tests."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -65,26 +69,28 @@ def _worker(
     i_am_producer_root = i_am_producer and get_vllm_tp_rank() == 0
     i_am_consumer_root = i_am_consumer and get_sae_tp_rank() == 0
 
-    local_slices: dict = {}   # consumer_idx -> tensor (for local self-routes)
+    local_slices: dict = {}   # producer_idx -> tensor (for local same-rank routes)
     outgoing: dict = {}       # consumer_idx -> (route, slice tensor)
 
-    # === PHASE 1: Consumer roots post metadata irecvs ===
-    meta_work = []
+    # === PHASE 1: Consumer roots pre-allocate payload buffers and post irecvs ===
+    # Buffer shape is known from routing table (n_rows) and d_in — no metadata needed.
+    payload_work = []
     if i_am_consumer_root:
         c = get_consumer_idx()
         c_routes = routes_for_consumer(routing, c)
         for route in c_routes:
             pp = route.producer_idx
             if get_producer_tp_root(pp) == get_consumer_tp_root(c):
-                meta_work.append((route, None, None))  # local route: no irecv
+                payload_work.append((route, None, None))  # local: filled after Phase 2
             else:
-                meta_buf = torch.zeros(2, dtype=torch.int64)
+                n_rows = route.row_end - route.row_start
+                act_buf = torch.zeros(n_rows, d_in)
                 grp = get_p2p_group(c)
                 src = get_producer_tp_root(pp)
-                w = dist.irecv(meta_buf, src=src, group=grp)
-                meta_work.append((route, meta_buf, w))
+                w = dist.irecv(act_buf, src=src, group=grp)
+                payload_work.append((route, act_buf, w))
 
-    # === PHASE 2: Producer roots generate batch + send metadata ===
+    # === PHASE 2: Producer roots generate batch; local slices stay on device ===
     if i_am_producer_root:
         p = get_producer_idx()
         # Create a deterministic batch: row i has value p*1000 + i
@@ -98,54 +104,43 @@ def _worker(
             sl = batch[route.row_start:route.row_end].clone().contiguous()
             outgoing[cc] = (route, sl)
             if get_producer_tp_root(p) == get_consumer_tp_root(cc):
-                local_slices[cc] = sl  # local path
-            else:
-                n_rows, di = sl.shape
-                meta = torch.tensor([n_rows, di], dtype=torch.int64)
-                grp = get_p2p_group(cc)
-                dst = get_consumer_tp_root(cc)
-                dist.send(meta, dst=dst, group=grp)
+                local_slices[route.producer_idx] = sl  # key: producer_idx
+                # No metadata send — consumer pre-allocates from routing table.
 
-    # === PHASE 3: Consumer roots wait metadata, post payload irecvs ===
-    payload_work = []
+    # Fill local payload_work slots from local_slices (dual-role ranks only).
     if i_am_consumer_root:
         c = get_consumer_idx()
-        for route, meta_buf, w in meta_work:
-            pp = route.producer_idx
-            if get_producer_tp_root(pp) == get_consumer_tp_root(c):
-                # Local: use stored slice
-                sl = local_slices[c]
-                payload_work.append((route, sl, None))
-            else:
-                w.wait()
-                n_rows = int(meta_buf[0])
-                di = int(meta_buf[1])
-                act_buf = torch.zeros(n_rows, di)
-                grp = get_p2p_group(c)
-                src = get_producer_tp_root(pp)
-                w2 = dist.irecv(act_buf, src=src, group=grp)
-                payload_work.append((route, act_buf, w2))
+        payload_work = [
+            (route, local_slices[route.producer_idx], None)
+            if buf is None
+            else (route, buf, w)
+            for route, buf, w in payload_work
+        ]
 
-    # === PHASE 4: Producer roots send cached slice payloads ===
+    # === PHASE 3: Producer roots send cached slice payloads (non-blocking) ===
     if i_am_producer_root:
         p = get_producer_idx()
         my_routes = routes_for_producer(routing, p)
+        work_handles = []
         for route in my_routes:
             cc = route.consumer_idx
             if get_producer_tp_root(p) != get_consumer_tp_root(cc):
                 _, sl = outgoing[cc]
                 grp = get_p2p_group(cc)
                 dst = get_consumer_tp_root(cc)
-                dist.send(sl, dst=dst, group=grp)
+                w = dist.isend(sl, dst=dst, group=grp)
+                work_handles.append(w)
+        for w in work_handles:
+            w.wait()
 
-    # === PHASE 5: Consumer roots wait payloads, assemble in route order ===
+    # === PHASE 4: Consumer roots wait payloads, assemble in route order ===
     if i_am_consumer_root:
         c = get_consumer_idx()
         c_routes = routes_for_consumer(routing, c)
         buf_map = {}
-        for route, buf, w2 in payload_work:
-            if w2 is not None:
-                w2.wait()
+        for route, buf, w in payload_work:
+            if w is not None:
+                w.wait()
             buf_map[route.producer_idx] = buf
 
         assembled = torch.cat(
@@ -266,3 +261,111 @@ def test_2producer_3consumer_vllm_tp1_sae_tp2() -> None:
     assert len(results) == 3
     all_rows = torch.cat(list(results.values()), dim=0)
     assert all_rows.shape[0] == 2 * 12
+
+
+def _worker_device(
+    rank: int,
+    world_size: int,
+    P: int,
+    Q: int,
+    batch_size: int,
+    d_in: int,
+    result_list,
+) -> None:
+    """Worker that records tensor device of local slices and assembled output."""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29604"
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+
+    init_distributed_v2(P=P, Q=Q, vllm_tp_size=1, sae_tp_size=1, batch_size=batch_size)
+
+    routing = get_routing_table()
+    i_am_producer_root = is_producer() and get_vllm_tp_rank() == 0
+    i_am_consumer_root = is_consumer() and get_sae_tp_rank() == 0
+
+    local_slices: dict = {}
+    outgoing: dict = {}
+
+    payload_work = []
+    if i_am_consumer_root:
+        c = get_consumer_idx()
+        for route in routes_for_consumer(routing, c):
+            pp = route.producer_idx
+            if get_producer_tp_root(pp) == get_consumer_tp_root(c):
+                payload_work.append((route, None, None))
+            else:
+                n_rows = route.row_end - route.row_start
+                act_buf = torch.zeros(n_rows, d_in)
+                w = dist.irecv(act_buf, src=get_producer_tp_root(pp), group=get_p2p_group(c))
+                payload_work.append((route, act_buf, w))
+
+    if i_am_producer_root:
+        p = get_producer_idx()
+        batch = torch.zeros(batch_size, d_in)
+        for route in routes_for_producer(routing, p):
+            cc = route.consumer_idx
+            sl = batch[route.row_start:route.row_end].clone().contiguous()
+            outgoing[cc] = (route, sl)
+            if get_producer_tp_root(p) == get_consumer_tp_root(cc):
+                local_slices[route.producer_idx] = sl
+
+    if i_am_consumer_root:
+        payload_work = [
+            (route, local_slices[route.producer_idx], None)
+            if buf is None
+            else (route, buf, w)
+            for route, buf, w in payload_work
+        ]
+
+    if i_am_producer_root:
+        p = get_producer_idx()
+        work_handles = []
+        for route in routes_for_producer(routing, p):
+            cc = route.consumer_idx
+            if get_producer_tp_root(p) != get_consumer_tp_root(cc):
+                _, sl = outgoing[cc]
+                w = dist.isend(sl, dst=get_consumer_tp_root(cc), group=get_p2p_group(cc))
+                work_handles.append(w)
+        for w in work_handles:
+            w.wait()
+
+    if i_am_consumer_root:
+        c = get_consumer_idx()
+        buf_map = {}
+        for route, buf, w in payload_work:
+            if w is not None:
+                w.wait()
+            buf_map[route.producer_idx] = buf
+        # Record the device of each slice in buf_map
+        devices = {p: str(t.device) for p, t in buf_map.items()}
+        result_list[rank] = (c, devices)
+
+    dist.destroy_process_group()
+    _reset()
+
+
+@pytest.mark.slow
+def test_local_routes_preserve_device_matched_dp() -> None:
+    """For a fully-local topology (P=Q, all routes same-rank), assembled slices
+    must be on the same device as the input batch — no CPU bounce for local routes."""
+    P, Q, B, d = 3, 3, 9, 4
+    world_size = max(P, Q)
+    manager = mp.Manager()
+    result_list = manager.list([None] * world_size)
+    mp.spawn(
+        _worker_device,
+        args=(world_size, P, Q, B, d, result_list),
+        nprocs=world_size,
+        join=True,
+    )
+    results = [r for r in result_list if r is not None]
+    assert len(results) == Q
+    for _c, devices in results:
+        # All local slices must be on the same device as the batch (cpu in this test).
+        # The key property: device is "cpu" (unchanged from the zero-filled batch),
+        # NOT something that would appear after an unnecessary to("cpu") call.
+        for p, dev in devices.items():
+            assert dev == "cpu", (
+                f"consumer slice from producer {p} is on device '{dev}' "
+                f"(expected 'cpu' — device of the input batch)"
+            )

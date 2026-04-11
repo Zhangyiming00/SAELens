@@ -3,14 +3,17 @@ import json
 import math
 import os
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Callable, Generic, Protocol
+from typing import Any, Generic, Protocol
 
 import torch
 import torch.distributed as dist
 import wandb
 from safetensors.torch import save_file
+from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.optim import Adam
 from tqdm.auto import tqdm
 
@@ -19,6 +22,8 @@ from sae_lens.config import SAETrainerConfig
 from sae_lens.constants import (
     ACTIVATION_SCALER_CFG_FILENAME,
     MSE_HISTORY_FILENAME,
+    SAE_CFG_FILENAME,
+    SAE_WEIGHTS_FILENAME,
     SPARSITY_FILENAME,
     TIMING_HISTORY_FILENAME,
     TRAINER_STATE_FILENAME,
@@ -92,8 +97,13 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         save_checkpoint_fn: SaveCheckpointFn | None = None,
         dp_group: dist.ProcessGroup | None = None,
         token_count_weighted_dp: bool = False,
+        base_sae: T_TRAINING_SAE | None = None,
     ) -> None:
         self.sae = sae
+        # base_sae is the unwrapped module when sae is an FSDP/DDP wrapper.
+        # Defaults to sae itself in manual mode.
+        self._base_sae: T_TRAINING_SAE = base_sae if base_sae is not None else sae
+        self._is_fsdp = isinstance(sae, FSDP)
         self.data_provider = data_provider
         self.evaluator = evaluator
         self.activation_scaler = ActivationScaler()
@@ -108,7 +118,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self.mse_history_path: Path | None = None
         self.timing_history_path: Path | None = None
 
-        _update_sae_lens_training_version(self.sae)
+        _update_sae_lens_training_version(self._base_sae)
 
         if self._should_write_training_metrics():
             assert self.cfg.output_path is not None
@@ -135,12 +145,14 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 )
             )[1:]
 
-        self.act_freq_scores = torch.zeros(sae.cfg.d_sae, device=cfg.device)
+        self.act_freq_scores = torch.zeros(self._base_sae.cfg.d_sae, device=cfg.device)
         self.n_forward_passes_since_fired = torch.zeros(
-            sae.cfg.d_sae, device=cfg.device
+            self._base_sae.cfg.d_sae, device=cfg.device
         )
         self.n_frac_active_samples = 0
 
+        # Optimizer is constructed over self.sae.parameters() so that in FSDP mode
+        # it sees FSDP's managed parameter views; in manual mode self.sae == _base_sae.
         self.optimizer = Adam(
             sae.parameters(),
             lr=cfg.lr,
@@ -161,7 +173,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             num_cycles=cfg.n_restart_cycles,
         )
         self.coefficient_schedulers = {}
-        for name, coeff_cfg in self.sae.get_coefficients().items():
+        for name, coeff_cfg in self._base_sae.get_coefficients().items():
             if not isinstance(coeff_cfg, TrainCoefficientConfig):
                 coeff_cfg = TrainCoefficientConfig(value=coeff_cfg, warm_up_steps=0)
             self.coefficient_schedulers[name] = CoefficientScheduler(
@@ -188,6 +200,11 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         return self.act_freq_scores / self.n_frac_active_samples
 
     @property
+    def base_sae(self) -> T_TRAINING_SAE:
+        """Return the unwrapped base SAE module (same as self.sae in manual mode)."""
+        return self._base_sae
+
+    @property
     def log_feature_sparsity(self) -> torch.Tensor:
         return _log_feature_sparsity(self.feature_sparsity)
 
@@ -199,9 +216,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self.sae.to(self.cfg.device)
         pbar = tqdm(total=self.cfg.total_training_samples, desc="Training SAE")
 
-        if self.sae.cfg.normalize_activations == "expected_average_only_in":
+        if self._base_sae.cfg.normalize_activations == "expected_average_only_in":
             self.activation_scaler.estimate_scaling_factor(
-                d_in=self.sae.cfg.d_in,
+                d_in=self._base_sae.cfg.d_in,
                 data_provider=self.data_provider,
                 n_batches_for_norm_estimate=int(1e3),
             )
@@ -215,7 +232,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 )
             self._maybe_synchronize_timing()
             data_t0 = time.perf_counter()
-            batch = next(self.data_provider).to(self.sae.device)
+            batch = next(self.data_provider).to(self._base_sae.device)
             self._maybe_synchronize_timing()
             data_time_s = time.perf_counter() - data_t0
             data_timing = self._consume_data_provider_timing()
@@ -254,7 +271,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
         # fold the estimated norm scaling factor into the sae weights
         if self.activation_scaler.scaling_factor is not None:
-            self.sae.fold_activation_norm_scaling_factor(
+            self._base_sae.fold_activation_norm_scaling_factor(
                 self.activation_scaler.scaling_factor
             )
             self.activation_scaler.scaling_factor = None
@@ -263,7 +280,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             self.save_checkpoint(checkpoint_name=f"final_{self.n_training_samples}")
 
         pbar.close()
-        return self.sae
+        return self._base_sae
 
     def save_checkpoint(
         self,
@@ -272,7 +289,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
     ) -> None:
         # With TP, all ranks in DP replica 0 must participate in the save collectives,
         # but only TP rank 0 writes files. Other DP replicas return early.
-        tp_group = getattr(self.sae, "_tp_group", None)
+        tp_group = getattr(self._base_sae, "_tp_group", None)
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
         if dp_rank != 0:
@@ -283,7 +300,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 checkpoint_path = base_checkpoint_path / checkpoint_name
                 checkpoint_path.mkdir(exist_ok=True, parents=True)
 
-                weights_path, cfg_path = self.sae.save_model(str(checkpoint_path))
+                weights_path, cfg_path = self._save_model(checkpoint_path)
 
                 sparsity_path = checkpoint_path / SPARSITY_FILENAME
                 save_file({"sparsity": self.log_feature_sparsity}, sparsity_path)
@@ -302,6 +319,32 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         if self.save_checkpoint_fn is not None and tp_rank == 0:
             self.save_checkpoint_fn(checkpoint_path=checkpoint_path)
 
+    def _save_model(self, checkpoint_path: Path) -> tuple[Path, Path]:
+        """Save SAE weights, handling FSDP gather before the existing TP-aware export."""
+        if not self._is_fsdp:
+            return self._base_sae.save_model(str(checkpoint_path))
+
+        # FSDP: gather full local-TP-shard state from DP replicas, then reuse
+        # the existing TP-aware gather path in process_state_dict_for_saving().
+        fsdp_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(self.sae, StateDictType.FULL_STATE_DICT, fsdp_cfg):
+            state_dict = self.sae.state_dict()
+        # state_dict is populated only on dp_rank==0 (rank0_only=True).
+        # process_state_dict_for_saving gathers TP shards via all_gather.
+        self._base_sae.process_state_dict_for_saving(state_dict)
+
+        model_weights_path = checkpoint_path / SAE_WEIGHTS_FILENAME
+        cfg_path = checkpoint_path / SAE_CFG_FILENAME
+        tp_group = getattr(self._base_sae, "_tp_group", None)
+        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+        if tp_rank == 0:
+            save_file(state_dict, model_weights_path)
+            with open(cfg_path, "w") as f:
+                json.dump(self._base_sae.cfg.to_dict(), f)
+        if tp_group is not None:
+            dist.barrier(group=tp_group)
+        return model_weights_path, cfg_path
+
     def save_trainer_state(self, checkpoint_path: Path) -> None:
         checkpoint_path.mkdir(exist_ok=True, parents=True)
         scheduler_state_dicts = {
@@ -309,7 +352,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             for name, scheduler in self.coefficient_schedulers.items()
         }
         optimizer_state_by_name = self._build_named_optimizer_state_for_save()
-        tp_group = getattr(self.sae, "_tp_group", None)
+        tp_group = getattr(self._base_sae, "_tp_group", None)
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         if tp_rank != 0:
             return
@@ -325,6 +368,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 "n_frac_active_samples": self.n_frac_active_samples,
                 "started_fine_tuning": self.started_fine_tuning,
                 "coefficient_schedulers": scheduler_state_dicts,
+                "sae_dp_mode": "fsdp" if self._is_fsdp else "manual",
             },
             str(checkpoint_path / TRAINER_STATE_FILENAME),
         )
@@ -335,6 +379,14 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         checkpoint_path = Path(checkpoint_path)
         self.activation_scaler.load(checkpoint_path / ACTIVATION_SCALER_CFG_FILENAME)
         state_dict = torch.load(checkpoint_path / TRAINER_STATE_FILENAME)
+        saved_mode = state_dict.get("sae_dp_mode", "manual")
+        current_mode = "fsdp" if self._is_fsdp else "manual"
+        if saved_mode != current_mode:
+            raise ValueError(
+                f"Cannot resume: checkpoint was saved with sae_dp_mode='{saved_mode}' "
+                f"but current mode is '{current_mode}'. Cross-mode optimizer resume is "
+                "not supported in v1."
+            )
         if "optimizer_by_name" in state_dict:
             self._load_named_optimizer_state(state_dict["optimizer_by_name"])
         else:
@@ -351,7 +403,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
     def _build_named_optimizer_state_for_save(self) -> dict[str, dict[str, Any]]:
         optimizer_state_by_name: dict[str, dict[str, Any]] = {}
-        for name, param in self.sae.named_parameters():
+        for name, param in self._base_sae.named_parameters():
             state = self.optimizer.state.get(param)
             if not state:
                 continue
@@ -359,17 +411,17 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 key: value.detach().clone() if torch.is_tensor(value) else deepcopy(value)
                 for key, value in state.items()
             }
-        self.sae.process_named_optimizer_state_for_saving(optimizer_state_by_name)
+        self._base_sae.process_named_optimizer_state_for_saving(optimizer_state_by_name)
         return optimizer_state_by_name
 
     def _load_named_optimizer_state(
         self, optimizer_state_by_name: dict[str, dict[str, Any]]
     ) -> None:
         optimizer_state_by_name = deepcopy(optimizer_state_by_name)
-        self.sae.process_named_optimizer_state_for_loading(optimizer_state_by_name)
+        self._base_sae.process_named_optimizer_state_for_loading(optimizer_state_by_name)
         self.optimizer.state.clear()
 
-        named_params = dict(self.sae.named_parameters())
+        named_params = dict(self._base_sae.named_parameters())
         for name, state in optimizer_state_by_name.items():
             if name not in named_params:
                 continue
@@ -407,18 +459,19 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 wandb.log(sparsity_log_dict, step=self.n_training_steps)
             self._reset_running_sparsity_stats()
 
-        # for documentation on autocasting see:
-        # https://pytorch.org/tutorials/recipes/recipes/amp_recipe.html
+        step_input = TrainStepInput(
+            sae_in=sae_in,
+            dead_neuron_mask=self.dead_neurons,
+            coefficients=self.get_coefficients(),
+            n_training_steps=self.n_training_steps,
+            is_logging_step=self._is_logging_step(),
+        )
+        # In FSDP mode self.sae is the FSDP wrapper; calling self.sae(step_input)
+        # routes through forward() which triggers FSDP's parameter-gather lifecycle.
+        # In manual mode self.sae == self._base_sae and the dispatch in
+        # TrainingSAE.forward() calls training_forward_pass identically.
         with self.autocast_if_enabled:
-            train_step_output = self.sae.training_forward_pass(
-                step_input=TrainStepInput(
-                    sae_in=sae_in,
-                    dead_neuron_mask=self.dead_neurons,
-                    coefficients=self.get_coefficients(),
-                    n_training_steps=self.n_training_steps,
-                    is_logging_step=self._is_logging_step(),
-                ),
-            )
+            train_step_output = self.sae(step_input)  # type: ignore[arg-type]
 
             with torch.no_grad():
                 # calling .bool() should be equivalent to .abs() > 0, and work with coo tensors
@@ -445,16 +498,18 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
             _debug_prefix_tp("backward done")
         self.grad_scaler.unscale_(self.optimizer)  # needed to clip correctly
-        # AllReduce gradients across DP group for consistent parameter updates.
-        # Flatten all gradients into one tensor to issue a single allreduce instead of N.
-        if self.dp_group is not None:
-            grads = [p.grad for p in self.sae.parameters() if p.grad is not None]
+
+        if self._is_fsdp:
+            # FSDP handles gradient reduction across dp_group during backward().
+            # No manual flat all-reduce needed.
+            pass
+        elif self.dp_group is not None:
+            # Manual mode: AllReduce gradients across DP group.
+            # Flatten all gradients into one tensor to issue a single allreduce.
+            grads = [p.grad for p in self._base_sae.parameters() if p.grad is not None]
             if grads:
                 flat = torch.cat([g.view(-1) for g in grads])
                 if self.token_count_weighted_dp:
-                    # Weighted average: each replica contributes proportionally to
-                    # its token count, so gradients are equivalent to training on
-                    # the pooled dataset regardless of irregular P:Q ratios.
                     local_tokens = float(sae_in.shape[0])
                     flat.mul_(local_tokens)
                     dp_t0 = time.perf_counter()
@@ -474,11 +529,13 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                     numel = g.numel()
                     g.copy_(flat[offset : offset + numel].view_as(g))
                     offset += numel
-        sae.sync_tensor_parallel_gradients()
+
+        self._base_sae.sync_tensor_parallel_gradients()
         if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
             _debug_prefix_tp("grad sync done")
-        # TODO: Work out if grad norm clipping should be in config / how to test it.
-        sae.clip_grad_norm_(1.0)
+        # In FSDP mode pass dp_group so the norm all-reduce covers the DP shard dimension.
+        dp_group_for_clip = self.dp_group if self._is_fsdp else None
+        self._base_sae.clip_grad_norm_(1.0, dp_group=dp_group_for_clip)
         self.grad_scaler.step(
             self.optimizer
         )  # just ctx.optimizer.step() if not autocasting
@@ -502,7 +559,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
     def _should_write_training_metrics(self) -> bool:
         if self.cfg.output_path is None or self.cfg.save_mse_every_n_steps <= 0:
             return False
-        tp_group = getattr(self.sae, "_tp_group", None)
+        tp_group = getattr(self._base_sae, "_tp_group", None)
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
         return tp_rank == 0 and dp_rank == 0
@@ -510,7 +567,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
     def _should_write_timing_metrics(self) -> bool:
         if self.cfg.output_path is None or self.cfg.save_timing_every_n_steps <= 0:
             return False
-        tp_group = getattr(self.sae, "_tp_group", None)
+        tp_group = getattr(self._base_sae, "_tp_group", None)
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
         return tp_rank == 0 and dp_rank == 0
@@ -518,9 +575,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
     def _maybe_synchronize_timing(self) -> None:
         if not self.cfg.synchronize_timing:
             return
-        if not self.sae.device.type.startswith("cuda"):
+        if not self._base_sae.device.type.startswith("cuda"):
             return
-        torch.cuda.synchronize(self.sae.device)
+        torch.cuda.synchronize(self._base_sae.device)
 
     def _consume_data_provider_timing(self) -> dict[str, float]:
         consume_timing = getattr(self.data_provider, "consume_last_data_timing", None)
@@ -663,11 +720,11 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         ) == 0:
             self.sae.eval()
             eval_metrics = (
-                self.evaluator(self.sae, self.data_provider, self.activation_scaler)
+                self.evaluator(self._base_sae, self.data_provider, self.activation_scaler)
                 if self.evaluator is not None
                 else {}
             )
-            for key, value in self.sae.log_histograms().items():
+            for key, value in self._base_sae.log_histograms().items():
                 eval_metrics[key] = wandb.Histogram(value)  # type: ignore
 
             wandb.log(
@@ -690,7 +747,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
     @torch.no_grad()
     def _reset_running_sparsity_stats(self) -> None:
         self.act_freq_scores = torch.zeros(
-            self.sae.cfg.d_sae,  # type: ignore
+            self._base_sae.cfg.d_sae,
             device=self.cfg.device,
         )
         self.n_frac_active_samples = 0

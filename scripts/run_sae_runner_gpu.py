@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/results_1.08_routing/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_1.12_routing/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
     parser.add_argument("--save-mse-every-n-steps", type=int, default=1)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=1)
@@ -73,6 +73,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use-shard-routing", action="store_true",default=True,
                         help="Use unified shard-routing DP (supports arbitrary vllm_dp:sae_dp ratios).")
+    parser.add_argument(
+        "--sae-dp-mode",
+        default="manual",
+        choices=["manual", "fsdp"],
+        help="SAE data-parallel sync mode. 'fsdp' shards parameters across DP replicas (requires --sae-dp-size > 1).",
+    )
     return parser.parse_args()
 
 
@@ -139,25 +145,42 @@ def main() -> None:
             f"the expected world size {expected_world_size}."
         )
 
+    training_tokens = args.training_tokens
+    train_batch_size_tokens = args.train_batch_size_tokens
+    if args.sae_dp_size > 1:
+        if args.training_tokens % args.sae_dp_size != 0:
+            raise ValueError(
+                "--training-tokens must be divisible by --sae-dp-size so each "
+                "SAE DP replica gets the same number of local tokens."
+            )
+        if args.train_batch_size_tokens % args.sae_dp_size != 0:
+            raise ValueError(
+                "--train-batch-size-tokens must be divisible by --sae-dp-size; "
+                "the argument is treated as the global SAE batch size."
+            )
+        training_tokens = args.training_tokens // args.sae_dp_size
+        train_batch_size_tokens = args.train_batch_size_tokens // args.sae_dp_size
+        print(
+            f"[INFO] sae_dp_size={args.sae_dp_size}: scaling training_tokens "
+            f"{args.training_tokens} -> {training_tokens} per replica."
+        )
+        print(
+            f"[INFO] sae_dp_size={args.sae_dp_size}: scaling train_batch_size_tokens "
+            f"{args.train_batch_size_tokens} -> {train_batch_size_tokens} per replica "
+            f"(global batch stays {args.train_batch_size_tokens})."
+        )
+
     min_n_batches_in_buffer = math.ceil(
-        args.train_batch_size_tokens / args.context_size
+        train_batch_size_tokens / args.context_size
     )
     n_batches_in_buffer = (
         max(2, min_n_batches_in_buffer)
         if args.n_batches_in_buffer is None
         else args.n_batches_in_buffer
     )
-    if n_batches_in_buffer * args.context_size < args.train_batch_size_tokens:
+    if n_batches_in_buffer * args.context_size < train_batch_size_tokens:
         raise ValueError(
             "n_batches_in_buffer * context_size must be >= train_batch_size_tokens"
-        )
-
-    training_tokens = args.training_tokens
-    if args.sae_dp_size > 1:
-        training_tokens = training_tokens // args.sae_dp_size
-        print(
-            f"[INFO] sae_dp_size={args.sae_dp_size}: scaling training_tokens "
-            f"{args.training_tokens} -> {training_tokens} per replica."
         )
 
     device = _resolve_device()
@@ -184,7 +207,7 @@ def main() -> None:
         is_dataset_tokenized=True,
         context_size=args.context_size,
         training_tokens=training_tokens,
-        train_batch_size_tokens=args.train_batch_size_tokens,
+        train_batch_size_tokens=train_batch_size_tokens,
         store_batch_size_prompts=args.store_batch_size_prompts,
         n_batches_in_buffer=n_batches_in_buffer,
         activations_mixing_fraction=0.0,
@@ -205,6 +228,7 @@ def main() -> None:
         synchronize_timing=args.synchronize_timing,
         seed=args.seed,
         verbose=True,
+        sae_dp_mode=args.sae_dp_mode,
     )
 
     print("Starting runner with:")
@@ -215,7 +239,8 @@ def main() -> None:
     print(f"  d_in={d_in} d_sae={args.d_sae} k={args.k}")
     print(
         "  training_tokens="
-        f"{args.training_tokens} train_batch_size_tokens={args.train_batch_size_tokens}"
+        f"{args.training_tokens} train_batch_size_tokens={args.train_batch_size_tokens} "
+        f"(per_replica={training_tokens}/{train_batch_size_tokens})"
     )
     print(
         f"  vllm_tp_size={vllm_tp_size} vllm_dp_size={args.vllm_dp_size} "

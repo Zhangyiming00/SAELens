@@ -990,7 +990,13 @@ def test_run_producer_phase2_v2_non_root_participates_without_sending(
     monkeypatch.setattr(v2, "get_vllm_tp_rank", lambda: 1)
     monkeypatch.setattr(v2, "get_vllm_tp_group", lambda: "tp")
     monkeypatch.setattr(v2, "get_vllm_tp_size", lambda: 2)
-    monkeypatch.setattr(dist, "barrier", lambda group: barrier_calls.append(group))
+    monkeypatch.setattr(
+        dist,
+        "barrier",
+        lambda *args, **kwargs: barrier_calls.append(
+            kwargs["group"] if "group" in kwargs else args[0]
+        ),
+    )
     monkeypatch.setattr(
         dist,
         "send",
@@ -1005,7 +1011,7 @@ def test_run_producer_phase2_v2_non_root_participates_without_sending(
     assert outgoing == {}
 
 
-def test_run_producer_phase2_and_phase4_v2_root_send_only_remote_routes(
+def test_run_producer_phase2_v2_root_prepares_local_and_remote_gpu_slices(
     monkeypatch: pytest.MonkeyPatch,
 ):
     store = ActivationsStore.__new__(ActivationsStore)
@@ -1024,7 +1030,6 @@ def test_run_producer_phase2_and_phase4_v2_root_send_only_remote_routes(
         ShardRoute(producer_idx=0, consumer_idx=0, row_start=0, row_end=2),
         ShardRoute(producer_idx=0, consumer_idx=1, row_start=2, row_end=6),
     ]
-    sent: list[dict[str, Any]] = []
     barrier_calls: list[object] = []
 
     monkeypatch.setattr(v2, "is_producer", lambda: True)
@@ -1035,34 +1040,20 @@ def test_run_producer_phase2_and_phase4_v2_root_send_only_remote_routes(
     monkeypatch.setattr(v2, "get_routing_table", lambda: routes)
     monkeypatch.setattr(v2, "get_producer_tp_root", lambda p: 0)
     monkeypatch.setattr(v2, "get_consumer_tp_root", lambda c: 0 if c == 0 else 3)
-    monkeypatch.setattr(v2, "get_p2p_group", lambda c: f"g{c}")
-    monkeypatch.setattr(dist, "barrier", lambda group: barrier_calls.append(group))
     monkeypatch.setattr(
         dist,
-        "send",
-        lambda tensor, dst, group: sent.append(
-            {"tensor": tensor.clone(), "dst": dst, "group": group}
+        "barrier",
+        lambda *args, **kwargs: barrier_calls.append(
+            kwargs["group"] if "group" in kwargs else args[0]
         ),
     )
 
     local_slices, outgoing = store._run_producer_phase2_v2()
 
-    assert torch.equal(local_slices[0], raw_acts[:2].contiguous().cpu())
-    assert torch.equal(outgoing[0], raw_acts[:2].contiguous().cpu())
-    assert torch.equal(outgoing[1], raw_acts[2:6].contiguous().cpu())
+    assert torch.equal(local_slices[0], raw_acts[:2].contiguous())
+    assert torch.equal(outgoing[0], raw_acts[:2].contiguous())
+    assert torch.equal(outgoing[1], raw_acts[2:6].contiguous())
     assert barrier_calls == ["tp"]
-    assert len(sent) == 1
-    assert sent[0]["dst"] == 3
-    assert sent[0]["group"] == "g1"
-    assert sent[0]["tensor"].dtype == torch.int64
-    assert sent[0]["tensor"].tolist() == [4, 2]
-
-    store._run_producer_phase4_v2(outgoing)
-
-    assert len(sent) == 2
-    assert sent[1]["dst"] == 3
-    assert sent[1]["group"] == "g1"
-    assert torch.equal(sent[1]["tensor"], raw_acts[2:6].contiguous().cpu())
 
 
 def test_activations_store_consumer_only_is_recv_only():

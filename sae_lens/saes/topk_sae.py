@@ -22,7 +22,6 @@ from sae_lens.saes.sae import (
     TrainingSAE,
     TrainingSAEConfig,
     TrainStepInput,
-    _disable_hooks,
 )
 
 
@@ -555,11 +554,15 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
         return model_weights_path, cfg_path
 
     @override
-    def clip_grad_norm_(self, max_norm: float) -> torch.Tensor:
-        if self._tp_group is None:
+    def clip_grad_norm_(
+        self,
+        max_norm: float,
+        dp_group: dist.ProcessGroup | None = None,
+    ) -> torch.Tensor:
+        if self._tp_group is None and dp_group is None:
             return super().clip_grad_norm_(max_norm)
 
-        tp_rank = dist.get_rank(self._tp_group)
+        tp_rank = dist.get_rank(self._tp_group) if self._tp_group is not None else 0
         local_sq_norm = torch.zeros((), device=self.device, dtype=torch.float32)
         shard_dims = self._tp_param_shard_dims()
 
@@ -569,13 +572,19 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
             grad_sq = param.grad.detach().float().pow(2).sum()
             shard_dim = shard_dims.get(name)
             if shard_dim is None:
-                # Count replicated parameters only once in the global norm.
+                # Count replicated parameters only once across TP ranks.
                 if tp_rank == 0:
                     local_sq_norm += grad_sq
             else:
                 local_sq_norm += grad_sq
 
-        dist.all_reduce(local_sq_norm, group=self._tp_group)
+        if self._tp_group is not None:
+            dist.all_reduce(local_sq_norm, group=self._tp_group)
+        if dp_group is not None:
+            # In FSDP mode each DP rank holds a distinct shard; summing squared
+            # norms across DP recovers the true global gradient norm.
+            dist.all_reduce(local_sq_norm, group=dp_group)
+
         total_norm = local_sq_norm.sqrt()
         clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
         for param in self.parameters():
@@ -648,23 +657,6 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
         sae_out_pre = self.hook_sae_recons(sae_out_pre)
         sae_out_pre = self.run_time_activation_norm_fn_out(sae_out_pre)
         return self.reshape_fn_out(sae_out_pre, self.d_head)
-
-    @override
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the SAE."""
-        feature_acts = self.encode(x)
-        sae_out = self.decode(feature_acts)
-
-        if self.use_error_term:
-            with torch.no_grad():
-                # Recompute without hooks for true error term
-                with _disable_hooks(self):
-                    feature_acts_clean = self.encode(x)
-                    x_reconstruct_clean = self.decode(feature_acts_clean)
-                sae_error = self.hook_sae_error(x - x_reconstruct_clean)
-            sae_out = sae_out + sae_error
-
-        return self.hook_sae_output(sae_out)
 
     @override
     def calculate_aux_loss(

@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
 
 import simple_parsing
 import torch
+import torch.distributed as dist
 import wandb
+
 from datasets import (
     Dataset,
     DatasetDict,
@@ -15,7 +17,6 @@ from datasets import (
     IterableDatasetDict,
     load_dataset,
 )
-
 from sae_lens import __version__, logger
 
 # keeping this unused import since some SAELens deps import DTYPE_MAP from config
@@ -287,8 +288,35 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     sae_lens_version: str = field(default_factory=lambda: __version__)
     sae_lens_training_version: str = field(default_factory=lambda: __version__)
     exclude_special_tokens: bool | list[int] = False
+    sae_dp_mode: Literal["manual", "ddp", "fsdp"] = "manual"
 
     def __post_init__(self):
+        if self.sae_dp_mode == "ddp":
+            raise NotImplementedError(
+                "sae_dp_mode='ddp' is not implemented in v1. Use 'manual' or 'fsdp'."
+            )
+        if self.sae_dp_mode == "fsdp":
+            if self.compile_sae:
+                raise ValueError(
+                    "compile_sae=True is incompatible with sae_dp_mode='fsdp'."
+                )
+            if self.n_checkpoints > 0:
+                raise ValueError(
+                    "n_checkpoints > 0 is not supported with sae_dp_mode='fsdp'. "
+                    "FSDP checkpoint/resume is not yet implemented."
+                )
+            if self.resume_from_checkpoint is not None:
+                raise ValueError(
+                    "resume_from_checkpoint is not supported with sae_dp_mode='fsdp'. "
+                    "FSDP checkpoint/resume is not yet implemented."
+                )
+            if self.save_final_checkpoint:
+                raise ValueError(
+                    "save_final_checkpoint=True is not supported with sae_dp_mode='fsdp'. "
+                    "Use save_final_checkpoint=False; the runner saves the final inference "
+                    "model via save_final_sae() instead."
+                )
+
         if self.hook_eval != "NOT_IN_USE":
             warnings.warn(
                 "The 'hook_eval' field is deprecated and will be removed in v7.0.0. "

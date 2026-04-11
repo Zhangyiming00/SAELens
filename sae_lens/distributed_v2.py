@@ -49,7 +49,7 @@ _consumer_tp_root: dict[int, int] = {}            # c -> world rank of TP root (
 _vllm_tp_group: dist.ProcessGroup | None = None
 _sae_tp_group: dist.ProcessGroup | None = None
 _sae_dp_group: dist.ProcessGroup | None = None
-_consumer_p2p_groups: dict[int, dist.ProcessGroup] = {}  # consumer_idx -> Gloo group
+_consumer_p2p_groups: dict[int, dist.ProcessGroup] = {}  # consumer_idx -> NCCL P2P group
 
 _routing_table: list[ShardRoute] = []
 
@@ -190,14 +190,17 @@ def init_distributed_v2(
     # --- Compute routing table ---
     _routing_table = compute_routing_table(P, Q, batch_size)
 
-    # --- Create Q per-consumer Gloo P2P groups ---
+    # --- Create Q per-consumer NCCL P2P groups ---
+    # Uses NCCL for efficient GPU-to-GPU activation transfers.
+    # Requires vLLM parallel state to be pre-initialized via preinit_vllm_distributed()
+    # to avoid NCCL communicator conflicts.
     for c in range(Q):
         sources = {r.producer_idx for r in _routing_table if r.consumer_idx == c}
         # Deduplicate: producer TP root and consumer TP root may coincide.
         p2p_members = sorted(
             {_consumer_tp_root[c]} | {_producer_tp_root[p] for p in sources}
         )
-        grp = dist.new_group(p2p_members, backend="gloo")
+        grp = dist.new_group(p2p_members, backend="nccl")
         if rank in p2p_members:
             _consumer_p2p_groups[c] = grp
 
@@ -261,7 +264,7 @@ def get_sae_dp_group() -> dist.ProcessGroup | None:
 
 
 def get_p2p_group(consumer_idx: int) -> dist.ProcessGroup:
-    """Return the Gloo P2P group for the given consumer.
+    """Return the NCCL P2P group for the given consumer.
 
     Raises ``KeyError`` if this rank is not a member of that consumer's P2P group.
     """

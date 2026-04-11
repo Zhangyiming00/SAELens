@@ -19,6 +19,8 @@ from sae_lens import logger
 from sae_lens.config import HfDataset, LanguageModelSAERunnerConfig
 from sae_lens.constants import (
     RUNNER_CFG_FILENAME,
+    SAE_CFG_FILENAME,
+    SAE_WEIGHTS_FILENAME,
     SPARSITY_FILENAME,
 )
 from sae_lens.distributed import (
@@ -355,6 +357,36 @@ class LanguageModelSAETrainingRunner:
             if tp_group is not None and hasattr(self.sae, "shard_weights"):
                 self.sae.shard_weights(tp_group)
 
+        # Wrap with FSDP after TP sharding when sae_dp_mode='fsdp'.
+        # base_sae always points to the raw module; wrapped_sae may be an FSDP wrapper.
+        self._base_sae = self.sae
+        if self.sae is not None and self.cfg.sae_dp_mode == "fsdp":
+            if not dist.is_initialized():
+                raise ValueError(
+                    "sae_dp_mode='fsdp' requires an initialized distributed process group."
+                )
+            if sae_tp_size > 1:
+                raise ValueError(
+                    "sae_dp_mode='fsdp' with sae_tp_size > 1 is not supported. "
+                    "Use sae_tp_size=1 with FSDP."
+                )
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp.api import ShardingStrategy
+            sae_dp_group = get_dp_group()
+            if self.use_shard_routing:
+                import sae_lens.distributed_v2 as v2_mod
+                sae_dp_group = v2_mod.get_sae_dp_group()
+            if sae_dp_group is None or dist.get_world_size(sae_dp_group) <= 1:
+                raise ValueError(
+                    "sae_dp_mode='fsdp' requires sae_dp_size > 1."
+                )
+            self.sae = FSDP(
+                self.sae,
+                process_group=sae_dp_group,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                use_orig_params=True,
+            )
+
     def run(self):
         """
         Run the training of the SAE.
@@ -396,8 +428,11 @@ class LanguageModelSAETrainingRunner:
         if self.use_shard_routing:
             import sae_lens.distributed_v2 as v2_mod
             sae_dp_group = v2_mod.get_sae_dp_group()
+        # In FSDP mode the dp_group is already embedded in the FSDP wrapper; we
+        # still pass it so the trainer can use it for sparsity/firing sync and rank checks.
         trainer = SAETrainer(
             sae=self.sae,
+            base_sae=self._base_sae,
             data_provider=self.activations_store,
             evaluator=evaluator,
             save_checkpoint_fn=self.save_checkpoint,
@@ -413,7 +448,7 @@ class LanguageModelSAETrainingRunner:
         if self.cfg.resume_from_checkpoint is not None:
             logger.info(f"Resuming from checkpoint: {self.cfg.resume_from_checkpoint}")
             trainer.load_trainer_state(self.cfg.resume_from_checkpoint)
-            self.sae.load_weights_from_checkpoint(self.cfg.resume_from_checkpoint)
+            self._base_sae.load_weights_from_checkpoint(self.cfg.resume_from_checkpoint)
             self.activations_store.load_from_checkpoint(self.cfg.resume_from_checkpoint)
 
         self._compile_if_needed()
@@ -519,8 +554,8 @@ class LanguageModelSAETrainingRunner:
         """Producer-only loop for shard-routing mode (use_shard_routing=True).
 
         All producer TP ranks participate in get_raw_llm_batch() each step.
-        Only the producer TP root (vllm_tp_rank == 0) sends metadata + payload slices
-        to each target consumer via the per-consumer Gloo P2P groups.
+        Producer TP roots then participate in the same per-consumer NCCL P2P
+        exchange phase as consumer ranks.
         Exits after total_producer_steps steps to stay in lockstep with consumers.
         """
         import math
@@ -534,7 +569,7 @@ class LanguageModelSAETrainingRunner:
 
         for _ in range(total_producer_steps):
             _local_slices, outgoing = self.activations_store._run_producer_phase2_v2()
-            self.activations_store._run_producer_phase4_v2(outgoing)
+            self.activations_store._run_nccl_p2p_exchange_v2(outgoing)
 
     def save_final_sae(
         self,
@@ -545,20 +580,46 @@ class LanguageModelSAETrainingRunner:
         tp_group = getattr(sae, "_tp_group", None)
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         dp_group = get_dp_group()
+        if self.use_shard_routing:
+            import sae_lens.distributed_v2 as v2_mod
+            dp_group = v2_mod.get_sae_dp_group()
         dp_rank = (
             dist.get_rank(dp_group)
             if dp_group is not None and dist.get_world_size(dp_group) > 1
             else 0
         )
-        if dp_rank != 0:
-            return
 
         base_output_path = Path(output_path)
         base_output_path.mkdir(exist_ok=True, parents=True)
 
-        weights_path, cfg_path = sae.save_inference_model(str(base_output_path))
-        if tp_rank != 0:
-            return
+        if self.cfg.sae_dp_mode == "fsdp":
+            # FSDP state dict gather is a collective — all DP ranks must call it.
+            # rank0_only=True means only dp_rank 0 receives a non-empty result.
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+            fsdp_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.sae, StateDictType.FULL_STATE_DICT, fsdp_cfg):
+                state_dict = self.sae.state_dict()
+            # Non-rank-0 processes have an empty dict; nothing to save.
+            if dp_rank != 0:
+                return
+            sae.process_state_dict_for_saving_inference(state_dict)
+            weights_path = base_output_path / SAE_WEIGHTS_FILENAME
+            cfg_path = base_output_path / SAE_CFG_FILENAME
+            if tp_rank == 0:
+                save_file(state_dict, weights_path)
+                config = sae.cfg.get_inference_sae_cfg_dict()
+                with open(cfg_path, "w") as f:
+                    json.dump(config, f)
+            if tp_group is not None:
+                dist.barrier(group=tp_group)
+        else:
+            if dp_rank != 0:
+                return
+            weights_path, cfg_path = sae.save_inference_model(str(base_output_path))
+            if tp_rank != 0:
+                return
 
         sparsity_path = None
         if log_feature_sparsity is not None:

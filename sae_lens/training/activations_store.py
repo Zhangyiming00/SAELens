@@ -1050,14 +1050,13 @@ class ActivationsStore:
         One global training step = each consumer receives all inbound slices,
         assembles them into one local batch, and yields exactly once.
 
-        The phase ordering guarantees deadlock-freedom:
-          Phase 1 — consumer roots post metadata irecvs (non-blocking)
-          Phase 2 — producer roots generate batch + send metadata
-          Phase 3 — consumer roots wait metadata, post payload irecvs
-          Phase 4 — producer roots send cached payloads
-          Phase 5 — consumer roots wait payloads, assemble in route order
-          Phase 6 — consumer TP root broadcasts to TP followers (if sae_tp > 1)
-          Phase 7 — all consumer ranks yield assembled batch
+        The phase ordering is NCCL-friendly:
+          Phase 1 — all producer ranks generate batches; producer roots prepare GPU slices
+          Phase 2 — producer roots and consumer roots exchange remote slices with
+                    ``batch_isend_irecv`` after producer data is ready
+          Phase 3 — consumer roots assemble local + remote slices in route order
+          Phase 4 — consumer TP root broadcasts to TP followers (if sae_tp > 1)
+          Phase 5 — all consumer ranks yield assembled batch
 
         Consumer-only ranks (self._consumer_only=True) never call get_raw_llm_batch().
         Producer-only ranks never enter this method (handled by the runner helper loop).
@@ -1067,99 +1066,61 @@ class ActivationsStore:
         routing = v2.get_routing_table()
         i_am_producer = v2.is_producer()
         i_am_consumer = v2.is_consumer()
-        i_am_producer_root = i_am_producer and v2.get_vllm_tp_rank() == 0
         i_am_consumer_root = i_am_consumer and v2.get_sae_tp_rank() == 0
         c = v2.get_consumer_idx() if i_am_consumer else -1
 
-        from sae_lens.shard_routing import routes_for_consumer, routes_for_producer
+        from sae_lens.shard_routing import routes_for_consumer
 
         while True:
             local_slices: dict[int, torch.Tensor] = {}   # producer_idx -> tensor
             outgoing: dict[int, torch.Tensor] = {}       # consumer_idx -> slice tensor
 
-            # === PHASE 1: Consumer roots post metadata irecvs ===
-            meta_work: list[tuple[object, torch.Tensor | None, object | None]] = []
-            if i_am_consumer_root:
-                for route in routes_for_consumer(routing, c):
-                    p = route.producer_idx
-                    if v2.get_producer_tp_root(p) == v2.get_consumer_tp_root(c):
-                        meta_work.append((route, None, None))  # local: no irecv
-                    else:
-                        meta_buf = torch.zeros(2, dtype=torch.int64)
-                        w = dist.irecv(
-                            meta_buf,
-                            src=v2.get_producer_tp_root(p),
-                            group=v2.get_p2p_group(c),
-                        )
-                        meta_work.append((route, meta_buf, w))
-
-            # === PHASE 2: Producer roots generate batch + send metadata ===
+            # === PHASE 1: Producer roots generate batch; slices stay on device ===
             # All producer TP ranks must participate in get_raw_llm_batch() for the
-            # model-parallel forward collective; only the root sends P2P metadata.
+            # model-parallel forward collective.
             vllm_stage_t0 = time.perf_counter()
             if i_am_producer:
                 local_slices, outgoing = self._run_producer_phase2_v2()
-
-            # === PHASE 3: Consumer roots wait metadata, post payload irecvs ===
-            payload_work: list[tuple[object, torch.Tensor, object | None]] = []
-            if i_am_consumer_root:
-                for route, meta_buf, w in meta_work:
-                    p = route.producer_idx  # type: ignore[union-attr]
-                    if v2.get_producer_tp_root(p) == v2.get_consumer_tp_root(c):
-                        payload_work.append((route, local_slices[p], None))
-                    else:
-                        w.wait()  # type: ignore[union-attr]
-                        n_rows = int(meta_buf[0])  # type: ignore[index]
-                        d_in = int(meta_buf[1])  # type: ignore[index]
-                        act_buf = torch.zeros(n_rows, d_in, dtype=self.dtype)
-                        w2 = dist.irecv(
-                            act_buf,
-                            src=v2.get_producer_tp_root(p),
-                            group=v2.get_p2p_group(c),
-                        )
-                        payload_work.append((route, act_buf, w2))
             self._add_data_timing(vllm_step_time_s=time.perf_counter() - vllm_stage_t0)
 
-            # === PHASE 4: Producer roots send cached payloads ===
+            # === PHASE 2: Exchange remote payloads with NCCL P2P ===
             transfer_t0 = time.perf_counter()
-            if i_am_producer_root:
-                self._run_producer_phase4_v2(outgoing)
+            remote_slices = self._run_nccl_p2p_exchange_v2(outgoing)
 
-            # === PHASE 5: Consumer roots wait payloads, assemble in route order ===
+            # === PHASE 3: Consumer roots assemble in route order ===
             assembled: torch.Tensor | None = None
             if i_am_consumer_root:
                 buf_map: dict[int, torch.Tensor] = {}
-                for route, buf, w2 in payload_work:
-                    if w2 is not None:
-                        w2.wait()  # type: ignore[union-attr]
-                    buf_map[route.producer_idx] = buf  # type: ignore[union-attr]
-
                 c_routes = routes_for_consumer(routing, c)
+                for route in c_routes:
+                    p = route.producer_idx
+                    if v2.get_producer_tp_root(p) == v2.get_consumer_tp_root(c):
+                        buf_map[p] = local_slices[p]
+                    else:
+                        buf_map[p] = remote_slices[p]
+
                 assembled = torch.cat(
                     [buf_map[r.producer_idx] for r in c_routes], dim=0
-                ).to(self.device)
+                )
 
-                # === PHASE 6: Broadcast to SAE TP followers ===
+                # === PHASE 4: Broadcast to SAE TP followers ===
                 sae_tp_group = v2.get_sae_tp_group()
                 sae_tp_size = v2.get_sae_tp_size()
                 if sae_tp_size > 1 and sae_tp_group is not None:
-                    shape_t = torch.tensor(list(assembled.shape), dtype=torch.int64, device=self.device)
-                    dist.broadcast(shape_t, src=v2.get_consumer_tp_root(c), group=sae_tp_group)
                     dist.broadcast(assembled, src=v2.get_consumer_tp_root(c), group=sae_tp_group)
 
             elif i_am_consumer and v2.get_sae_tp_size() > 1:
-                # SAE TP follower: receive broadcasts
+                # SAE TP follower: receive data broadcast.
+                # Shape is known from routing table + self.d_in — no shape broadcast needed.
                 sae_tp_group = v2.get_sae_tp_group()
                 routing_c = v2.get_consumer_idx()
-                n_sources = len(routes_for_consumer(routing, routing_c))
-                shape_t = torch.zeros(2, dtype=torch.int64, device=self.device)
-                dist.broadcast(shape_t, src=v2.get_consumer_tp_root(routing_c), group=sae_tp_group)
-                assembled = torch.empty(
-                    int(shape_t[0]), int(shape_t[1]), dtype=self.dtype, device=self.device
+                n_rows = sum(
+                    r.row_end - r.row_start for r in routes_for_consumer(routing, routing_c)
                 )
+                assembled = torch.empty(n_rows, self.d_in, dtype=self.dtype, device=self.device)
                 dist.broadcast(assembled, src=v2.get_consumer_tp_root(routing_c), group=sae_tp_group)
 
-            # === PHASE 7: All consumer ranks yield assembled batch ===
+            # === PHASE 5: All consumer ranks yield assembled batch ===
             if assembled is not None:
                 self._add_data_timing(
                     transfer_time_s=time.perf_counter() - transfer_t0
@@ -1185,7 +1146,14 @@ class ActivationsStore:
         """Run shard-routing phase 2 for one producer step.
 
         All producer TP ranks participate in ``get_raw_llm_batch()``. Only the
-        producer TP root prepares slices and sends metadata for remote consumers.
+        producer TP root prepares slices.
+
+        All slices stay on the original device (GPU) — local routes and remote
+        routes both use GPU tensors, since NCCL P2P handles GPU-to-GPU transfers
+        directly without CPU staging.
+
+        No metadata is sent: consumers pre-allocate buffers from the routing
+        table (``route.row_end - route.row_start``) and ``self.d_in``.
         """
         import sae_lens.distributed_v2 as v2
 
@@ -1210,43 +1178,105 @@ class ActivationsStore:
 
         p = v2.get_producer_idx()
         raw_acts, _ = self._get_raw_llm_batch_with_epoch_restart()
-        raw_cpu = raw_acts.to("cpu").contiguous()
+        p_routes = routes_for_producer(v2.get_routing_table(), p)
 
-        for route in routes_for_producer(v2.get_routing_table(), p):
+        for route in p_routes:
             cc = route.consumer_idx
-            sl = raw_cpu[route.row_start:route.row_end].contiguous()
-            outgoing[cc] = sl
+            sl = raw_acts[route.row_start:route.row_end].contiguous()
             if v2.get_producer_tp_root(p) == v2.get_consumer_tp_root(cc):
+                # Local route: slice stays on the original device.
                 local_slices[route.producer_idx] = sl
-            else:
-                n_rows, d_in = sl.shape
-                meta = torch.tensor([n_rows, d_in], dtype=torch.int64)
-                dist.send(
-                    meta,
-                    dst=v2.get_consumer_tp_root(cc),
-                    group=v2.get_p2p_group(cc),
-                )
+            outgoing[cc] = sl
 
         return local_slices, outgoing
 
-    def _run_producer_phase4_v2(self, outgoing: dict[int, torch.Tensor]) -> None:
-        """Run shard-routing phase 4 for one producer step."""
+    def _run_nccl_p2p_exchange_v2(
+        self,
+        outgoing: dict[int, torch.Tensor],
+    ) -> dict[int, torch.Tensor]:
+        """Exchange remote activation slices with per-consumer NCCL P2P groups.
+
+        All producer data is already materialized before this runs.  For each
+        consumer, every member of that consumer's P2P group enters a NCCL barrier
+        and then issues its send/recv ops together via ``batch_isend_irecv``.
+        This avoids the Gloo-style early-recv pattern that can deadlock with NCCL.
+        """
         import sae_lens.distributed_v2 as v2
 
-        from sae_lens.shard_routing import routes_for_producer
+        from sae_lens.shard_routing import routes_for_consumer, routes_for_producer
 
-        if not v2.is_producer() or v2.get_vllm_tp_rank() != 0:
-            return
+        recv_slices: dict[int, torch.Tensor] = {}
+        rank = dist.get_rank() if dist.is_initialized() else -1
 
-        p = v2.get_producer_idx()
-        for route in routes_for_producer(v2.get_routing_table(), p):
-            cc = route.consumer_idx
-            if v2.get_producer_tp_root(p) != v2.get_consumer_tp_root(cc):
-                dist.send(
-                    outgoing[cc],
-                    dst=v2.get_consumer_tp_root(cc),
-                    group=v2.get_p2p_group(cc),
+        producer_routes = (
+            routes_for_producer(v2.get_routing_table(), v2.get_producer_idx())
+            if v2.is_producer() and v2.get_vllm_tp_rank() == 0
+            else []
+        )
+        producer_routes_by_consumer = {
+            route.consumer_idx: route for route in producer_routes
+        }
+
+        for c in range(v2.get_sae_dp_size()):
+            consumer_root = v2.get_consumer_tp_root(c)
+            consumer_routes = routes_for_consumer(v2.get_routing_table(), c)
+            remote_routes = [
+                route
+                for route in consumer_routes
+                if v2.get_producer_tp_root(route.producer_idx) != consumer_root
+            ]
+            if not remote_routes:
+                continue
+
+            send_route = producer_routes_by_consumer.get(c)
+            should_send = (
+                send_route is not None
+                and v2.get_producer_tp_root(send_route.producer_idx) != consumer_root
+            )
+            should_recv = rank == consumer_root
+            if not should_send and not should_recv:
+                continue
+
+            p2p_group = v2.get_p2p_group(c)
+            barrier_kwargs: dict[str, Any] = {"group": p2p_group}
+            if torch.cuda.is_available():
+                barrier_kwargs["device_ids"] = [torch.cuda.current_device()]
+            dist.barrier(**barrier_kwargs)
+
+            ops: list[dist.P2POp] = []
+            if should_recv:
+                for route in remote_routes:
+                    n_rows = route.row_end - route.row_start
+                    recv_buf = torch.empty(
+                        n_rows,
+                        self.d_in,
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                    recv_slices[route.producer_idx] = recv_buf
+                    ops.append(
+                        dist.P2POp(
+                            dist.irecv,
+                            recv_buf,
+                            v2.get_producer_tp_root(route.producer_idx),
+                            group=p2p_group,
+                        )
+                    )
+
+            if should_send:
+                ops.append(
+                    dist.P2POp(
+                        dist.isend,
+                        outgoing[c],
+                        consumer_root,
+                        group=p2p_group,
+                    )
                 )
+
+            for work in dist.batch_isend_irecv(ops):
+                work.wait()
+
+        return recv_slices
 
     def get_data_loader(
         self,
