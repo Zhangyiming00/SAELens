@@ -46,6 +46,7 @@ from sae_lens.distributed import (
     is_vllm_dp_root,
 )
 from sae_lens.pretokenize_runner import get_special_token_from_cfg
+from sae_lens.profiling import nccl_nvtx_range
 from sae_lens.saes.sae import SAE, T_SAE_CONFIG, T_TRAINING_SAE_CONFIG
 from sae_lens.tokenization_and_batching import concat_and_batch_sequences
 from sae_lens.training.mixing_buffer import mixing_buffer
@@ -721,11 +722,12 @@ class ActivationsStore:
                     f"tp_world_size={world_size}, expected d_in={self.d_in}."
                 )
             shards = [torch.empty_like(layerwise_activations) for _ in range(world_size)]
-            dist.all_gather(
-                shards,
-                layerwise_activations.contiguous(),
-                group=vllm_tp_group,
-            )
+            with nccl_nvtx_range("nccl:vllm_tp_activation_all_gather", vllm_tp_group):
+                dist.all_gather(
+                    shards,
+                    layerwise_activations.contiguous(),
+                    group=vllm_tp_group,
+                )
             layerwise_activations = torch.cat(shards, dim=-1)
 
         n_batches, n_context = layerwise_activations.shape[:2]
@@ -974,9 +976,22 @@ class ActivationsStore:
                         )
                         transfer_t0 = time.perf_counter()
                         _debug_prefix_tp("vllm_dp root tp broadcast start")
-                        dist.broadcast(batch_acts, src=cluster_sae_root, group=sae_tp_group)
+                        with nccl_nvtx_range("nccl:legacy_sae_tp_acts_broadcast", sae_tp_group):
+                            dist.broadcast(
+                                batch_acts,
+                                src=cluster_sae_root,
+                                group=sae_tp_group,
+                            )
                         if batch_tokens is not None:
-                            dist.broadcast(batch_tokens, src=cluster_sae_root, group=sae_tp_group)
+                            with nccl_nvtx_range(
+                                "nccl:legacy_sae_tp_tokens_broadcast",
+                                sae_tp_group,
+                            ):
+                                dist.broadcast(
+                                    batch_tokens,
+                                    src=cluster_sae_root,
+                                    group=sae_tp_group,
+                                )
                         self._add_data_timing(
                             transfer_time_s=time.perf_counter() - transfer_t0
                         )
@@ -1008,7 +1023,12 @@ class ActivationsStore:
                     )
                     transfer_t0 = time.perf_counter()
                     _debug_prefix_tp("vllm_dp tp follower broadcast wait")
-                    dist.broadcast(helper_acts, src=cluster_sae_root, group=sae_tp_group)
+                    with nccl_nvtx_range("nccl:legacy_sae_tp_acts_broadcast", sae_tp_group):
+                        dist.broadcast(
+                            helper_acts,
+                            src=cluster_sae_root,
+                            group=sae_tp_group,
+                        )
                     helper_tokens = None
                     if combined_shape_tokens is not None:
                         helper_tokens = torch.empty(
@@ -1016,7 +1036,15 @@ class ActivationsStore:
                             dtype=raw_tokens.dtype,  # type: ignore[union-attr]
                             device=tp_runtime_device,
                         )
-                        dist.broadcast(helper_tokens, src=cluster_sae_root, group=sae_tp_group)
+                        with nccl_nvtx_range(
+                            "nccl:legacy_sae_tp_tokens_broadcast",
+                            sae_tp_group,
+                        ):
+                            dist.broadcast(
+                                helper_tokens,
+                                src=cluster_sae_root,
+                                group=sae_tp_group,
+                            )
                     self._add_data_timing(
                         transfer_time_s=time.perf_counter() - transfer_t0
                     )
@@ -1107,7 +1135,12 @@ class ActivationsStore:
                 sae_tp_group = v2.get_sae_tp_group()
                 sae_tp_size = v2.get_sae_tp_size()
                 if sae_tp_size > 1 and sae_tp_group is not None:
-                    dist.broadcast(assembled, src=v2.get_consumer_tp_root(c), group=sae_tp_group)
+                    with nccl_nvtx_range("nccl:shard_routing_sae_tp_broadcast", sae_tp_group):
+                        dist.broadcast(
+                            assembled,
+                            src=v2.get_consumer_tp_root(c),
+                            group=sae_tp_group,
+                        )
 
             elif i_am_consumer and v2.get_sae_tp_size() > 1:
                 # SAE TP follower: receive data broadcast.
@@ -1118,7 +1151,12 @@ class ActivationsStore:
                     r.row_end - r.row_start for r in routes_for_consumer(routing, routing_c)
                 )
                 assembled = torch.empty(n_rows, self.d_in, dtype=self.dtype, device=self.device)
-                dist.broadcast(assembled, src=v2.get_consumer_tp_root(routing_c), group=sae_tp_group)
+                with nccl_nvtx_range("nccl:shard_routing_sae_tp_broadcast", sae_tp_group):
+                    dist.broadcast(
+                        assembled,
+                        src=v2.get_consumer_tp_root(routing_c),
+                        group=sae_tp_group,
+                    )
 
             # === PHASE 5: All consumer ranks yield assembled batch ===
             if assembled is not None:
@@ -1170,7 +1208,8 @@ class ActivationsStore:
             barrier_kwargs: dict[str, Any] = {"group": vllm_tp_group}
             if torch.cuda.is_available():
                 barrier_kwargs["device_ids"] = [torch.cuda.current_device()]
-            dist.barrier(**barrier_kwargs)
+            with nccl_nvtx_range("nccl:vllm_tp_step_barrier", vllm_tp_group):
+                dist.barrier(**barrier_kwargs)
 
         if v2.get_vllm_tp_rank() != 0:
             self._get_raw_llm_batch_with_epoch_restart()
@@ -1241,7 +1280,8 @@ class ActivationsStore:
             barrier_kwargs: dict[str, Any] = {"group": p2p_group}
             if torch.cuda.is_available():
                 barrier_kwargs["device_ids"] = [torch.cuda.current_device()]
-            dist.barrier(**barrier_kwargs)
+            with nccl_nvtx_range("nccl:shard_routing_p2p_barrier", p2p_group):
+                dist.barrier(**barrier_kwargs)
 
             ops: list[dist.P2POp] = []
             if should_recv:
@@ -1273,8 +1313,9 @@ class ActivationsStore:
                     )
                 )
 
-            for work in dist.batch_isend_irecv(ops):
-                work.wait()
+            with nccl_nvtx_range("nccl:shard_routing_p2p_exchange", p2p_group):
+                for work in dist.batch_isend_irecv(ops):
+                    work.wait()
 
         return recv_slices
 

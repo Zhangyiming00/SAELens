@@ -21,6 +21,8 @@ import os
 import torch
 import torch.distributed as dist
 
+from sae_lens.profiling import nccl_nvtx_range
+
 # Module-level state for prefix-overlap training.
 _sae_tp_group: dist.ProcessGroup | None = None
 _sae_dp_group: dist.ProcessGroup | None = None
@@ -413,7 +415,8 @@ class _AllGather(torch.autograd.Function):
         ctx.tp_rank = dist.get_rank(group)
         ctx.shard_size = local.shape[-1]
         output_tensors = [torch.zeros_like(local) for _ in range(tp_size)]
-        dist.all_gather(output_tensors, local.contiguous(), group=group)
+        with nccl_nvtx_range("nccl:sae_tp_all_gather_forward", group):
+            dist.all_gather(output_tensors, local.contiguous(), group=group)
         return torch.cat(output_tensors, dim=-1)
 
     @staticmethod
@@ -436,7 +439,8 @@ class _AllReduce(torch.autograd.Function):
         group: dist.ProcessGroup,
     ) -> torch.Tensor:
         out = x.clone()
-        dist.all_reduce(out, group=group)
+        with nccl_nvtx_range("nccl:sae_tp_all_reduce_forward", group):
+            dist.all_reduce(out, group=group)
         return out
 
     @staticmethod

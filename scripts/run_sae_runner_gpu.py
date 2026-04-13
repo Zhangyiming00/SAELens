@@ -36,6 +36,7 @@ import torch.distributed as dist
 from transformers import AutoConfig
 
 from sae_lens.config import LanguageModelSAERunnerConfig, LoggingConfig
+from sae_lens.constants import SAE_WEIGHTS_FILENAME, TRAINER_STATE_FILENAME
 from sae_lens.llm_sae_training_runner import LanguageModelSAETrainingRunner
 from sae_lens.saes.topk_sae import TopKTrainingSAEConfig
 
@@ -48,11 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d-sae", type=int, default=32768*2)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--vllm-tp-size", type=int, default=1)
-    parser.add_argument("--sae-tp-size", type=int, default=1)
+    parser.add_argument("--vllm-tp-size", type=int, default=None)
+    parser.add_argument("--sae-tp-size", type=int, default=None)
     parser.add_argument("--vllm-dp-size", type=int, default=1)
     parser.add_argument("--sae-dp-size", type=int, default=1)
-    parser.add_argument("--training-tokens", type=int, default=2048*40)
+    parser.add_argument("--training-tokens", type=int, default=2048*32)
     parser.add_argument("--train-batch-size-tokens", type=int, default=2048)
     parser.add_argument("--context-size", type=int, default=2048)
     parser.add_argument("--store-batch-size-prompts", type=int, default=4)
@@ -65,19 +66,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/results_1.12_routing/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_1.22/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
     parser.add_argument("--save-mse-every-n-steps", type=int, default=1)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=1)
     parser.add_argument("--synchronize-timing", action="store_true", default=True)
+    parser.add_argument("--checkpoint-path", default="checkpoints/ck3")
+    parser.add_argument("--n-checkpoints", type=int, default=0)
+    parser.add_argument("--save-final-checkpoint", action="store_true", default=True)
+    parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use-shard-routing", action="store_true",default=True,
                         help="Use unified shard-routing DP (supports arbitrary vllm_dp:sae_dp ratios).")
     parser.add_argument(
         "--sae-dp-mode",
         default="manual",
-        choices=["manual", "fsdp"],
-        help="SAE data-parallel sync mode. 'fsdp' shards parameters across DP replicas (requires --sae-dp-size > 1).",
+        choices=["manual", "ddp", "fsdp"],
+        help=(
+            "SAE data-parallel sync mode. 'ddp' replicates SAE parameters across DP "
+            "replicas; 'fsdp' shards them (requires --sae-dp-size > 1)."
+        ),
     )
     return parser.parse_args()
 
@@ -98,10 +106,42 @@ def _resolve_hidden_size(model_name: str) -> int:
     return int(hf_cfg.hidden_size)
 
 
+def _validate_checkpoint_args(args: argparse.Namespace) -> None:
+    if args.n_checkpoints < 0:
+        raise ValueError("--n-checkpoints must be >= 0")
+    needs_checkpoint_path = args.n_checkpoints > 0 or args.save_final_checkpoint
+    if needs_checkpoint_path and args.checkpoint_path is None:
+        raise ValueError(
+            "--checkpoint-path is required when --n-checkpoints > 0 or "
+            "--save-final-checkpoint is set."
+        )
+    if args.resume_from_checkpoint is None:
+        return
+
+    resume_path = Path(args.resume_from_checkpoint)
+    if not resume_path.exists():
+        raise ValueError(f"--resume-from-checkpoint does not exist: {resume_path}")
+    if not resume_path.is_dir():
+        raise ValueError(f"--resume-from-checkpoint must be a directory: {resume_path}")
+    missing = [
+        filename
+        for filename in (TRAINER_STATE_FILENAME, SAE_WEIGHTS_FILENAME)
+        if not (resume_path / filename).exists()
+    ]
+    if missing:
+        raise ValueError(
+            "--resume-from-checkpoint is missing required file(s): "
+            + ", ".join(missing)
+        )
+
+
 def main() -> None:
     args = parse_args()
-    vllm_tp_size = args.vllm_tp_size or args.tp_size
-    sae_tp_size = args.sae_tp_size or args.tp_size
+    _validate_checkpoint_args(args)
+    vllm_tp_size = (
+        args.vllm_tp_size if args.vllm_tp_size is not None else args.tp_size
+    )
+    sae_tp_size = args.sae_tp_size if args.sae_tp_size is not None else args.tp_size
     if vllm_tp_size < 1:
         raise ValueError("--vllm-tp-size must be >= 1")
     if sae_tp_size < 1:
@@ -220,8 +260,9 @@ def main() -> None:
         compile_sae=False,
         n_eval_batches=0,
         logger=LoggingConfig(log_to_wandb=False),
-        n_checkpoints=0,
-        save_final_checkpoint=False,
+        n_checkpoints=args.n_checkpoints,
+        checkpoint_path=args.checkpoint_path,
+        save_final_checkpoint=args.save_final_checkpoint,
         output_path=args.output_path,
         save_mse_every_n_steps=args.save_mse_every_n_steps,
         save_timing_every_n_steps=args.save_timing_every_n_steps,
@@ -253,9 +294,18 @@ def main() -> None:
         print(f"  save_timing_every_n_steps={args.save_timing_every_n_steps}")
     if args.synchronize_timing:
         print("  synchronize_timing=True")
+    if args.checkpoint_path is not None:
+        print(f"  checkpoint_path={args.checkpoint_path}")
+    if args.n_checkpoints > 0:
+        print(f"  n_checkpoints={args.n_checkpoints}")
+    if args.save_final_checkpoint:
+        print("  save_final_checkpoint=True")
+    if args.resume_from_checkpoint is not None:
+        print(f"  resume_from_checkpoint={args.resume_from_checkpoint}")
 
     runner = LanguageModelSAETrainingRunner(
         cfg=cfg,
+        resume_from_checkpoint=args.resume_from_checkpoint,
         vllm_tp_size=vllm_tp_size,
         sae_tp_size=sae_tp_size,
         vllm_dp_size=args.vllm_dp_size,

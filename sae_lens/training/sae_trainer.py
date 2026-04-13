@@ -12,8 +12,14 @@ import torch
 import torch.distributed as dist
 import wandb
 from safetensors.torch import save_file
-from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+from torch.distributed.fsdp import (
+    FullStateDictConfig,
+    ShardedOptimStateDictConfig,
+    ShardedStateDictConfig,
+    StateDictType,
+)
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Adam
 from tqdm.auto import tqdm
 
@@ -21,6 +27,7 @@ from sae_lens import __version__
 from sae_lens.config import SAETrainerConfig
 from sae_lens.constants import (
     ACTIVATION_SCALER_CFG_FILENAME,
+    FSDP_OPTIMIZER_STATE_FILENAME_TEMPLATE,
     MSE_HISTORY_FILENAME,
     SAE_CFG_FILENAME,
     SAE_WEIGHTS_FILENAME,
@@ -28,6 +35,7 @@ from sae_lens.constants import (
     TIMING_HISTORY_FILENAME,
     TRAINER_STATE_FILENAME,
 )
+from sae_lens.profiling import nccl_nvtx_range
 from sae_lens.saes.sae import (
     T_TRAINING_SAE,
     T_TRAINING_SAE_CONFIG,
@@ -77,6 +85,8 @@ class SaveCheckpointFn(Protocol):
 
 Evaluator = Callable[[T_TRAINING_SAE, DataProvider, ActivationScaler], dict[str, Any]]
 
+FSDP_OPTIMIZER_STATE_FORMAT = "fsdp_sharded"
+
 
 class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
     """
@@ -104,6 +114,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         # Defaults to sae itself in manual mode.
         self._base_sae: T_TRAINING_SAE = base_sae if base_sae is not None else sae
         self._is_fsdp = isinstance(sae, FSDP)
+        self._is_ddp = isinstance(sae, DDP)
         self.data_provider = data_provider
         self.evaluator = evaluator
         self.activation_scaler = ActivationScaler()
@@ -205,6 +216,14 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         return self._base_sae
 
     @property
+    def sae_dp_mode(self) -> str:
+        if self._is_fsdp:
+            return "fsdp"
+        if self._is_ddp:
+            return "ddp"
+        return "manual"
+
+    @property
     def log_feature_sparsity(self) -> torch.Tensor:
         return _log_feature_sparsity(self.feature_sparsity)
 
@@ -288,11 +307,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         wandb_aliases: list[str] | None = None,
     ) -> None:
         # With TP, all ranks in DP replica 0 must participate in the save collectives,
-        # but only TP rank 0 writes files. Other DP replicas return early.
+        # but only TP rank 0 writes files. FSDP state-dict collectives require all
+        # FSDP DP ranks to enter this method.
         tp_group = getattr(self._base_sae, "_tp_group", None)
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
-        if dp_rank != 0:
+        if dp_rank != 0 and not self._is_fsdp:
             return
         checkpoint_path = None
         if self.cfg.checkpoint_path is not None or self.cfg.logger.log_to_wandb:
@@ -303,11 +323,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 weights_path, cfg_path = self._save_model(checkpoint_path)
 
                 sparsity_path = checkpoint_path / SPARSITY_FILENAME
-                save_file({"sparsity": self.log_feature_sparsity}, sparsity_path)
+                if dp_rank == 0 and tp_rank == 0:
+                    save_file({"sparsity": self.log_feature_sparsity}, sparsity_path)
 
                 self.save_trainer_state(checkpoint_path)
 
-                if self.cfg.logger.log_to_wandb and tp_rank == 0:
+                if self.cfg.logger.log_to_wandb and dp_rank == 0 and tp_rank == 0:
                     self.cfg.logger.log(
                         self,
                         weights_path,
@@ -337,7 +358,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         cfg_path = checkpoint_path / SAE_CFG_FILENAME
         tp_group = getattr(self._base_sae, "_tp_group", None)
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
-        if tp_rank == 0:
+        dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
+        if dp_rank == 0 and tp_rank == 0:
             save_file(state_dict, model_weights_path)
             with open(cfg_path, "w") as f:
                 json.dump(self._base_sae.cfg.to_dict(), f)
@@ -351,15 +373,32 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             name: scheduler.state_dict()
             for name, scheduler in self.coefficient_schedulers.items()
         }
-        optimizer_state_by_name = self._build_named_optimizer_state_for_save()
         tp_group = getattr(self._base_sae, "_tp_group", None)
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+        dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
+        dp_size = dist.get_world_size(self.dp_group) if self.dp_group is not None else 1
+
+        if self._is_fsdp:
+            self._save_fsdp_optimizer_state(checkpoint_path)
+            if dp_rank != 0 or tp_rank != 0:
+                return
+            optimizer_state: dict[str, Any] = {
+                "optimizer_state_format": FSDP_OPTIMIZER_STATE_FORMAT,
+                "fsdp_dp_size": dp_size,
+            }
+        else:
+            optimizer_state_by_name = self._build_named_optimizer_state_for_save()
+            if tp_rank != 0:
+                return
+            optimizer_state = {
+                "optimizer_by_name": optimizer_state_by_name,
+            }
+
         if tp_rank != 0:
             return
         torch.save(
             {
-                "optimizer": self.optimizer.state_dict(),
-                "optimizer_by_name": optimizer_state_by_name,
+                **optimizer_state,
                 "lr_scheduler": self.lr_scheduler.state_dict(),
                 "n_training_samples": self.n_training_samples,
                 "n_training_steps": self.n_training_steps,
@@ -368,7 +407,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 "n_frac_active_samples": self.n_frac_active_samples,
                 "started_fine_tuning": self.started_fine_tuning,
                 "coefficient_schedulers": scheduler_state_dicts,
-                "sae_dp_mode": "fsdp" if self._is_fsdp else "manual",
+                "sae_dp_mode": self.sae_dp_mode,
             },
             str(checkpoint_path / TRAINER_STATE_FILENAME),
         )
@@ -378,28 +417,90 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
     def load_trainer_state(self, checkpoint_path: Path | str) -> None:
         checkpoint_path = Path(checkpoint_path)
         self.activation_scaler.load(checkpoint_path / ACTIVATION_SCALER_CFG_FILENAME)
-        state_dict = torch.load(checkpoint_path / TRAINER_STATE_FILENAME)
+        state_dict = torch.load(checkpoint_path / TRAINER_STATE_FILENAME, map_location="cpu")
         saved_mode = state_dict.get("sae_dp_mode", "manual")
-        current_mode = "fsdp" if self._is_fsdp else "manual"
+        current_mode = self.sae_dp_mode
         if saved_mode != current_mode:
             raise ValueError(
                 f"Cannot resume: checkpoint was saved with sae_dp_mode='{saved_mode}' "
                 f"but current mode is '{current_mode}'. Cross-mode optimizer resume is "
                 "not supported in v1."
             )
-        if "optimizer_by_name" in state_dict:
+        if self._is_fsdp:
+            if state_dict.get("optimizer_state_format") != FSDP_OPTIMIZER_STATE_FORMAT:
+                raise ValueError(
+                    "Cannot resume FSDP checkpoint: missing "
+                    f"optimizer_state_format='{FSDP_OPTIMIZER_STATE_FORMAT}'."
+                )
+            expected_dp_size = state_dict.get("fsdp_dp_size")
+            current_dp_size = (
+                dist.get_world_size(self.dp_group) if self.dp_group is not None else 1
+            )
+            if expected_dp_size != current_dp_size:
+                raise ValueError(
+                    "Cannot resume FSDP checkpoint with a different sae_dp_size: "
+                    f"checkpoint has {expected_dp_size}, current run has {current_dp_size}."
+                )
+            self._load_fsdp_optimizer_state(checkpoint_path)
+        elif "optimizer_by_name" in state_dict:
             self._load_named_optimizer_state(state_dict["optimizer_by_name"])
         else:
             self.optimizer.load_state_dict(state_dict["optimizer"])
         self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
         self.n_training_samples = state_dict["n_training_samples"]
         self.n_training_steps = state_dict["n_training_steps"]
-        self.act_freq_scores = state_dict["act_freq_scores"]
-        self.n_forward_passes_since_fired = state_dict["n_forward_passes_since_fired"]
+        self.act_freq_scores = state_dict["act_freq_scores"].to(self.cfg.device)
+        self.n_forward_passes_since_fired = state_dict[
+            "n_forward_passes_since_fired"
+        ].to(self.cfg.device)
         self.n_frac_active_samples = state_dict["n_frac_active_samples"]
         self.started_fine_tuning = state_dict["started_fine_tuning"]
         for name, scheduler_state_dict in state_dict["coefficient_schedulers"].items():
             self.coefficient_schedulers[name].load_state_dict(scheduler_state_dict)
+
+    def _fsdp_optimizer_state_path(self, checkpoint_path: Path) -> Path:
+        dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
+        return checkpoint_path / FSDP_OPTIMIZER_STATE_FILENAME_TEMPLATE.format(
+            rank=dp_rank
+        )
+
+    def _save_fsdp_optimizer_state(self, checkpoint_path: Path) -> None:
+        state_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+        optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True)
+        with FSDP.state_dict_type(
+            self.sae,
+            StateDictType.SHARDED_STATE_DICT,
+            state_cfg,
+            optim_cfg,
+        ):
+            optimizer_state = FSDP.optim_state_dict(
+                self.sae,
+                self.optimizer,
+                group=self.dp_group,
+            )
+        torch.save(optimizer_state, self._fsdp_optimizer_state_path(checkpoint_path))
+
+    def _load_fsdp_optimizer_state(self, checkpoint_path: Path) -> None:
+        optimizer_state = torch.load(
+            self._fsdp_optimizer_state_path(checkpoint_path),
+            map_location="cpu",
+            weights_only=False,
+        )
+        state_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+        optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True)
+        with FSDP.state_dict_type(
+            self.sae,
+            StateDictType.SHARDED_STATE_DICT,
+            state_cfg,
+            optim_cfg,
+        ):
+            optimizer_state = FSDP.optim_state_dict_to_load(
+                self.sae,
+                self.optimizer,
+                optimizer_state,
+                group=self.dp_group,
+            )
+        self.optimizer.load_state_dict(optimizer_state)
 
     def _build_named_optimizer_state_for_save(self) -> dict[str, dict[str, Any]]:
         optimizer_state_by_name: dict[str, dict[str, Any]] = {}
@@ -451,7 +552,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         if (self.n_training_steps + 1) % self.cfg.feature_sampling_window == 0:
             # Sync act_freq_scores across DP replicas before logging/reset.
             if self.dp_group is not None:
-                dist.all_reduce(self.act_freq_scores, op=dist.ReduceOp.SUM, group=self.dp_group)
+                with nccl_nvtx_range("nccl:sae_dp_sparsity_all_reduce", self.dp_group):
+                    dist.all_reduce(
+                        self.act_freq_scores,
+                        op=dist.ReduceOp.SUM,
+                        group=self.dp_group,
+                    )
                 dp_size = dist.get_world_size(self.dp_group)
                 self.n_frac_active_samples *= dp_size
             if self.cfg.logger.log_to_wandb:
@@ -471,7 +577,13 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         # In manual mode self.sae == self._base_sae and the dispatch in
         # TrainingSAE.forward() calls training_forward_pass identically.
         with self.autocast_if_enabled:
-            train_step_output = self.sae(step_input)  # type: ignore[arg-type]
+            fsdp_forward_context = (
+                nccl_nvtx_range("nccl:sae_fsdp_forward_param_all_gather", self.dp_group)
+                if self._is_fsdp
+                else contextlib.nullcontext()
+            )
+            with fsdp_forward_context:
+                train_step_output = self.sae(step_input)  # type: ignore[arg-type]
 
             with torch.no_grad():
                 # calling .bool() should be equivalent to .abs() > 0, and work with coo tensors
@@ -482,7 +594,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 # Sync did_fire across DP replicas: a feature counts as fired if any replica saw it.
                 if self.dp_group is not None:
                     did_fire_int = did_fire.to(torch.int32)
-                    dist.all_reduce(did_fire_int, op=dist.ReduceOp.MAX, group=self.dp_group)
+                    with nccl_nvtx_range("nccl:sae_dp_did_fire_all_reduce", self.dp_group):
+                        dist.all_reduce(
+                            did_fire_int,
+                            op=dist.ReduceOp.MAX,
+                            group=self.dp_group,
+                        )
                     did_fire = did_fire_int.bool()
                 self.n_forward_passes_since_fired += 1
                 self.n_forward_passes_since_fired[did_fire] = 0
@@ -492,15 +609,28 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             _debug_prefix_tp("train_step forward done")
 
         # Grad scaler will rescale gradients if autocast is enabled
-        self.grad_scaler.scale(
-            train_step_output.loss
-        ).backward()  # loss.backward() if not autocasting
+        loss = train_step_output.loss
+        if self._is_ddp and self.dp_group is not None and self.token_count_weighted_dp:
+            local_tokens = float(sae_in.shape[0])
+            tokens_t = torch.tensor(local_tokens, device=loss.device)
+            with nccl_nvtx_range("nccl:sae_ddp_token_count_all_reduce", self.dp_group):
+                dist.all_reduce(tokens_t, op=dist.ReduceOp.SUM, group=self.dp_group)
+            dp_size = dist.get_world_size(self.dp_group)
+            loss = loss * (local_tokens * dp_size / tokens_t.item())
+
+        backward_context = (
+            nccl_nvtx_range(f"nccl:sae_{self.sae_dp_mode}_backward", self.dp_group)
+            if self._is_fsdp or self._is_ddp
+            else contextlib.nullcontext()
+        )
+        with backward_context:
+            self.grad_scaler.scale(loss).backward()  # loss.backward() if not autocasting
         if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
             _debug_prefix_tp("backward done")
         self.grad_scaler.unscale_(self.optimizer)  # needed to clip correctly
 
-        if self._is_fsdp:
-            # FSDP handles gradient reduction across dp_group during backward().
+        if self._is_fsdp or self._is_ddp:
+            # FSDP/DDP handle gradient reduction across dp_group during backward().
             # No manual flat all-reduce needed.
             pass
         elif self.dp_group is not None:
@@ -513,15 +643,22 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                     local_tokens = float(sae_in.shape[0])
                     flat.mul_(local_tokens)
                     dp_t0 = time.perf_counter()
-                    dist.all_reduce(flat, group=self.dp_group)
+                    with nccl_nvtx_range("nccl:sae_manual_dp_grad_all_reduce", self.dp_group):
+                        dist.all_reduce(flat, group=self.dp_group)
                     tokens_t = torch.tensor(local_tokens, device=flat.device)
-                    dist.all_reduce(tokens_t, op=dist.ReduceOp.SUM, group=self.dp_group)
+                    with nccl_nvtx_range("nccl:sae_manual_dp_token_count_all_reduce", self.dp_group):
+                        dist.all_reduce(
+                            tokens_t,
+                            op=dist.ReduceOp.SUM,
+                            group=self.dp_group,
+                        )
                     dp_allreduce_time_s += time.perf_counter() - dp_t0
                     flat.div_(tokens_t.item())
                 else:
                     dp_size = dist.get_world_size(self.dp_group)
                     dp_t0 = time.perf_counter()
-                    dist.all_reduce(flat, group=self.dp_group)
+                    with nccl_nvtx_range("nccl:sae_manual_dp_grad_all_reduce", self.dp_group):
+                        dist.all_reduce(flat, group=self.dp_group)
                     dp_allreduce_time_s += time.perf_counter() - dp_t0
                     flat /= dp_size
                 offset = 0

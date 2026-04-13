@@ -11,6 +11,7 @@ from transformer_lens import HookedTransformer
 
 from sae_lens import __version__
 from sae_lens.config import LanguageModelSAERunnerConfig
+from sae_lens.constants import TRAINER_STATE_FILENAME
 from sae_lens.llm_sae_training_runner import (
     LanguageModelSAETrainingRunner,
     LLMSaeEvaluator,
@@ -105,7 +106,7 @@ def test_train_step__reduces_loss_when_called_repeatedly_on_same_acts(
         trainer._train_step(
             sae=trainer.sae,
             sae_in=layer_acts,
-        )
+        )[0]
         for _ in range(5)
     ]
 
@@ -120,7 +121,7 @@ def test_train_step__reduces_loss_when_called_repeatedly_on_same_acts(
 def test_train_step__output_looks_reasonable(trainer: SAETrainer[Any, Any]) -> None:
     layer_acts = next(trainer.data_provider)
 
-    output = trainer._train_step(
+    output, _ = trainer._train_step(
         sae=trainer.sae,
         sae_in=layer_acts,
     )
@@ -146,7 +147,7 @@ def test_train_step__sparsity_updates_based_on_feature_act_sparsity(
     trainer._reset_running_sparsity_stats()
     layer_acts = next(trainer.data_provider)
 
-    train_output = trainer._train_step(
+    train_output, _ = trainer._train_step(
         sae=trainer.sae,
         sae_in=layer_acts,
     )
@@ -616,6 +617,9 @@ def test_SAETrainer_save_and_load_from_checkpoint(
         trainer.coefficient_schedulers["l1"].step()
 
     trainer.save_trainer_state(checkpoint_dir)
+    saved_trainer_state = torch.load(checkpoint_dir / TRAINER_STATE_FILENAME)
+    assert "optimizer" not in saved_trainer_state
+    assert "optimizer_by_name" in saved_trainer_state
 
     new_trainer = SAETrainer(
         cfg=cfg.to_sae_trainer_config(),

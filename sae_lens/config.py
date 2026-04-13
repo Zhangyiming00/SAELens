@@ -2,12 +2,12 @@ import json
 import math
 import warnings
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
 import simple_parsing
 import torch
-import torch.distributed as dist
 import wandb
 
 from datasets import (
@@ -35,6 +35,19 @@ T_TRAINING_SAE_CONFIG = TypeVar(
 )
 
 HfDataset = DatasetDict | Dataset | IterableDatasetDict | IterableDataset
+
+
+def _timestamp_run_id() -> str:
+    return datetime.now().strftime("%y%m%d_%H%M%S")
+
+
+def _unique_run_id(base_path: Path, run_id: str) -> str:
+    candidate = run_id
+    suffix = 1
+    while (base_path / candidate).exists():
+        candidate = f"{run_id}_{suffix}"
+        suffix += 1
+    return candidate
 
 
 # calling this "json_dict" so error messages will reference "json_dict" being invalid
@@ -162,6 +175,9 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         compile_llm (bool): Whether to compile the LLM using `torch.compile`.
         llm_compilation_mode (str, optional): The compilation mode to use for the LLM if `compile_llm` is True.
         compile_sae (bool): Whether to compile the SAE using `torch.compile`.
+            With sae_dp_mode="fsdp", this is experimental FSDP-only support:
+            the raw SAE module is compiled before FSDP wrapping, and speedups
+            are not guaranteed for every model or shape.
         sae_compilation_mode (str, optional): The compilation mode to use for the SAE if `compile_sae` is True.
         train_batch_size_tokens (int): The batch size for training, in tokens. This controls the batch size of the SAE training loop.
         adam_beta1 (float): The beta1 parameter for the Adam optimizer.
@@ -181,7 +197,9 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         n_checkpoints (int): The number of checkpoints to save during training. 0 means no checkpoints.
         checkpoint_path (str | None): The path to save checkpoints. A unique ID will be appended to this path. Set to None to disable checkpoint saving. (default is "checkpoints")
         save_final_checkpoint (bool): Whether to include an additional final checkpoint when training is finished. (default is False).
-        resume_from_checkpoint (str | None): The path to the checkpoint to resume training from. (default is None).
+        resume_from_checkpoint (str | None): The path to the checkpoint to resume training from.
+            With sae_dp_mode="fsdp", this is experimental and requires the same FSDP
+            DP size/rank layout as the checkpoint. (default is None).
         output_path (str | None): The path to save outputs. Set to None to disable output saving. (default is "output")
         save_mse_every_n_steps (int): Save an `mse_history.jsonl` record every N training steps. 0 disables it. (default is 0)
         save_timing_every_n_steps (int): Save a `timing_history.jsonl` record every N training steps with separate `vllm_step_time_s`, `transfer_time_s`, and `sae_time_s` wall times. 0 disables it. (default is 0)
@@ -291,32 +309,10 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     sae_dp_mode: Literal["manual", "ddp", "fsdp"] = "manual"
 
     def __post_init__(self):
-        if self.sae_dp_mode == "ddp":
-            raise NotImplementedError(
-                "sae_dp_mode='ddp' is not implemented in v1. Use 'manual' or 'fsdp'."
+        if self.sae_dp_mode == "ddp" and self.compile_sae:
+            raise ValueError(
+                "compile_sae=True is incompatible with sae_dp_mode='ddp'."
             )
-        if self.sae_dp_mode == "fsdp":
-            if self.compile_sae:
-                raise ValueError(
-                    "compile_sae=True is incompatible with sae_dp_mode='fsdp'."
-                )
-            if self.n_checkpoints > 0:
-                raise ValueError(
-                    "n_checkpoints > 0 is not supported with sae_dp_mode='fsdp'. "
-                    "FSDP checkpoint/resume is not yet implemented."
-                )
-            if self.resume_from_checkpoint is not None:
-                raise ValueError(
-                    "resume_from_checkpoint is not supported with sae_dp_mode='fsdp'. "
-                    "FSDP checkpoint/resume is not yet implemented."
-                )
-            if self.save_final_checkpoint:
-                raise ValueError(
-                    "save_final_checkpoint=True is not supported with sae_dp_mode='fsdp'. "
-                    "Use save_final_checkpoint=False; the runner saves the final inference "
-                    "model via save_final_sae() instead."
-                )
-
         if self.hook_eval != "NOT_IN_USE":
             warnings.warn(
                 "The 'hook_eval' field is deprecated and will be removed in v7.0.0. "
@@ -366,10 +362,11 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
 
         unique_id = self.logger.wandb_id
         if unique_id is None:
-            unique_id = cast(
-                Any, wandb
-            ).util.generate_id()  # not sure why this type is erroring
-        self.checkpoint_path = f"{self.checkpoint_path}/{unique_id}"
+            unique_id = _timestamp_run_id()
+            if self.checkpoint_path is not None:
+                unique_id = _unique_run_id(Path(self.checkpoint_path), unique_id)
+        if self.checkpoint_path is not None:
+            self.checkpoint_path = str(Path(self.checkpoint_path) / unique_id)
 
         if self.verbose:
             logger.info(

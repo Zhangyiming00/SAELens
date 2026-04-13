@@ -13,8 +13,9 @@ from transformer_lens.hook_points import HookPoint
 from typing_extensions import override
 from safetensors.torch import save_file
 
-from sae_lens.distributed import tp_allgather, tp_allreduce
 from sae_lens.constants import SAE_CFG_FILENAME, SAE_WEIGHTS_FILENAME
+from sae_lens.distributed import tp_allgather, tp_allreduce
+from sae_lens.profiling import nccl_nvtx_range
 from sae_lens.saes.sae import (
     SAE,
     SAEConfig,
@@ -410,7 +411,8 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
 
         tp_size = dist.get_world_size(self._tp_group)
         parts = [torch.zeros_like(tensor) for _ in range(tp_size)]
-        dist.all_gather(parts, tensor.detach().contiguous(), group=self._tp_group)
+        with nccl_nvtx_range("nccl:topk_tp_state_all_gather", self._tp_group):
+            dist.all_gather(parts, tensor.detach().contiguous(), group=self._tp_group)
         return torch.cat(parts, dim=shard_dim)
 
     def _slice_tp_tensor(
@@ -511,7 +513,8 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 continue
             if self._tp_param_shard_dims().get(name) is not None:
                 continue
-            dist.all_reduce(param.grad, group=self._tp_group)
+            with nccl_nvtx_range("nccl:topk_tp_replicated_grad_all_reduce", self._tp_group):
+                dist.all_reduce(param.grad, group=self._tp_group)
 
     @override
     def save_model(self, path: str | Path) -> tuple[Path, Path]:
@@ -530,7 +533,8 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
             with open(cfg_path, "w") as f:
                 json.dump(self.cfg.to_dict(), f)
 
-        dist.barrier(group=self._tp_group)
+        with nccl_nvtx_range("nccl:topk_tp_save_barrier", self._tp_group):
+            dist.barrier(group=self._tp_group)
         return model_weights_path, cfg_path
 
     @override
@@ -550,7 +554,8 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
             with open(cfg_path, "w") as f:
                 json.dump(self.cfg.get_inference_sae_cfg_dict(), f)
 
-        dist.barrier(group=self._tp_group)
+        with nccl_nvtx_range("nccl:topk_tp_save_inference_barrier", self._tp_group):
+            dist.barrier(group=self._tp_group)
         return model_weights_path, cfg_path
 
     @override
@@ -579,11 +584,13 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 local_sq_norm += grad_sq
 
         if self._tp_group is not None:
-            dist.all_reduce(local_sq_norm, group=self._tp_group)
+            with nccl_nvtx_range("nccl:topk_tp_grad_norm_all_reduce", self._tp_group):
+                dist.all_reduce(local_sq_norm, group=self._tp_group)
         if dp_group is not None:
             # In FSDP mode each DP rank holds a distinct shard; summing squared
             # norms across DP recovers the true global gradient norm.
-            dist.all_reduce(local_sq_norm, group=dp_group)
+            with nccl_nvtx_range("nccl:topk_dp_grad_norm_all_reduce", dp_group):
+                dist.all_reduce(local_sq_norm, group=dp_group)
 
         total_norm = local_sq_norm.sqrt()
         clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)

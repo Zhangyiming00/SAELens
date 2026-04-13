@@ -22,6 +22,7 @@ from sae_lens.constants import (
     SAE_CFG_FILENAME,
     SAE_WEIGHTS_FILENAME,
     SPARSITY_FILENAME,
+    TRAINER_STATE_FILENAME,
 )
 from sae_lens.distributed import (
     get_dp_group,
@@ -150,6 +151,8 @@ class LanguageModelSAETrainingRunner:
             )
 
         self.cfg = cfg
+        if resume_from_checkpoint is not None:
+            self.cfg.resume_from_checkpoint = str(resume_from_checkpoint)
         self.sae_dp_size = sae_dp_size
         self.vllm_dp_size = vllm_dp_size
         self.use_shard_routing = use_shard_routing
@@ -226,6 +229,7 @@ class LanguageModelSAETrainingRunner:
                     vllm_dp_size=vllm_dp_size,
                     sae_dp_size=sae_dp_size,
                 )
+        self._sync_run_paths_across_ranks()
 
         if use_shard_routing and dist.is_initialized():
             import sae_lens.distributed_v2 as v2_mod
@@ -279,15 +283,19 @@ class LanguageModelSAETrainingRunner:
                     "normalize_activations='expected_average_only_in'."
                 )
 
-        if vllm_dp_size > 1:
-            if self.cfg.resume_from_checkpoint is not None:
-                raise ValueError(
-                    "resume_from_checkpoint is not supported with vllm_dp_size > 1"
-                )
-            if self.cfg.use_cached_activations:
-                raise ValueError(
-                    "use_cached_activations is not supported with vllm_dp_size > 1"
-                )
+        if (
+            vllm_dp_size > 1
+            and self.cfg.resume_from_checkpoint is not None
+            and self.cfg.sae_dp_mode not in ("ddp", "fsdp")
+        ):
+            raise ValueError(
+                "resume_from_checkpoint with vllm_dp_size > 1 is only "
+                "supported with sae_dp_mode='ddp' or 'fsdp'"
+            )
+        if vllm_dp_size > 1 and self.cfg.use_cached_activations:
+            raise ValueError(
+                "use_cached_activations is not supported with vllm_dp_size > 1"
+            )
 
         if override_model is None:
             if self.vllm_active:
@@ -357,41 +365,87 @@ class LanguageModelSAETrainingRunner:
             if tp_group is not None and hasattr(self.sae, "shard_weights"):
                 self.sae.shard_weights(tp_group)
 
-        # Wrap with FSDP after TP sharding when sae_dp_mode='fsdp'.
-        # base_sae always points to the raw module; wrapped_sae may be an FSDP wrapper.
+        # _base_sae is always the raw module before any torch DP wrapper.
+        # SAE compilation must happen on this module before FSDP wrapping; training
+        # still enters through the wrapper so FSDP owns parameter all-gather/reshard.
         self._base_sae = self.sae
-        if self.sae is not None and self.cfg.sae_dp_mode == "fsdp":
+        if (
+            self._base_sae is not None
+            and self.cfg.sae_dp_mode == "fsdp"
+            and self.cfg.resume_from_checkpoint is not None
+        ):
+            self._base_sae.load_weights_from_checkpoint(
+                self.cfg.resume_from_checkpoint
+            )
+
+        # Wrap after TP sharding and optional raw-module compile when sae_dp_mode
+        # requests a torch DP wrapper. self.sae may become FSDP/DDP.
+        if self.sae is not None and self.cfg.sae_dp_mode in ("ddp", "fsdp"):
             if not dist.is_initialized():
                 raise ValueError(
-                    "sae_dp_mode='fsdp' requires an initialized distributed process group."
+                    f"sae_dp_mode='{self.cfg.sae_dp_mode}' requires an initialized "
+                    "distributed process group."
                 )
-            if sae_tp_size > 1:
-                raise ValueError(
-                    "sae_dp_mode='fsdp' with sae_tp_size > 1 is not supported. "
-                    "Use sae_tp_size=1 with FSDP."
-                )
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp.api import ShardingStrategy
             sae_dp_group = get_dp_group()
             if self.use_shard_routing:
                 import sae_lens.distributed_v2 as v2_mod
                 sae_dp_group = v2_mod.get_sae_dp_group()
             if sae_dp_group is None or dist.get_world_size(sae_dp_group) <= 1:
                 raise ValueError(
-                    "sae_dp_mode='fsdp' requires sae_dp_size > 1."
+                    f"sae_dp_mode='{self.cfg.sae_dp_mode}' requires sae_dp_size > 1."
                 )
-            self.sae = FSDP(
-                self.sae,
-                process_group=sae_dp_group,
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                use_orig_params=True,
-            )
+            if self.cfg.sae_dp_mode == "fsdp":
+                if sae_tp_size > 1:
+                    raise ValueError(
+                        "sae_dp_mode='fsdp' with sae_tp_size > 1 is not supported. "
+                        "Use sae_tp_size=1 with FSDP."
+                    )
+                self._compile_sae_if_needed()
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                from torch.distributed.fsdp.api import ShardingStrategy
+                self.sae = FSDP(
+                    self._base_sae,
+                    process_group=sae_dp_group,
+                    sharding_strategy=ShardingStrategy.FULL_SHARD,
+                    use_orig_params=True,
+                )
+            else:
+                from torch.nn.parallel import DistributedDataParallel as DDP
+                device_ids = None
+                output_device = None
+                device = torch.device(self.cfg.device)
+                if device.type == "cuda":
+                    device_index = (
+                        device.index
+                        if device.index is not None
+                        else torch.cuda.current_device()
+                    )
+                    device_ids = [device_index]
+                    output_device = device_index
+                self._compile_sae_if_needed()
+                self.sae = DDP(
+                    self._base_sae,
+                    process_group=sae_dp_group,
+                    device_ids=device_ids,
+                    output_device=output_device,
+                )
+        else:
+            self._compile_sae_if_needed()
+
+    def _sync_run_paths_across_ranks(self) -> None:
+        if not dist.is_initialized() or dist.get_world_size() <= 1:
+            return
+        run_paths = [self.cfg.checkpoint_path, self.cfg.output_path]
+        dist.broadcast_object_list(run_paths, src=0)
+        self.cfg.checkpoint_path = run_paths[0]
+        self.cfg.output_path = run_paths[1]
 
     def run(self):
         """
         Run the training of the SAE.
         """
         if self.use_shard_routing and self.vllm_active and not self.sae_active:
+            self._load_producer_resume_state_if_needed()
             self._run_producer_helper_loop_v2()
             return None
 
@@ -448,7 +502,10 @@ class LanguageModelSAETrainingRunner:
         if self.cfg.resume_from_checkpoint is not None:
             logger.info(f"Resuming from checkpoint: {self.cfg.resume_from_checkpoint}")
             trainer.load_trainer_state(self.cfg.resume_from_checkpoint)
-            self._base_sae.load_weights_from_checkpoint(self.cfg.resume_from_checkpoint)
+            if self.cfg.sae_dp_mode != "fsdp":
+                self._base_sae.load_weights_from_checkpoint(
+                    self.cfg.resume_from_checkpoint
+                )
             self.activations_store.load_from_checkpoint(self.cfg.resume_from_checkpoint)
 
         self._compile_if_needed()
@@ -563,13 +620,38 @@ class LanguageModelSAETrainingRunner:
         P = self.vllm_dp_size
         batch_size = self.cfg.store_batch_size_prompts
         ctx_size = self.activations_store.training_context_size
+        remaining_training_tokens = max(
+            self.cfg.total_training_tokens - self._resume_training_samples(),
+            0,
+        )
         total_producer_steps = math.ceil(
-            self.cfg.total_training_tokens / (batch_size * ctx_size * P)
+            remaining_training_tokens / (batch_size * ctx_size * P)
         )
 
         for _ in range(total_producer_steps):
             _local_slices, outgoing = self.activations_store._run_producer_phase2_v2()
             self.activations_store._run_nccl_p2p_exchange_v2(outgoing)
+
+    def _resume_checkpoint_path(self) -> Path | None:
+        if self.cfg.resume_from_checkpoint is None:
+            return None
+        return Path(self.cfg.resume_from_checkpoint)
+
+    def _resume_training_samples(self) -> int:
+        checkpoint_path = self._resume_checkpoint_path()
+        if checkpoint_path is None:
+            return 0
+        state_dict = torch.load(
+            checkpoint_path / TRAINER_STATE_FILENAME,
+            map_location="cpu",
+        )
+        return int(state_dict.get("n_training_samples", 0))
+
+    def _load_producer_resume_state_if_needed(self) -> None:
+        checkpoint_path = self._resume_checkpoint_path()
+        if checkpoint_path is None:
+            return
+        self.activations_store.load_from_checkpoint(checkpoint_path)
 
     def save_final_sae(
         self,
@@ -640,28 +722,43 @@ class LanguageModelSAETrainingRunner:
             )
 
     def _set_sae_metadata(self):
-        assert self.sae is not None
-        self.sae.cfg.metadata.dataset_path = self.cfg.dataset_path
-        self.sae.cfg.metadata.hook_name = self.cfg.hook_name
-        self.sae.cfg.metadata.model_name = self.cfg.model_name
-        self.sae.cfg.metadata.model_class_name = self.cfg.model_class_name
-        self.sae.cfg.metadata.hook_head_index = self.cfg.hook_head_index
-        self.sae.cfg.metadata.context_size = self.cfg.context_size
-        self.sae.cfg.metadata.seqpos_slice = self.cfg.seqpos_slice
-        self.sae.cfg.metadata.model_from_pretrained_kwargs = (
+        assert self._base_sae is not None
+        self._base_sae.cfg.metadata.dataset_path = self.cfg.dataset_path
+        self._base_sae.cfg.metadata.hook_name = self.cfg.hook_name
+        self._base_sae.cfg.metadata.model_name = self.cfg.model_name
+        self._base_sae.cfg.metadata.model_class_name = self.cfg.model_class_name
+        self._base_sae.cfg.metadata.hook_head_index = self.cfg.hook_head_index
+        self._base_sae.cfg.metadata.context_size = self.cfg.context_size
+        self._base_sae.cfg.metadata.seqpos_slice = self.cfg.seqpos_slice
+        self._base_sae.cfg.metadata.model_from_pretrained_kwargs = (
             self.cfg.model_from_pretrained_kwargs
         )
-        self.sae.cfg.metadata.prepend_bos = self.cfg.prepend_bos
-        self.sae.cfg.metadata.exclude_special_tokens = self.cfg.exclude_special_tokens
-        self.sae.cfg.metadata.sequence_separator_token = (
+        self._base_sae.cfg.metadata.prepend_bos = self.cfg.prepend_bos
+        self._base_sae.cfg.metadata.exclude_special_tokens = self.cfg.exclude_special_tokens
+        self._base_sae.cfg.metadata.sequence_separator_token = (
             self.cfg.sequence_separator_token
         )
-        self.sae.cfg.metadata.disable_concat_sequences = (
+        self._base_sae.cfg.metadata.disable_concat_sequences = (
             self.cfg.disable_concat_sequences
         )
 
+    def _compile_sae_if_needed(self):
+        if not self.cfg.compile_sae or self._base_sae is None:
+            return
+
+        backend = "aot_eager" if self.cfg.device == "mps" else "inductor"
+        compiled_training_forward = torch.compile(
+            self._base_sae.training_forward_pass,
+            mode=self.cfg.sae_compilation_mode,
+            backend=backend,
+        )
+        self._base_sae.training_forward_pass = (  # type: ignore[method-assign]
+            compiled_training_forward
+        )
+
     def _compile_if_needed(self):
-        # Compile model and SAE
+        # Compile model. SAE compilation is done before FSDP/DDP wrapping so it
+        # targets the raw module, not the distributed wrapper.
         #  torch.compile can provide significant speedups (10-20% in testing)
         # using max-autotune gives the best speedups but:
         # (a) increases VRAM usage,
@@ -674,15 +771,6 @@ class LanguageModelSAETrainingRunner:
             self.model = torch.compile(
                 self.model,
                 mode=self.cfg.llm_compilation_mode,
-            )  # type: ignore
-
-        if self.cfg.compile_sae and self.sae is not None:
-            backend = "aot_eager" if self.cfg.device == "mps" else "inductor"
-
-            self.sae.training_forward_pass = torch.compile(  # type: ignore
-                self.sae.training_forward_pass,
-                mode=self.cfg.sae_compilation_mode,
-                backend=backend,
             )  # type: ignore
 
     def run_trainer_with_interruption_handling(
@@ -714,10 +802,13 @@ class LanguageModelSAETrainingRunner:
     ) -> None:
         if checkpoint_path is None:
             return
-        sae = self.sae
+        sae = self._base_sae
         tp_group = getattr(sae, "_tp_group", None) if sae is not None else None
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         dp_group = get_dp_group()
+        if self.use_shard_routing:
+            import sae_lens.distributed_v2 as v2_mod
+            dp_group = v2_mod.get_sae_dp_group()
         dp_rank = (
             dist.get_rank(dp_group)
             if dp_group is not None and dist.get_world_size(dp_group) > 1

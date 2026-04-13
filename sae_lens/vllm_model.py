@@ -54,6 +54,8 @@ import torch.nn as nn
 from transformer_lens.utils import USE_DEFAULT_VALUE, get_tokens_with_bos_removed
 from transformers import PreTrainedTokenizerBase
 
+from sae_lens.profiling import nccl_nvtx_range
+
 # Force in-process vLLM scheduler.  Must be set before vllm is imported.
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 # Allow cloudpickle serialisation as a fallback for any worker-to-worker comms.
@@ -690,7 +692,8 @@ class HookedVLLMModel:
                         )
                     world_size = dist.get_world_size(tp_group)
                     shards = [torch.zeros_like(raw) for _ in range(world_size)]
-                    dist.all_gather(shards, raw.contiguous(), group=tp_group)
+                    with nccl_nvtx_range("nccl:vllm_hook_shard_all_gather", tp_group):
+                        dist.all_gather(shards, raw.contiguous(), group=tp_group)
                     raw = gather_fn(shards)
                 activations[hook_name] = raw[:total_tokens].view(B, S, -1)
         else:
