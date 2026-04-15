@@ -46,7 +46,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", default="/data/models/Llama-3.1-8B")
     parser.add_argument("--dataset-path", default="../datasets/fineweb-edu-10BT_tokenized_llama31_ctx2048")
     parser.add_argument("--hook-name", default="blocks.21.hook_resid_post")
-    parser.add_argument("--d-sae", type=int, default=32768*2)
+    parser.add_argument(
+        "--hook-names",
+        default=None,
+        help="Comma-separated hook names for multi-layer independent SAE training.",
+    )
+    parser.add_argument("--d-sae", type=int, default=32768)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--vllm-tp-size", type=int, default=None)
@@ -66,14 +71,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/results_1.22/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_1.35_16+21/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
     parser.add_argument("--save-mse-every-n-steps", type=int, default=1)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=1)
-    parser.add_argument("--synchronize-timing", action="store_true", default=True)
-    parser.add_argument("--checkpoint-path", default="checkpoints/ck3")
+    parser.add_argument(
+        "--synchronize-timing",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, force CUDA sync around timed regions for measurement accuracy. "
+            "This can perturb runtime; keep disabled for throughput/overlap runs."
+        ),
+    )
+    parser.add_argument("--checkpoint-path", default="checkpoints/ck1.35_21")
     parser.add_argument("--n-checkpoints", type=int, default=0)
     parser.add_argument("--save-final-checkpoint", action="store_true", default=True)
+    parser.add_argument(
+        "--no-save-final-checkpoint",
+        dest="save_final_checkpoint",
+        action="store_false",
+        help="Do not write the final training checkpoint.",
+    )
+    parser.add_argument(
+        "--no-save-final-sae",
+        action="store_true",
+        help="Do not write final SAE weights to output_path. Useful for smoke tests.",
+    )
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use-shard-routing", action="store_true",default=True,
@@ -84,7 +108,28 @@ def parse_args() -> argparse.Namespace:
         choices=["manual", "ddp", "fsdp"],
         help=(
             "SAE data-parallel sync mode. 'ddp' replicates SAE parameters across DP "
-            "replicas; 'fsdp' shards them (requires --sae-dp-size > 1)."
+            "replicas; 'fsdp' shards them. Multi-layer SAE defaults manual to ddp; "
+            "with --sae-dp-size 1 this runs without DP communication."
+        ),
+    )
+    parser.add_argument(
+        "--multi-sae-backward-mode",
+        default="combined",
+        choices=["combined", "sequential"],
+        help=(
+            "Multi-layer SAE backward mode. 'combined' keeps all layer graphs "
+            "until one backward to allow DDP/FSDP communication overlap with "
+            "later-layer backward compute. 'sequential' uses less memory."
+        ),
+    )
+    parser.add_argument(
+        "--multi-sae-seed-mode",
+        default="same",
+        choices=["same", "offset"],
+        help=(
+            "How to seed independent SAE initializations in multi-layer mode. "
+            "'same' matches separate single-layer runs with the same --seed; "
+            "'offset' uses seed + hook_index for each hook."
         ),
     )
     return parser.parse_args()
@@ -223,8 +268,17 @@ def main() -> None:
             "n_batches_in_buffer * context_size must be >= train_batch_size_tokens"
         )
 
+    output_path = None if args.no_save_final_sae else args.output_path
+
     device = _resolve_device()
     d_in = _resolve_hidden_size(args.model_name)
+    hook_names = (
+        [hook.strip() for hook in args.hook_names.split(",") if hook.strip()]
+        if args.hook_names is not None
+        else None
+    )
+    if hook_names is not None and len(hook_names) <= 1:
+        hook_names = None
     cfg = LanguageModelSAERunnerConfig(
         sae=TopKTrainingSAEConfig(
             d_in=d_in,
@@ -241,6 +295,7 @@ def main() -> None:
             "gpu_memory_utilization": args.gpu_memory_utilization,
         },
         hook_name=args.hook_name,
+        hook_names=hook_names,
         dataset_path=args.dataset_path,
         dataset_trust_remote_code=False,
         streaming=False,
@@ -250,7 +305,7 @@ def main() -> None:
         train_batch_size_tokens=train_batch_size_tokens,
         store_batch_size_prompts=args.store_batch_size_prompts,
         n_batches_in_buffer=n_batches_in_buffer,
-        activations_mixing_fraction=0.0,
+        activations_mixing_fraction=0.5,
         device=device,
         act_store_device=args.act_store_device,
         dtype=args.dtype,
@@ -263,13 +318,15 @@ def main() -> None:
         n_checkpoints=args.n_checkpoints,
         checkpoint_path=args.checkpoint_path,
         save_final_checkpoint=args.save_final_checkpoint,
-        output_path=args.output_path,
+        output_path=output_path,
         save_mse_every_n_steps=args.save_mse_every_n_steps,
         save_timing_every_n_steps=args.save_timing_every_n_steps,
         synchronize_timing=args.synchronize_timing,
         seed=args.seed,
         verbose=True,
         sae_dp_mode=args.sae_dp_mode,
+        multi_sae_backward_mode=args.multi_sae_backward_mode,
+        multi_sae_seed_mode=args.multi_sae_seed_mode,
     )
 
     print("Starting runner with:")
@@ -277,6 +334,8 @@ def main() -> None:
     print(f"  model={args.model_name}")
     print(f"  dataset={args.dataset_path}")
     print(f"  hook={args.hook_name}")
+    if hook_names is not None:
+        print(f"  hooks={','.join(hook_names)}")
     print(f"  d_in={d_in} d_sae={args.d_sae} k={args.k}")
     print(
         "  training_tokens="
@@ -286,8 +345,12 @@ def main() -> None:
     print(
         f"  vllm_tp_size={vllm_tp_size} vllm_dp_size={args.vllm_dp_size} "
         f"sae_tp_size={sae_tp_size} sae_dp_size={args.sae_dp_size} "
-        f"output_path={args.output_path}"
+        f"output_path={output_path}"
     )
+    print(f"  sae_dp_mode={cfg.sae_dp_mode}")
+    if hook_names is not None:
+        print(f"  multi_sae_backward_mode={cfg.multi_sae_backward_mode}")
+        print(f"  multi_sae_seed_mode={cfg.multi_sae_seed_mode}")
     if args.save_mse_every_n_steps > 0:
         print(f"  save_mse_every_n_steps={args.save_mse_every_n_steps}")
     if args.save_timing_every_n_steps > 0:

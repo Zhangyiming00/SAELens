@@ -250,16 +250,11 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                     f"trainer next() start samples={self.n_training_samples}"
                 )
             self._maybe_synchronize_timing()
-            data_t0 = time.perf_counter()
             batch = next(self.data_provider).to(self._base_sae.device)
             self._maybe_synchronize_timing()
-            data_time_s = time.perf_counter() - data_t0
             data_timing = self._consume_data_provider_timing()
             vllm_step_time_s = data_timing["vllm_step_time_s"]
             transfer_time_s = data_timing["transfer_time_s"]
-            residual_data_time_s = data_time_s - (vllm_step_time_s + transfer_time_s)
-            if residual_data_time_s > 0:
-                transfer_time_s += residual_data_time_s
             if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
                 _debug_prefix_tp(f"trainer next() done batch={tuple(batch.shape)}")
             self.n_training_samples += batch.shape[0]
@@ -267,7 +262,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
             self._maybe_synchronize_timing()
             sae_t0 = time.perf_counter()
-            step_output, dp_allreduce_time_s = self._train_step(
+            step_output, _dp_allreduce_time_s = self._train_step(
                 sae=self.sae, sae_in=scaled_batch
             )
             self._maybe_synchronize_timing()
@@ -281,7 +276,6 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             self._record_timing_if_needed(
                 vllm_step_time_s=vllm_step_time_s,
                 transfer_time_s=transfer_time_s,
-                dp_allreduce_time_s=dp_allreduce_time_s,
                 sae_time_s=sae_time_s,
             )
             self._checkpoint_if_needed()
@@ -417,7 +411,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
     def load_trainer_state(self, checkpoint_path: Path | str) -> None:
         checkpoint_path = Path(checkpoint_path)
         self.activation_scaler.load(checkpoint_path / ACTIVATION_SCALER_CFG_FILENAME)
-        state_dict = torch.load(checkpoint_path / TRAINER_STATE_FILENAME, map_location="cpu")
+        state_dict = torch.load(
+            checkpoint_path / TRAINER_STATE_FILENAME, map_location="cpu"
+        )
         saved_mode = state_dict.get("sae_dp_mode", "manual")
         current_mode = self.sae_dp_mode
         if saved_mode != current_mode:
@@ -509,7 +505,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             if not state:
                 continue
             optimizer_state_by_name[name] = {
-                key: value.detach().clone() if torch.is_tensor(value) else deepcopy(value)
+                key: value.detach().clone()
+                if torch.is_tensor(value)
+                else deepcopy(value)
                 for key, value in state.items()
             }
         self._base_sae.process_named_optimizer_state_for_saving(optimizer_state_by_name)
@@ -519,7 +517,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self, optimizer_state_by_name: dict[str, dict[str, Any]]
     ) -> None:
         optimizer_state_by_name = deepcopy(optimizer_state_by_name)
-        self._base_sae.process_named_optimizer_state_for_loading(optimizer_state_by_name)
+        self._base_sae.process_named_optimizer_state_for_loading(
+            optimizer_state_by_name
+        )
         self.optimizer.state.clear()
 
         named_params = dict(self._base_sae.named_parameters())
@@ -531,9 +531,13 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             for key, value in state.items():
                 if torch.is_tensor(value):
                     target_dtype = (
-                        param.dtype if value.is_floating_point() and value.ndim > 0 else value.dtype
+                        param.dtype
+                        if value.is_floating_point() and value.ndim > 0
+                        else value.dtype
                     )
-                    loaded_state[key] = value.to(device=param.device, dtype=target_dtype)
+                    loaded_state[key] = value.to(
+                        device=param.device, dtype=target_dtype
+                    )
                 else:
                     loaded_state[key] = deepcopy(value)
             self.optimizer.state[param] = loaded_state
@@ -544,7 +548,6 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         sae_in: torch.Tensor,
     ) -> tuple[TrainStepOutput, float]:
         sae.train()
-        dp_allreduce_time_s = 0.0
         if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
             _debug_prefix_tp("train_step forward start")
 
@@ -585,26 +588,29 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             with fsdp_forward_context:
                 train_step_output = self.sae(step_input)  # type: ignore[arg-type]
 
-            with torch.no_grad():
-                # calling .bool() should be equivalent to .abs() > 0, and work with coo tensors
-                firing_feats = train_step_output.feature_acts.bool().float()
-                did_fire = firing_feats.sum(-2).bool()
-                if did_fire.is_sparse:
-                    did_fire = did_fire.to_dense()
-                # Sync did_fire across DP replicas: a feature counts as fired if any replica saw it.
-                if self.dp_group is not None:
-                    did_fire_int = did_fire.to(torch.int32)
-                    with nccl_nvtx_range("nccl:sae_dp_did_fire_all_reduce", self.dp_group):
-                        dist.all_reduce(
-                            did_fire_int,
-                            op=dist.ReduceOp.MAX,
-                            group=self.dp_group,
-                        )
-                    did_fire = did_fire_int.bool()
-                self.n_forward_passes_since_fired += 1
-                self.n_forward_passes_since_fired[did_fire] = 0
-                self.act_freq_scores += firing_feats.sum(0)
-                self.n_frac_active_samples += self.cfg.train_batch_size_samples
+        with torch.no_grad():
+            # calling .bool() should be equivalent to .abs() > 0, and work with coo tensors
+            firing_feats = train_step_output.feature_acts.bool().float()
+            did_fire = firing_feats.sum(-2).bool()
+            if did_fire.is_sparse:
+                did_fire = did_fire.to_dense()
+            # Sync did_fire across DP replicas: a feature counts as fired if any replica saw it.
+            if self.dp_group is not None:
+                did_fire_int = did_fire.to(torch.int32)
+                with nccl_nvtx_range(
+                    "nccl:sae_dp_did_fire_all_reduce",
+                    self.dp_group,
+                ):
+                    dist.all_reduce(
+                        did_fire_int,
+                        op=dist.ReduceOp.MAX,
+                        group=self.dp_group,
+                    )
+                did_fire = did_fire_int.bool()
+            self.n_forward_passes_since_fired += 1
+            self.n_forward_passes_since_fired[did_fire] = 0
+            self.act_freq_scores += firing_feats.sum(0)
+            self.n_frac_active_samples += self.cfg.train_batch_size_samples
         if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
             _debug_prefix_tp("train_step forward done")
 
@@ -613,7 +619,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         if self._is_ddp and self.dp_group is not None and self.token_count_weighted_dp:
             local_tokens = float(sae_in.shape[0])
             tokens_t = torch.tensor(local_tokens, device=loss.device)
-            with nccl_nvtx_range("nccl:sae_ddp_token_count_all_reduce", self.dp_group):
+            with nccl_nvtx_range(
+                "nccl:sae_ddp_token_count_all_reduce", self.dp_group
+            ):
                 dist.all_reduce(tokens_t, op=dist.ReduceOp.SUM, group=self.dp_group)
             dp_size = dist.get_world_size(self.dp_group)
             loss = loss * (local_tokens * dp_size / tokens_t.item())
@@ -642,24 +650,29 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 if self.token_count_weighted_dp:
                     local_tokens = float(sae_in.shape[0])
                     flat.mul_(local_tokens)
-                    dp_t0 = time.perf_counter()
-                    with nccl_nvtx_range("nccl:sae_manual_dp_grad_all_reduce", self.dp_group):
+                    with nccl_nvtx_range(
+                        "nccl:sae_manual_dp_grad_all_reduce",
+                        self.dp_group,
+                    ):
                         dist.all_reduce(flat, group=self.dp_group)
                     tokens_t = torch.tensor(local_tokens, device=flat.device)
-                    with nccl_nvtx_range("nccl:sae_manual_dp_token_count_all_reduce", self.dp_group):
+                    with nccl_nvtx_range(
+                        "nccl:sae_manual_dp_token_count_all_reduce",
+                        self.dp_group,
+                    ):
                         dist.all_reduce(
                             tokens_t,
                             op=dist.ReduceOp.SUM,
                             group=self.dp_group,
                         )
-                    dp_allreduce_time_s += time.perf_counter() - dp_t0
                     flat.div_(tokens_t.item())
                 else:
                     dp_size = dist.get_world_size(self.dp_group)
-                    dp_t0 = time.perf_counter()
-                    with nccl_nvtx_range("nccl:sae_manual_dp_grad_all_reduce", self.dp_group):
+                    with nccl_nvtx_range(
+                        "nccl:sae_manual_dp_grad_all_reduce",
+                        self.dp_group,
+                    ):
                         dist.all_reduce(flat, group=self.dp_group)
-                    dp_allreduce_time_s += time.perf_counter() - dp_t0
                     flat /= dp_size
                 offset = 0
                 for g in grads:
@@ -685,7 +698,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         for scheduler in self.coefficient_schedulers.values():
             scheduler.step()
 
-        return train_step_output, dp_allreduce_time_s
+        return train_step_output, 0.0
 
     def _is_logging_step(self) -> bool:
         return (
@@ -696,16 +709,39 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
     def _should_write_training_metrics(self) -> bool:
         if self.cfg.output_path is None or self.cfg.save_mse_every_n_steps <= 0:
             return False
-        tp_group = getattr(self._base_sae, "_tp_group", None)
-        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
-        dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
-        return tp_rank == 0 and dp_rank == 0
+        return self._is_metric_writer_rank()
 
     def _should_write_timing_metrics(self) -> bool:
         if self.cfg.output_path is None or self.cfg.save_timing_every_n_steps <= 0:
             return False
+        return self._is_metric_writer_rank()
+
+    def _is_metric_writer_rank(self) -> bool:
         tp_group = getattr(self._base_sae, "_tp_group", None)
-        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+        if dist.is_available() and dist.is_initialized() and tp_group is not None:
+            tp_rank = dist.get_rank(tp_group)
+        elif dist.is_available() and dist.is_initialized():
+            tp_rank = 0
+            try:
+                import sae_lens.distributed_v2 as v2_mod
+
+                if getattr(v2_mod, "_initialized", False) and v2_mod.is_consumer():
+                    sae_tp_rank = int(v2_mod.get_sae_tp_rank())
+                    if sae_tp_rank >= 0:
+                        tp_rank = sae_tp_rank
+            except ImportError:
+                pass
+            if tp_rank == 0:
+                try:
+                    from sae_lens.distributed import get_sae_tp_group
+
+                    fallback_group = get_sae_tp_group()
+                    if fallback_group is not None:
+                        tp_rank = dist.get_rank(fallback_group)
+                except ImportError:
+                    pass
+        else:
+            tp_rank = 0
         dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
         return tp_rank == 0 and dp_rank == 0
 
@@ -760,7 +796,6 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self,
         vllm_step_time_s: float,
         transfer_time_s: float,
-        dp_allreduce_time_s: float,
         sae_time_s: float,
     ) -> None:
         if self.timing_history_path is None:
@@ -776,7 +811,6 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             "transfer_time_s": transfer_time_s,
             "data_time_s": data_time_s,
             "vllm_time_s": data_time_s,
-            "dp_allreduce_time_s": dp_allreduce_time_s,
             "sae_time_s": sae_time_s,
             "step_time_s": data_time_s + sae_time_s,
         }
@@ -857,7 +891,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         ) == 0:
             self.sae.eval()
             eval_metrics = (
-                self.evaluator(self._base_sae, self.data_provider, self.activation_scaler)
+                self.evaluator(
+                    self._base_sae, self.data_provider, self.activation_scaler
+                )
                 if self.evaluator is not None
                 else {}
             )

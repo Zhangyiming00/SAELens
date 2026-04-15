@@ -213,3 +213,5 @@ scripts/scripts/
 
 scripts/run_sae_runner_*.sh
 scripts/profile_vllm_*
+*.nsys-rep
+profile*.sqlite

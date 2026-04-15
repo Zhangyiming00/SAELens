@@ -50,6 +50,7 @@ from sae_lens.saes.sae import (
 )
 from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.activations_store import ActivationsStore
+from sae_lens.training.multi_sae_trainer import MultiSAETrainer
 from sae_lens.training.sae_trainer import SAETrainer
 from sae_lens.training.types import DataProvider
 from sae_lens.util import temporary_seed
@@ -151,6 +152,12 @@ class LanguageModelSAETrainingRunner:
             )
 
         self.cfg = cfg
+        self.hook_names = (
+            list(cfg.hook_names)
+            if cfg.hook_names is not None and len(cfg.hook_names) > 0
+            else [cfg.hook_name]
+        )
+        self.is_multi_sae = len(self.hook_names) > 1
         if resume_from_checkpoint is not None:
             self.cfg.resume_from_checkpoint = str(resume_from_checkpoint)
         self.sae_dp_size = sae_dp_size
@@ -282,6 +289,25 @@ class LanguageModelSAETrainingRunner:
                     "Prefix-overlap training does not yet support "
                     "normalize_activations='expected_average_only_in'."
                 )
+        if self.is_multi_sae:
+            if self.cfg.sae_dp_mode not in ("ddp", "fsdp"):
+                raise ValueError("Multi-layer SAE training requires sae_dp_mode='ddp' or 'fsdp'.")
+            if self.cfg.sae.normalize_activations == "expected_average_only_in":
+                raise ValueError(
+                    "Multi-layer SAE training does not yet support "
+                    "normalize_activations='expected_average_only_in'."
+                )
+            if self.cfg.sae_dp_mode == "fsdp" and not dist.is_initialized():
+                raise ValueError(
+                    "Multi-layer SAE training with sae_dp_mode='fsdp' requires "
+                    "torch distributed. Use the default/ddp mode for sae_dp_size=1."
+                )
+            if self.cfg.n_eval_batches > 0:
+                raise ValueError("Multi-layer SAE training requires n_eval_batches=0 in v1.")
+            if self.cfg.use_cached_activations:
+                raise ValueError("Multi-layer SAE training does not support cached activations in v1.")
+            if override_sae is not None or self.cfg.from_pretrained_path is not None:
+                raise ValueError("Multi-layer SAE training does not support override/pretrained SAE in v1.")
 
         if (
             vllm_dp_size > 1
@@ -335,6 +361,15 @@ class LanguageModelSAETrainingRunner:
             dataset_shard_count=ds_shard_count,
             consumer_only=consumer_only,
         )
+
+        self.sae_by_hook: dict[str, Any] = {}
+        self.base_sae_by_hook: dict[str, TrainingSAE[Any]] = {}
+        if self.is_multi_sae:
+            if self.sae_active:
+                self._init_multi_saes()
+            self.sae = None
+            self._base_sae = None
+            return
 
         if self.sae_active:
             if override_sae is None:
@@ -432,6 +467,97 @@ class LanguageModelSAETrainingRunner:
         else:
             self._compile_sae_if_needed()
 
+    def _init_multi_saes(self) -> None:
+        if self.cfg.sae_dp_mode == "fsdp" and not dist.is_initialized():
+            raise ValueError("Multi-layer SAE training with FSDP requires torch distributed.")
+
+        sae_dp_group = get_dp_group() if dist.is_initialized() else None
+        if self.use_shard_routing and dist.is_initialized():
+            import sae_lens.distributed_v2 as v2_mod
+
+            sae_dp_group = v2_mod.get_sae_dp_group()
+        sae_dp_world_size = (
+            dist.get_world_size(sae_dp_group)
+            if sae_dp_group is not None and dist.is_initialized()
+            else 1
+        )
+        if self.cfg.sae_dp_mode == "fsdp" and self.sae_tp_size > 1:
+            raise ValueError(
+                "sae_dp_mode='fsdp' with sae_tp_size > 1 is not supported. "
+                "Use sae_tp_size=1 with FSDP."
+            )
+        if self.cfg.sae_dp_mode == "fsdp" and sae_dp_group is None:
+            raise ValueError("Multi-layer SAE training with FSDP requires an SAE DP group.")
+
+        for idx, hook_name in enumerate(self.hook_names):
+            seed = (
+                self.cfg.seed
+                if self.cfg.multi_sae_seed_mode == "same"
+                else self.cfg.seed + idx
+            )
+            with temporary_seed(seed):
+                sae = TrainingSAE.from_dict(
+                    TrainingSAEConfig.from_dict(
+                        self.cfg.get_training_sae_cfg_dict(),
+                    ).to_dict()
+                )
+            sae.to(self.cfg.device)
+            sae.cfg.metadata.hook_name = hook_name
+            sae.cfg.metadata.hook_head_index = self.cfg.hook_head_index
+            sae.cfg.metadata.dataset_path = self.cfg.dataset_path
+            sae.cfg.metadata.model_name = self.cfg.model_name
+            sae.cfg.metadata.model_class_name = self.cfg.model_class_name
+            sae.cfg.metadata.context_size = self.cfg.context_size
+            sae.cfg.metadata.seqpos_slice = self.cfg.seqpos_slice
+            sae.cfg.metadata.prepend_bos = self.cfg.prepend_bos
+            sae.cfg.metadata.exclude_special_tokens = self.cfg.exclude_special_tokens
+            self.base_sae_by_hook[hook_name] = sae
+
+            if self.sae_tp_size > 1:
+                if self.use_shard_routing:
+                    import sae_lens.distributed_v2 as v2_mod
+
+                    tp_group = v2_mod.get_sae_tp_group()
+                else:
+                    tp_group = get_tp_group()
+                if tp_group is not None and hasattr(sae, "shard_weights"):
+                    sae.shard_weights(tp_group)
+
+            wrapped: Any
+            if self.cfg.sae_dp_mode == "fsdp":
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                from torch.distributed.fsdp.api import ShardingStrategy
+
+                wrapped = FSDP(
+                    sae,
+                    process_group=sae_dp_group,
+                    sharding_strategy=ShardingStrategy.FULL_SHARD,
+                    use_orig_params=True,
+                )
+            elif sae_dp_world_size > 1:
+                from torch.nn.parallel import DistributedDataParallel as DDP
+
+                device_ids = None
+                output_device = None
+                device = torch.device(self.cfg.device)
+                if device.type == "cuda":
+                    device_index = (
+                        device.index
+                        if device.index is not None
+                        else torch.cuda.current_device()
+                    )
+                    device_ids = [device_index]
+                    output_device = device_index
+                wrapped = DDP(
+                    sae,
+                    process_group=sae_dp_group,
+                    device_ids=device_ids,
+                    output_device=output_device,
+                )
+            else:
+                wrapped = sae
+            self.sae_by_hook[hook_name] = wrapped
+
     def _sync_run_paths_across_ranks(self) -> None:
         if not dist.is_initialized() or dist.get_world_size() <= 1:
             return
@@ -458,6 +584,9 @@ class LanguageModelSAETrainingRunner:
                 print(line, end="", flush=True)
             self._run_vllm_helper_loop()
             return None
+
+        if self.is_multi_sae:
+            return self._run_multi_sae()
 
         assert self.sae is not None
         self._set_sae_metadata()
@@ -522,6 +651,35 @@ class LanguageModelSAETrainingRunner:
             wandb.finish()
 
         return sae
+
+    def _run_multi_sae(self) -> dict[str, TrainingSAE[Any]]:
+        sae_dp_group = get_dp_group() if dist.is_initialized() else None
+        if self.use_shard_routing and dist.is_initialized():
+            import sae_lens.distributed_v2 as v2_mod
+
+            sae_dp_group = v2_mod.get_sae_dp_group()
+
+        trainer = MultiSAETrainer(
+            hook_names=self.hook_names,
+            sae_by_hook=self.sae_by_hook,
+            base_sae_by_hook=self.base_sae_by_hook,
+            data_provider=self.activations_store,
+            save_checkpoint_fn=self.save_checkpoint,
+            cfg=self.cfg.to_sae_trainer_config(),
+            dp_group=sae_dp_group,
+            token_count_weighted_dp=self.use_shard_routing,
+            sae_dp_mode=self.cfg.sae_dp_mode,
+            backward_mode=self.cfg.multi_sae_backward_mode,
+            seed_mode=self.cfg.multi_sae_seed_mode,
+        )
+        if self.cfg.resume_from_checkpoint is not None:
+            trainer.load_trainer_state(self.cfg.resume_from_checkpoint)
+            self.activations_store.load_from_checkpoint(self.cfg.resume_from_checkpoint)
+
+        result = self.run_multi_trainer_with_interruption_handling(trainer)
+        if self.cfg.output_path is not None:
+            trainer.save_final(self.cfg.output_path)
+        return result
 
     def _run_vllm_helper_loop(self) -> None:
         """Pump activations for helper-only ranks (vllm_active and not sae_active).
@@ -615,22 +773,86 @@ class LanguageModelSAETrainingRunner:
         exchange phase as consumer ranks.
         Exits after total_producer_steps steps to stay in lockstep with consumers.
         """
-        import math
-
-        P = self.vllm_dp_size
-        batch_size = self.cfg.store_batch_size_prompts
         ctx_size = self.activations_store.training_context_size
         remaining_training_tokens = max(
             self.cfg.total_training_tokens - self._resume_training_samples(),
             0,
         )
-        total_producer_steps = math.ceil(
-            remaining_training_tokens / (batch_size * ctx_size * P)
+        rows_per_consumer_step = self._v2_rows_per_consumer_step(ctx_size)
+        buffer_size = self.cfg.n_batches_in_buffer * ctx_size
+        total_producer_steps = max(
+            self._mixing_buffer_source_steps_needed(
+                target_samples=remaining_training_tokens,
+                source_batch_size=rows_per_step,
+                buffer_size=buffer_size,
+                train_batch_size=self.cfg.train_batch_size_tokens,
+                mix_fraction=self.cfg.activations_mixing_fraction,
+            )
+            for rows_per_step in rows_per_consumer_step
         )
 
         for _ in range(total_producer_steps):
             _local_slices, outgoing = self.activations_store._run_producer_phase2_v2()
             self.activations_store._run_nccl_p2p_exchange_v2(outgoing)
+
+    def _v2_rows_per_consumer_step(self, ctx_size: int) -> list[int]:
+        try:
+            import sae_lens.distributed_v2 as v2_mod
+
+            if v2_mod._initialized:
+                from sae_lens.shard_routing import routes_for_consumer
+
+                return [
+                    sum(
+                        route.row_end - route.row_start
+                        for route in routes_for_consumer(v2_mod.get_routing_table(), c)
+                    )
+                    for c in range(v2_mod.get_sae_dp_size())
+                ]
+        except ImportError:
+            pass
+
+        total_rows = self.cfg.store_batch_size_prompts * ctx_size * self.vllm_dp_size
+        rows_per_consumer = (total_rows + self.sae_dp_size - 1) // self.sae_dp_size
+        return [rows_per_consumer]
+
+    @staticmethod
+    def _mixing_buffer_source_steps_needed(
+        *,
+        target_samples: int,
+        source_batch_size: int,
+        buffer_size: int,
+        train_batch_size: int,
+        mix_fraction: float,
+    ) -> int:
+        if target_samples <= 0:
+            return 0
+        if source_batch_size <= 0:
+            raise ValueError("source_batch_size must be > 0")
+        if buffer_size < train_batch_size:
+            raise ValueError(
+                "buffer_size must be greater than or equal to train_batch_size"
+            )
+        if not 0 <= mix_fraction <= 1:
+            raise ValueError("mix_fraction must be in [0, 1]")
+
+        source_steps = 0
+        yielded_samples = 0
+        storage_samples = 0
+        while yielded_samples < target_samples:
+            source_steps += 1
+            storage_samples += source_batch_size
+            if storage_samples < buffer_size:
+                continue
+
+            keep_for_mixing = int(buffer_size * mix_fraction)
+            num_to_serve = storage_samples - keep_for_mixing
+            num_serving_batches = max(1, num_to_serve // train_batch_size)
+            serving_cutoff = num_serving_batches * train_batch_size
+            yielded_samples += serving_cutoff
+            storage_samples -= serving_cutoff
+
+        return source_steps
 
     def _resume_checkpoint_path(self) -> Path | None:
         if self.cfg.resume_from_checkpoint is None:
@@ -795,6 +1017,20 @@ class LanguageModelSAETrainingRunner:
             raise
 
         return sae
+
+    def run_multi_trainer_with_interruption_handling(
+        self, trainer: MultiSAETrainer
+    ) -> dict[str, TrainingSAE[Any]]:
+        try:
+            signal.signal(signal.SIGINT, interrupt_callback)
+            signal.signal(signal.SIGTERM, interrupt_callback)
+            return trainer.fit()
+        except (KeyboardInterrupt, InterruptedException):
+            if self.cfg.checkpoint_path is not None:
+                logger.warning("interrupted, saving multi-SAE progress")
+                trainer.save_checkpoint(checkpoint_name=str(trainer.n_training_samples))
+                logger.info("done saving")
+            raise
 
     def save_checkpoint(
         self,

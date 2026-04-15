@@ -157,6 +157,60 @@ def test_mixing_buffer_zero_mix_fraction_no_shuffle():
     assert torch.equal(all_values, torch.arange(100))
 
 
+def test_mixing_buffer_dict_uses_shared_permutation():
+    activations = [
+        {
+            "a": torch.arange(16).unsqueeze(-1),
+            "b": (torch.arange(16) + 100).unsqueeze(-1),
+        }
+    ]
+
+    batches = list(
+        mixing_buffer(
+            buffer_size=16,
+            batch_size=8,
+            activations_loader=iter(activations),
+            mix_fraction=0.5,
+        )
+    )
+
+    assert len(batches) == 2
+    for batch in batches:
+        assert isinstance(batch, dict)
+        assert torch.equal(batch["b"].squeeze(-1), batch["a"].squeeze(-1) + 100)
+
+
+def test_mixing_buffer_generator_decouples_from_global_rng():
+    activations = [torch.arange(16), torch.arange(16, 32)]
+    gen1 = torch.Generator().manual_seed(1234)
+    out1 = list(
+        mixing_buffer(
+            buffer_size=16,
+            batch_size=8,
+            activations_loader=iter(activations),
+            mix_fraction=0.5,
+            generator=gen1,
+        )
+    )
+
+    # Consume global RNG to simulate unrelated randomness (e.g., DDP/FSDP init).
+    _ = torch.rand(1000)
+    gen2 = torch.Generator().manual_seed(1234)
+    out2 = list(
+        mixing_buffer(
+            buffer_size=16,
+            batch_size=8,
+            activations_loader=iter(activations),
+            mix_fraction=0.5,
+            generator=gen2,
+        )
+    )
+
+    assert len(out1) == len(out2)
+    for b1, b2 in zip(out1, out2, strict=True):
+        assert torch.equal(b1, b2)
+
+
 def test_mixing_buffer_mix_fraction_matches_observed_mix_fraction():
     target_mix_frac = 0.7
     buffer_size = 10_000

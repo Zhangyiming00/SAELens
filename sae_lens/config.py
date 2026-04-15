@@ -218,6 +218,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     model_name: str = "gelu-2l"
     model_class_name: str = "HookedTransformer"
     hook_name: str = "blocks.0.hook_mlp_out"
+    hook_names: list[str] | None = None
     hook_eval: str = "NOT_IN_USE"
     hook_head_index: int | None = None
     dataset_path: str = ""
@@ -307,8 +308,27 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     sae_lens_training_version: str = field(default_factory=lambda: __version__)
     exclude_special_tokens: bool | list[int] = False
     sae_dp_mode: Literal["manual", "ddp", "fsdp"] = "manual"
+    multi_sae_backward_mode: Literal["combined", "sequential"] = "combined"
+    multi_sae_seed_mode: Literal["same", "offset"] = "same"
 
     def __post_init__(self):
+        if self.multi_sae_seed_mode not in ("same", "offset"):
+            raise ValueError("multi_sae_seed_mode must be 'same' or 'offset'")
+        if self.hook_names is not None:
+            self.hook_names = list(dict.fromkeys(self.hook_names))
+            if len(self.hook_names) == 0:
+                raise ValueError("hook_names must not be empty when provided")
+            if len(self.hook_names) > 1 and self.sae_dp_mode == "manual":
+                warnings.warn(
+                    "Multi-layer SAE training does not use manual DP sync; "
+                    "defaulting sae_dp_mode to 'ddp'. With sae_dp_size=1 this "
+                    "runs without data-parallel communication.",
+                    stacklevel=2,
+                )
+                self.sae_dp_mode = "ddp"
+            if len(self.hook_names) == 1:
+                self.hook_name = self.hook_names[0]
+
         if self.sae_dp_mode == "ddp" and self.compile_sae:
             raise ValueError(
                 "compile_sae=True is incompatible with sae_dp_mode='ddp'."
@@ -322,6 +342,11 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             )
 
         if self.use_cached_activations and self.cached_activations_path is None:
+            if self.hook_names is not None and len(self.hook_names) > 1:
+                raise ValueError(
+                    "use_cached_activations is not supported with multi-layer "
+                    "hook_names in this implementation."
+                )
             self.cached_activations_path = _default_cached_activations_path(
                 self.dataset_path,
                 self.model_name,

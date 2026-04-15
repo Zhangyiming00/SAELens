@@ -51,6 +51,7 @@ from sae_lens.saes.sae import SAE, T_SAE_CONFIG, T_TRAINING_SAE_CONFIG
 from sae_lens.tokenization_and_batching import concat_and_batch_sequences
 from sae_lens.training.mixing_buffer import mixing_buffer
 from sae_lens.util import (
+    extract_layer_from_tlens_hook_name,
     extract_stop_at_layer_from_tlens_hook_name,
     get_special_token_ids,
     str_to_dtype,
@@ -70,6 +71,7 @@ class ActivationsStore:
     cached_activation_dataset: Dataset | None = None
     tokens_column: Literal["tokens", "input_ids", "text", "problem"]
     hook_name: str
+    hook_names: list[str]
     hook_head_index: int | None
     _dataloader: Iterator[Any] | None = None
     exclude_special_tokens: torch.Tensor | None = None
@@ -88,6 +90,7 @@ class ActivationsStore:
             cached_activations_path=cfg.new_cached_activations_path,
             dtype=cfg.dtype,
             hook_name=cfg.hook_name,
+            hook_names=[cfg.hook_name],
             context_size=cfg.context_size,
             d_in=cfg.d_in,
             n_batches_in_buffer=cfg.n_batches_in_buffer,
@@ -107,6 +110,7 @@ class ActivationsStore:
             autocast_lm=False,
             dataset_trust_remote_code=None,
             exclude_special_tokens=None,
+            mixing_seed=cfg.seed,
         )
 
     @classmethod
@@ -151,6 +155,12 @@ class ActivationsStore:
             dataset=override_dataset or cfg.dataset_path,
             streaming=cfg.streaming,
             hook_name=cfg.hook_name,
+            hook_names=(
+                cfg.hook_names
+                if isinstance(cfg, LanguageModelSAERunnerConfig)
+                and cfg.hook_names is not None
+                else [cfg.hook_name]
+            ),
             hook_head_index=cfg.hook_head_index,
             context_size=cfg.context_size,
             d_in=cfg.d_in
@@ -173,6 +183,7 @@ class ActivationsStore:
             disable_concat_sequences=cfg.disable_concat_sequences,
             sequence_separator_token=cfg.sequence_separator_token,
             activations_mixing_fraction=cfg.activations_mixing_fraction,
+            mixing_seed=cfg.seed,
             dataset_shard_index=dataset_shard_index,
             dataset_shard_count=dataset_shard_count,
             consumer_only=consumer_only,
@@ -242,6 +253,7 @@ class ActivationsStore:
         normalize_activations: str,
         device: torch.device,
         dtype: str,
+        hook_names: list[str] | None = None,
         cached_activations_path: str | None = None,
         model_kwargs: dict[str, Any] | None = None,
         autocast_lm: bool = False,
@@ -251,6 +263,7 @@ class ActivationsStore:
         disable_concat_sequences: bool = False,
         sequence_separator_token: int | Literal["bos", "eos", "sep"] | None = "bos",
         activations_mixing_fraction: float = 0.5,
+        mixing_seed: int | None = None,
         dataset_shard_index: int = 0,
         dataset_shard_count: int = 1,
         consumer_only: bool = False,
@@ -284,6 +297,10 @@ class ActivationsStore:
                 )
 
         self.hook_name = hook_name
+        self.hook_names = list(hook_names or [hook_name])
+        if not self.hook_names:
+            raise ValueError("hook_names must not be empty")
+        self.is_multi_hook = len(self.hook_names) > 1
         self.hook_head_index = hook_head_index
         self.context_size = context_size
         self.d_in = d_in
@@ -307,6 +324,13 @@ class ActivationsStore:
         self.activations_mixing_fraction = activations_mixing_fraction
         self._dataset_shard_index = dataset_shard_index
         self._dataset_shard_count = dataset_shard_count
+        self._mixing_generator: torch.Generator | None = None
+        # Use a dedicated per-store generator so activation mixing order is
+        # deterministic and decoupled from unrelated global RNG consumption
+        # (e.g. extra model/SAE initialization paths in multi-hook runs).
+        if mixing_seed is not None:
+            self._mixing_generator = torch.Generator()
+            self._mixing_generator.manual_seed(int(mixing_seed) + int(dataset_shard_index))
         self._current_data_timing = {
             "vllm_step_time_s": 0.0,
             "transfer_time_s": 0.0,
@@ -493,6 +517,10 @@ class ActivationsStore:
         """
         if self.cached_activations_path is None:
             return None
+        if self.is_multi_hook:
+            raise ValueError(
+                "Cached activations are not supported for multi-layer hook_names."
+            )
 
         assert self.cached_activations_path is not None  # keep pyright happy
         # Sanity check: does the cache directory exist?
@@ -656,6 +684,12 @@ class ActivationsStore:
                 self._add_data_timing(vllm_step_time_s=time.perf_counter() - local_t0)
             return activations
 
+        if self.is_multi_hook:
+            raise ValueError(
+                "Multi-layer hook_names require shard-routing/v2 activation flow; "
+                "legacy worker broadcast does not support activation dicts."
+            )
+
         src_rank = get_vllm_root_rank()
         n_context = self.training_context_size
         if is_vllm_active():
@@ -683,8 +717,21 @@ class ActivationsStore:
             self._add_data_timing(transfer_time_s=time.perf_counter() - transfer_t0)
         return activations
 
-    def _get_activations_local(self, batch_tokens: torch.Tensor) -> torch.Tensor:
+    def _get_activations_local(
+        self, batch_tokens: torch.Tensor
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
         model_device = _get_model_device(self.model)
+        hook_names = self.hook_names
+        hook_layers = [
+            layer
+            for hook_name in hook_names
+            if (layer := extract_layer_from_tlens_hook_name(hook_name)) is not None
+        ]
+        stop_at_layer = (
+            max(hook_layers) + 1
+            if len(hook_layers) > 0
+            else extract_stop_at_layer_from_tlens_hook_name(self.hook_name)
+        )
         with torch.autocast(
             device_type=model_device.type,
             dtype=torch.bfloat16,
@@ -692,18 +739,25 @@ class ActivationsStore:
         ):
             layerwise_activations_cache = self.model.run_with_cache(
                 batch_tokens,
-                names_filter=[self.hook_name],
-                stop_at_layer=extract_stop_at_layer_from_tlens_hook_name(
-                    self.hook_name
-                ),
+                names_filter=hook_names,
+                stop_at_layer=stop_at_layer,
                 prepend_bos=False,
                 **self.model_kwargs,
             )[1]
 
-        layerwise_activations = layerwise_activations_cache[self.hook_name][
-            :, slice(*self.seqpos_slice)
-        ]
+        activations_by_hook = {
+            hook_name: self._postprocess_hook_activations(
+                layerwise_activations_cache[hook_name][:, slice(*self.seqpos_slice)]
+            )
+            for hook_name in hook_names
+        }
+        if self.is_multi_hook:
+            return activations_by_hook
+        return activations_by_hook[self.hook_name]
 
+    def _postprocess_hook_activations(
+        self, layerwise_activations: torch.Tensor
+    ) -> torch.Tensor:
         if (
             dist.is_initialized()
             and is_vllm_active()
@@ -840,15 +894,26 @@ class ActivationsStore:
         batch_tokens = self.get_batch_tokens(raise_at_epoch_end=raise_on_epoch_end).to(
             _get_model_device(self.model)
         )
-        activations = self.get_activations(batch_tokens).to(
-            device=self.device, dtype=self.dtype
-        )
+        activations_raw = self.get_activations(batch_tokens)
+        if isinstance(activations_raw, dict):
+            activations = {
+                hook_name: acts.to(device=self.device, dtype=self.dtype)
+                for hook_name, acts in activations_raw.items()
+            }
+        else:
+            activations = activations_raw.to(device=self.device, dtype=self.dtype)
 
         # handle seqpos_slice, this is done for activations in get_activations
         batch_tokens = batch_tokens[:, slice(*self.seqpos_slice)]
 
         # reshape from (batch, context, d_in) to (batch * context, d_in)
-        activations = activations.reshape(-1, d_in)
+        if isinstance(activations, dict):
+            activations = {
+                hook_name: acts.reshape(-1, d_in)
+                for hook_name, acts in activations.items()
+            }
+        else:
+            activations = activations.reshape(-1, d_in)
         token_ids = batch_tokens.reshape(-1)
 
         return activations, token_ids
@@ -1072,24 +1137,12 @@ class ActivationsStore:
                         "Unable to fill buffer after starting new epoch. Dataset may be too small."
                     )
 
-    def _iterate_filtered_activations_v2(self) -> Generator[torch.Tensor, None, None]:
-        """Unified shard-routing activation iterator for consumer ranks.
-
-        One global training step = each consumer receives all inbound slices,
-        assembles them into one local batch, and yields exactly once.
-
-        The phase ordering is NCCL-friendly:
-          Phase 1 — all producer ranks generate batches; producer roots prepare GPU slices
-          Phase 2 — producer roots and consumer roots exchange remote slices with
-                    ``batch_isend_irecv`` after producer data is ready
-          Phase 3 — consumer roots assemble local + remote slices in route order
-          Phase 4 — consumer TP root broadcasts to TP followers (if sae_tp > 1)
-          Phase 5 — all consumer ranks yield assembled batch
-
-        Consumer-only ranks (self._consumer_only=True) never call get_raw_llm_batch().
-        Producer-only ranks never enter this method (handled by the runner helper loop).
-        """
+    def _produce_one_v2_assembled_batch(
+        self,
+    ) -> torch.Tensor | dict[str, torch.Tensor] | None:
+        """Run one shard-routing production cycle and return one assembled consumer batch."""
         import sae_lens.distributed_v2 as v2
+        from sae_lens.shard_routing import routes_for_consumer
 
         routing = v2.get_routing_table()
         i_am_producer = v2.is_producer()
@@ -1097,75 +1150,104 @@ class ActivationsStore:
         i_am_consumer_root = i_am_consumer and v2.get_sae_tp_rank() == 0
         c = v2.get_consumer_idx() if i_am_consumer else -1
 
-        from sae_lens.shard_routing import routes_for_consumer
+        local_slices: dict[int, Any] = {}
+        outgoing: dict[int, Any] = {}
 
-        while True:
-            local_slices: dict[int, torch.Tensor] = {}   # producer_idx -> tensor
-            outgoing: dict[int, torch.Tensor] = {}       # consumer_idx -> slice tensor
+        vllm_stage_t0 = time.perf_counter()
+        if i_am_producer:
+            local_slices, outgoing = self._run_producer_phase2_v2()
+        self._add_data_timing(vllm_step_time_s=time.perf_counter() - vllm_stage_t0)
 
-            # === PHASE 1: Producer roots generate batch; slices stay on device ===
-            # All producer TP ranks must participate in get_raw_llm_batch() for the
-            # model-parallel forward collective.
-            vllm_stage_t0 = time.perf_counter()
-            if i_am_producer:
-                local_slices, outgoing = self._run_producer_phase2_v2()
-            self._add_data_timing(vllm_step_time_s=time.perf_counter() - vllm_stage_t0)
+        transfer_t0 = time.perf_counter()
+        remote_slices = self._run_nccl_p2p_exchange_v2(outgoing)
 
-            # === PHASE 2: Exchange remote payloads with NCCL P2P ===
-            transfer_t0 = time.perf_counter()
-            remote_slices = self._run_nccl_p2p_exchange_v2(outgoing)
+        assembled: torch.Tensor | dict[str, torch.Tensor] | None = None
+        if i_am_consumer_root:
+            buf_map: dict[int, Any] = {}
+            c_routes = routes_for_consumer(routing, c)
+            for route in c_routes:
+                p = route.producer_idx
+                if v2.get_producer_tp_root(p) == v2.get_consumer_tp_root(c):
+                    buf_map[p] = local_slices[p]
+                else:
+                    buf_map[p] = remote_slices[p]
 
-            # === PHASE 3: Consumer roots assemble in route order ===
-            assembled: torch.Tensor | None = None
-            if i_am_consumer_root:
-                buf_map: dict[int, torch.Tensor] = {}
-                c_routes = routes_for_consumer(routing, c)
-                for route in c_routes:
-                    p = route.producer_idx
-                    if v2.get_producer_tp_root(p) == v2.get_consumer_tp_root(c):
-                        buf_map[p] = local_slices[p]
-                    else:
-                        buf_map[p] = remote_slices[p]
-
+            first_buf = next(iter(buf_map.values()))
+            if isinstance(first_buf, dict):
+                assembled = {
+                    hook_name: torch.cat(
+                        [buf_map[r.producer_idx][hook_name] for r in c_routes],
+                        dim=0,
+                    )
+                    for hook_name in self.hook_names
+                }
+            else:
                 assembled = torch.cat(
                     [buf_map[r.producer_idx] for r in c_routes], dim=0
                 )
 
-                # === PHASE 4: Broadcast to SAE TP followers ===
-                sae_tp_group = v2.get_sae_tp_group()
-                sae_tp_size = v2.get_sae_tp_size()
-                if sae_tp_size > 1 and sae_tp_group is not None:
-                    with nccl_nvtx_range("nccl:shard_routing_sae_tp_broadcast", sae_tp_group):
+            sae_tp_group = v2.get_sae_tp_group()
+            sae_tp_size = v2.get_sae_tp_size()
+            if sae_tp_size > 1 and sae_tp_group is not None:
+                with nccl_nvtx_range("nccl:shard_routing_sae_tp_broadcast", sae_tp_group):
+                    if isinstance(assembled, dict):
+                        for hook_acts in assembled.values():
+                            dist.broadcast(
+                                hook_acts,
+                                src=v2.get_consumer_tp_root(c),
+                                group=sae_tp_group,
+                            )
+                    else:
                         dist.broadcast(
                             assembled,
                             src=v2.get_consumer_tp_root(c),
                             group=sae_tp_group,
                         )
-
-            elif i_am_consumer and v2.get_sae_tp_size() > 1:
-                # SAE TP follower: receive data broadcast.
-                # Shape is known from routing table + self.d_in — no shape broadcast needed.
-                sae_tp_group = v2.get_sae_tp_group()
-                routing_c = v2.get_consumer_idx()
-                n_rows = sum(
-                    r.row_end - r.row_start for r in routes_for_consumer(routing, routing_c)
-                )
+        elif i_am_consumer and v2.get_sae_tp_size() > 1:
+            sae_tp_group = v2.get_sae_tp_group()
+            routing_c = v2.get_consumer_idx()
+            n_rows = sum(
+                r.row_end - r.row_start for r in routes_for_consumer(routing, routing_c)
+            )
+            if self.is_multi_hook:
+                assembled = {
+                    hook_name: torch.empty(
+                        n_rows,
+                        self.d_in,
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                    for hook_name in self.hook_names
+                }
+            else:
                 assembled = torch.empty(n_rows, self.d_in, dtype=self.dtype, device=self.device)
-                with nccl_nvtx_range("nccl:shard_routing_sae_tp_broadcast", sae_tp_group):
+            with nccl_nvtx_range("nccl:shard_routing_sae_tp_broadcast", sae_tp_group):
+                if isinstance(assembled, dict):
+                    for hook_acts in assembled.values():
+                        dist.broadcast(
+                            hook_acts,
+                            src=v2.get_consumer_tp_root(routing_c),
+                            group=sae_tp_group,
+                        )
+                else:
                     dist.broadcast(
                         assembled,
                         src=v2.get_consumer_tp_root(routing_c),
                         group=sae_tp_group,
                     )
 
-            # === PHASE 5: All consumer ranks yield assembled batch ===
+        if assembled is not None:
+            self._add_data_timing(transfer_time_s=time.perf_counter() - transfer_t0)
+        return assembled
+
+    def _iterate_filtered_activations_v2(
+        self,
+    ) -> Generator[torch.Tensor | dict[str, torch.Tensor], None, None]:
+        """Unified shard-routing activation iterator for consumer ranks."""
+        while True:
+            assembled = self._produce_one_v2_assembled_batch()
             if assembled is not None:
-                self._add_data_timing(
-                    transfer_time_s=time.perf_counter() - transfer_t0
-                )
-                yield _filter_buffer_acts(
-                    (assembled, None), self.exclude_special_tokens
-                )
+                yield _filter_buffer_acts((assembled, None), self.exclude_special_tokens)
 
     def _get_raw_llm_batch_with_epoch_restart(
         self,
@@ -1180,7 +1262,7 @@ class ActivationsStore:
 
     def _run_producer_phase2_v2(
         self,
-    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+    ) -> tuple[dict[int, Any], dict[int, Any]]:
         """Run shard-routing phase 2 for one producer step.
 
         All producer TP ranks participate in ``get_raw_llm_batch()``. Only the
@@ -1197,8 +1279,8 @@ class ActivationsStore:
 
         from sae_lens.shard_routing import routes_for_producer
 
-        local_slices: dict[int, torch.Tensor] = {}
-        outgoing: dict[int, torch.Tensor] = {}
+        local_slices: dict[int, Any] = {}
+        outgoing: dict[int, Any] = {}
         if not v2.is_producer():
             return local_slices, outgoing
 
@@ -1221,7 +1303,16 @@ class ActivationsStore:
 
         for route in p_routes:
             cc = route.consumer_idx
-            sl = raw_acts[route.row_start:route.row_end].contiguous()
+            if isinstance(raw_acts, dict):
+                # Keep hook payload order explicitly aligned with self.hook_names.
+                # P2P exchange serializes multiple tensors without metadata, so
+                # sender/receiver must enqueue ops in the exact same order.
+                sl = {
+                    hook_name: raw_acts[hook_name][route.row_start:route.row_end].contiguous()
+                    for hook_name in self.hook_names
+                }
+            else:
+                sl = raw_acts[route.row_start:route.row_end].contiguous()
             if v2.get_producer_tp_root(p) == v2.get_consumer_tp_root(cc):
                 # Local route: slice stays on the original device.
                 local_slices[route.producer_idx] = sl
@@ -1231,8 +1322,8 @@ class ActivationsStore:
 
     def _run_nccl_p2p_exchange_v2(
         self,
-        outgoing: dict[int, torch.Tensor],
-    ) -> dict[int, torch.Tensor]:
+        outgoing: dict[int, Any],
+    ) -> dict[int, Any]:
         """Exchange remote activation slices with per-consumer NCCL P2P groups.
 
         All producer data is already materialized before this runs.  For each
@@ -1244,7 +1335,7 @@ class ActivationsStore:
 
         from sae_lens.shard_routing import routes_for_consumer, routes_for_producer
 
-        recv_slices: dict[int, torch.Tensor] = {}
+        recv_slices: dict[int, Any] = {}
         rank = dist.get_rank() if dist.is_initialized() else -1
 
         producer_routes = (
@@ -1287,31 +1378,67 @@ class ActivationsStore:
             if should_recv:
                 for route in remote_routes:
                     n_rows = route.row_end - route.row_start
-                    recv_buf = torch.empty(
-                        n_rows,
-                        self.d_in,
-                        dtype=self.dtype,
-                        device=self.device,
-                    )
+                    if self.is_multi_hook:
+                        recv_buf = {
+                            hook_name: torch.empty(
+                                n_rows,
+                                self.d_in,
+                                dtype=self.dtype,
+                                device=self.device,
+                            )
+                            for hook_name in self.hook_names
+                        }
+                    else:
+                        recv_buf = torch.empty(
+                            n_rows,
+                            self.d_in,
+                            dtype=self.dtype,
+                            device=self.device,
+                        )
                     recv_slices[route.producer_idx] = recv_buf
+                    if isinstance(recv_buf, dict):
+                        for hook_name in self.hook_names:
+                            hook_buf = recv_buf[hook_name]
+                            ops.append(
+                                dist.P2POp(
+                                    dist.irecv,
+                                    hook_buf,
+                                    v2.get_producer_tp_root(route.producer_idx),
+                                    group=p2p_group,
+                                )
+                            )
+                    else:
+                        ops.append(
+                            dist.P2POp(
+                                dist.irecv,
+                                recv_buf,
+                                v2.get_producer_tp_root(route.producer_idx),
+                                group=p2p_group,
+                            )
+                        )
+
+            if should_send:
+                send_buf = outgoing[c]
+                if isinstance(send_buf, dict):
+                    for hook_name in self.hook_names:
+                        hook_buf = send_buf[hook_name]
+                        ops.append(
+                            dist.P2POp(
+                                dist.isend,
+                                hook_buf,
+                                consumer_root,
+                                group=p2p_group,
+                            )
+                        )
+                else:
                     ops.append(
                         dist.P2POp(
-                            dist.irecv,
-                            recv_buf,
-                            v2.get_producer_tp_root(route.producer_idx),
+                            dist.isend,
+                            send_buf,
+                            consumer_root,
                             group=p2p_group,
                         )
                     )
-
-            if should_send:
-                ops.append(
-                    dist.P2POp(
-                        dist.isend,
-                        outgoing[c],
-                        consumer_root,
-                        group=p2p_group,
-                    )
-                )
 
             with nccl_nvtx_range("nccl:shard_routing_p2p_exchange", p2p_group):
                 for work in dist.batch_isend_irecv(ops):
@@ -1333,12 +1460,14 @@ class ActivationsStore:
                 batch_size=self.train_batch_size_tokens,
                 activations_loader=self._iterate_filtered_activations_v2(),
                 mix_fraction=self.activations_mixing_fraction,
+                generator=self._mixing_generator,
             )
         return mixing_buffer(
             buffer_size=self.n_batches_in_buffer * self.training_context_size,
             batch_size=self.train_batch_size_tokens,
             activations_loader=self._iterate_filtered_activations(),
             mix_fraction=self.activations_mixing_fraction,
+            generator=self._mixing_generator,
         )
 
     def next_batch(self) -> torch.Tensor:
@@ -1452,9 +1581,9 @@ def _get_model_device(model: HookedRootModule) -> torch.device:
 
 
 def _filter_buffer_acts(
-    buffer: tuple[torch.Tensor, torch.Tensor | None],
+    buffer: tuple[torch.Tensor | dict[str, torch.Tensor], torch.Tensor | None],
     exclude_tokens: torch.Tensor | None,
-) -> torch.Tensor:
+) -> torch.Tensor | dict[str, torch.Tensor]:
     """
     Filter out activations for tokens that are in exclude_tokens.
     """
@@ -1466,6 +1595,8 @@ def _filter_buffer_acts(
     if exclude_tokens.device != tokens.device:
         exclude_tokens = exclude_tokens.to(tokens.device)
     mask = torch.isin(tokens, exclude_tokens)
+    if isinstance(activations, dict):
+        return {hook_name: acts[~mask] for hook_name, acts in activations.items()}
     return activations[~mask]
 
 

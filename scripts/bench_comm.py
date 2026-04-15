@@ -1,115 +1,205 @@
-"""Benchmark communication bandwidth for each collective used in SAELens.
+"""Benchmark communication bandwidth: Gloo CPU vs NCCL GPU collectives + P2P.
 
-Covers:
-  - Gloo CPU broadcast  (worker_cpu_group path: activations + tokens)
-  - Gloo CPU send/recv  (vllm_dp P2P / shard-routing P2P)
-  - NCCL GPU all_gather (vllm_tp_group, split-activation gather)
-  - NCCL GPU broadcast  (sae_tp_group, fan-in / v2 Phase-6)
-  - NCCL GPU all_reduce (sae_dp_group, gradient sync)
+Sizes: 256 KB → 8 GB (powers of 4).  GPU ops timed with CUDA events.
 
-Usage (2 GPUs):
+Collectives tested:
+  Gloo   : broadcast, send/recv
+  NCCL   : all_reduce, all_gather, reduce_scatter, broadcast, send/recv
+
+Bandwidth reported:
+  algbw  = payload / time          (algorithmic BW — what the app sees)
+  busbw  = algbw * bus_factor      (bus BW — what the NIC/NVLink actually carries)
+    AllReduce      bus_factor = 2(n-1)/n
+    AllGather      bus_factor = (n-1)/n
+    ReduceScatter  bus_factor = (n-1)/n
+    Broadcast      bus_factor = (n-1)/n
+    P2P            bus_factor = 1
+
+Usage:
     torchrun --nproc_per_node=2 scripts/bench_comm.py
-    torchrun --nproc_per_node=2 scripts/bench_comm.py --sizes-mb 32 128 512
+    torchrun --nproc_per_node=2 scripts/bench_comm.py --warmup 10 --iters 50
+    torchrun --nproc_per_node=2 scripts/bench_comm.py --min-kb 256 --max-gb 8
 """
 from __future__ import annotations
 
 import argparse
+import os
 import time
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Timing helpers
 # ---------------------------------------------------------------------------
 
-def _make_tensor(n_bytes: int, device: str, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    n_elem = n_bytes // dtype.itemsize  # type: ignore[attr-defined]
-    return torch.zeros(n_elem, dtype=dtype, device=device)
+@dataclass
+class TimingResult:
+    label: str
+    n_bytes: int
+    avg_ms: float
+    algbw: float   # GB/s
+    busbw: float   # GB/s
 
 
-def _bandwidth_gb_s(n_bytes: int, elapsed_s: float) -> float:
-    return n_bytes / elapsed_s / 1e9
-
-
-def _run(label: str, fn, n_bytes: int, warmup: int, iters: int) -> None:
-    rank = dist.get_rank()
-    # warmup
+def _cuda_timed(fn, warmup: int, iters: int, group: dist.ProcessGroup) -> float:
+    """Return average elapsed GPU milliseconds over `iters` calls, timed with CUDA events."""
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
-    dist.barrier()
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters   # ms
+
+
+def _cpu_timed(fn, warmup: int, iters: int, group: dist.ProcessGroup) -> float:
+    """Return average elapsed CPU milliseconds over `iters` calls (Gloo/CPU path)."""
+    for _ in range(warmup):
+        fn()
+    dist.barrier(group=group)
+
     t0 = time.perf_counter()
     for _ in range(iters):
         fn()
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
-    dist.barrier()
-    elapsed = time.perf_counter() - t0
-    avg_s = elapsed / iters
-    bw = _bandwidth_gb_s(n_bytes, avg_s)
-    if rank == 0:
-        print(f"  {label:<45s}  size={n_bytes/1e6:7.1f} MB  avg={avg_s*1e3:7.2f} ms  bw={bw:6.2f} GB/s")
+    dist.barrier(group=group)
+    return (time.perf_counter() - t0) / iters * 1e3   # ms
+
+
+def _result(label: str, n_bytes: int, avg_ms: float, bus_factor: float) -> TimingResult:
+    algbw = n_bytes / (avg_ms * 1e-3) / 1e9
+    return TimingResult(label, n_bytes, avg_ms, algbw, algbw * bus_factor)
 
 
 # ---------------------------------------------------------------------------
-# Benchmark functions
+# Individual benchmarks
 # ---------------------------------------------------------------------------
 
-def bench_gloo_broadcast(group: dist.ProcessGroup, n_bytes: int, src: int,
-                          warmup: int, iters: int) -> None:
-    rank = dist.get_rank()
-    t = _make_tensor(n_bytes, device="cpu")
-    label = f"Gloo broadcast (src={src}, world={dist.get_world_size(group)})"
-    _run(label, lambda: dist.broadcast(t, src=src, group=group), n_bytes, warmup, iters)
+def bench_gloo_broadcast(group: dist.ProcessGroup, n_bytes: int,
+                          warmup: int, iters: int) -> TimingResult:
+    n = dist.get_world_size(group)
+    t = torch.zeros(n_bytes // 4, dtype=torch.float32)
+    avg_ms = _cpu_timed(lambda: dist.broadcast(t, src=0, group=group), warmup, iters, group)
+    return _result(f"Gloo  broadcast   (n={n})", n_bytes, avg_ms, (n - 1) / n)
 
 
 def bench_gloo_sendrecv(group: dist.ProcessGroup, n_bytes: int,
-                         warmup: int, iters: int) -> None:
+                         warmup: int, iters: int) -> TimingResult | None:
+    n = dist.get_world_size(group)
+    if n < 2:
+        return None
     rank = dist.get_rank()
-    world = dist.get_world_size(group)
-    # rank 0 sends to rank 1 (inside the group); group members are [0, 1]
-    members = [dist.get_global_rank(group, i) for i in range(world)]
-    sender = members[0]
-    recver = members[1]
-    t = _make_tensor(n_bytes, device="cpu")
+    members = [dist.get_global_rank(group, i) for i in range(n)]
+    sender, recver = members[0], members[1]
+    t = torch.zeros(n_bytes // 4, dtype=torch.float32)
 
     def fn():
         if rank == sender:
             dist.send(t, dst=recver, group=group)
         elif rank == recver:
             dist.recv(t, src=sender, group=group)
+        else:
+            pass  # idle ranks just wait at next barrier
 
-    label = f"Gloo send/recv (rank {sender}→{recver})"
-    _run(label, fn, n_bytes, warmup, iters)
-
-
-def bench_nccl_all_gather(group: dist.ProcessGroup, n_bytes: int,
-                            warmup: int, iters: int) -> None:
-    world = dist.get_world_size(group)
-    # Each rank holds a shard of size n_bytes/world; all_gather reassembles
-    shard_bytes = n_bytes // world
-    local = _make_tensor(shard_bytes, device="cuda")
-    shards = [torch.empty_like(local) for _ in range(world)]
-    label = f"NCCL all_gather (world={world}, shard={shard_bytes/1e6:.1f} MB)"
-    _run(label, lambda: dist.all_gather(shards, local.contiguous(), group=group),
-         n_bytes, warmup, iters)
-
-
-def bench_nccl_broadcast(group: dist.ProcessGroup, n_bytes: int, src: int,
-                           warmup: int, iters: int) -> None:
-    world = dist.get_world_size(group)
-    t = _make_tensor(n_bytes, device="cuda")
-    label = f"NCCL broadcast   (src={src}, world={world})"
-    _run(label, lambda: dist.broadcast(t, src=src, group=group), n_bytes, warmup, iters)
+    avg_ms = _cpu_timed(fn, warmup, iters, group)
+    return _result(f"Gloo  send/recv   ({sender}→{recver})", n_bytes, avg_ms, 1.0)
 
 
 def bench_nccl_all_reduce(group: dist.ProcessGroup, n_bytes: int,
-                            warmup: int, iters: int) -> None:
-    world = dist.get_world_size(group)
-    t = _make_tensor(n_bytes, device="cuda")
-    label = f"NCCL all_reduce  (world={world})"
-    _run(label, lambda: dist.all_reduce(t, group=group), n_bytes, warmup, iters)
+                            warmup: int, iters: int) -> TimingResult:
+    n = dist.get_world_size(group)
+    t = torch.zeros(n_bytes // 4, dtype=torch.float32, device="cuda")
+    avg_ms = _cuda_timed(lambda: dist.all_reduce(t, group=group), warmup, iters, group)
+    return _result(f"NCCL  all_reduce  (n={n})", n_bytes, avg_ms, 2 * (n - 1) / n)
+
+
+def bench_nccl_all_gather(group: dist.ProcessGroup, n_bytes: int,
+                            warmup: int, iters: int) -> TimingResult:
+    n = dist.get_world_size(group)
+    shard = torch.zeros(n_bytes // 4 // n, dtype=torch.float32, device="cuda")
+    out = [torch.empty_like(shard) for _ in range(n)]
+    avg_ms = _cuda_timed(
+        lambda: dist.all_gather(out, shard.contiguous(), group=group),
+        warmup, iters, group,
+    )
+    return _result(f"NCCL  all_gather  (n={n})", n_bytes, avg_ms, (n - 1) / n)
+
+
+def bench_nccl_reduce_scatter(group: dist.ProcessGroup, n_bytes: int,
+                                warmup: int, iters: int) -> TimingResult:
+    n = dist.get_world_size(group)
+    inp = torch.zeros(n_bytes // 4, dtype=torch.float32, device="cuda")
+    out = torch.zeros(n_bytes // 4 // n, dtype=torch.float32, device="cuda")
+    avg_ms = _cuda_timed(
+        lambda: dist.reduce_scatter_tensor(out, inp, group=group),
+        warmup, iters, group,
+    )
+    return _result(f"NCCL  reduce_scat (n={n})", n_bytes, avg_ms, (n - 1) / n)
+
+
+def bench_nccl_broadcast(group: dist.ProcessGroup, n_bytes: int,
+                           warmup: int, iters: int) -> TimingResult:
+    n = dist.get_world_size(group)
+    t = torch.zeros(n_bytes // 4, dtype=torch.float32, device="cuda")
+    avg_ms = _cuda_timed(lambda: dist.broadcast(t, src=0, group=group), warmup, iters, group)
+    return _result(f"NCCL  broadcast   (n={n})", n_bytes, avg_ms, (n - 1) / n)
+
+
+def bench_nccl_sendrecv(group: dist.ProcessGroup, n_bytes: int,
+                          warmup: int, iters: int) -> TimingResult | None:
+    n = dist.get_world_size(group)
+    if n < 2:
+        return None
+    rank = dist.get_rank()
+    members = [dist.get_global_rank(group, i) for i in range(n)]
+    sender, recver = members[0], members[1]
+    send_t = torch.zeros(n_bytes // 4, dtype=torch.float32, device="cuda")
+    recv_t = torch.zeros(n_bytes // 4, dtype=torch.float32, device="cuda")
+
+    def fn():
+        ops = []
+        if rank == sender:
+            ops.append(dist.P2POp(dist.isend, send_t, recver, group=group))
+        if rank == recver:
+            ops.append(dist.P2POp(dist.irecv, recv_t, sender, group=group))
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for r in reqs:
+                r.wait()
+
+    avg_ms = _cuda_timed(fn, warmup, iters, group)
+    return _result(f"NCCL  send/recv   ({sender}→{recver})", n_bytes, avg_ms, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Pretty print
+# ---------------------------------------------------------------------------
+
+def _print_header() -> None:
+    print(f"\n{'Operation':<38}  {'Size':>9}  {'Time':>9}  {'algbw':>9}  {'busbw':>9}")
+    print("-" * 82)
+
+
+def _print_result(r: TimingResult) -> None:
+    size_mb = r.n_bytes / 1e6
+    if size_mb < 1:
+        size_str = f"{r.n_bytes / 1024:.0f} KB"
+    elif size_mb < 1024:
+        size_str = f"{size_mb:.1f} MB"
+    else:
+        size_str = f"{size_mb / 1024:.2f} GB"
+    print(
+        f"  {r.label:<36}  {size_str:>9}  {r.avg_ms:>7.2f} ms"
+        f"  {r.algbw:>7.2f} GB/s  {r.busbw:>7.2f} GB/s"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -118,65 +208,74 @@ def bench_nccl_all_reduce(group: dist.ProcessGroup, n_bytes: int,
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument(
-        "--sizes-mb", nargs="+", type=float,
-        default=[1, 8, 32, 128, 512],
-        help="Payload sizes in MB to benchmark (default: 1 8 32 128 512)",
-    )
+    p.add_argument("--min-kb", type=float, default=256,
+                   help="Minimum payload size in KB (default: 256)")
+    p.add_argument("--max-gb", type=float, default=8.0,
+                   help="Maximum payload size in GB (default: 8)")
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iters", type=int, default=20)
+    p.add_argument("--skip-gloo", action="store_true",
+                   help="Skip Gloo benchmarks (much slower, skip for large sizes)")
     return p.parse_args()
+
+
+def _size_range(min_kb: float, max_gb: float) -> list[int]:
+    """Powers-of-4 sizes from min_kb to max_gb, aligned to float32."""
+    sizes: list[int] = []
+    n_bytes = int(min_kb * 1024)
+    max_bytes = int(max_gb * 1024 ** 3)
+    while n_bytes <= max_bytes:
+        aligned = (n_bytes // 4) * 4
+        if aligned > 0:
+            sizes.append(aligned)
+        n_bytes *= 4
+    return sizes
 
 
 def main() -> None:
     args = parse_args()
-    dist.init_process_group(backend="nccl")  # NCCL as default; Gloo groups created explicitly
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
 
+    dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    world = dist.get_world_size()
+    device = torch.device(f"cuda:{local_rank}")
 
-    if torch.cuda.is_available():
-        torch.cuda.set_device(rank % torch.cuda.device_count())
+    all_ranks = list(range(world))
+    gloo_group = dist.new_group(all_ranks, backend="gloo")
+    nccl_group = dist.new_group(all_ranks, backend="nccl")
 
     if rank == 0:
-        print(f"world_size={world_size}  GPUs available={torch.cuda.device_count()}")
+        gpu_name = torch.cuda.get_device_name(device)
+        print(f"world={world}  GPU={gpu_name}  device=cuda:{local_rank}")
+        print(f"sizes: {args.min_kb:.0f} KB → {args.max_gb:.0f} GB  "
+              f"warmup={args.warmup}  iters={args.iters}")
+        _print_header()
 
-    # Build groups (must be created on ALL ranks simultaneously)
-    all_ranks = list(range(world_size))
+    sizes = _size_range(args.min_kb, args.max_gb)
 
-    # Gloo groups (CPU comms)
-    gloo_group_all  = dist.new_group(all_ranks, backend="gloo")
+    for n_bytes in sizes:
+        results: list[TimingResult] = []
 
-    # NCCL groups (GPU comms)
-    nccl_group_all  = dist.new_group(all_ranks, backend="nccl")
+        if not args.skip_gloo:
+            results.append(bench_gloo_broadcast(gloo_group, n_bytes, args.warmup, args.iters))
+            r = bench_gloo_sendrecv(gloo_group, n_bytes, args.warmup, args.iters)
+            if r is not None:
+                results.append(r)
 
-    # For send/recv we need at least 2 ranks; skip if world_size==1
-    can_p2p = world_size >= 2
-
-    for size_mb in args.sizes_mb:
-        n_bytes = int(size_mb * 1e6)
-        # round to float32 element boundary
-        n_bytes = (n_bytes // 4) * 4
+        results.append(bench_nccl_all_reduce(nccl_group, n_bytes, args.warmup, args.iters))
+        results.append(bench_nccl_all_gather(nccl_group, n_bytes, args.warmup, args.iters))
+        results.append(bench_nccl_reduce_scatter(nccl_group, n_bytes, args.warmup, args.iters))
+        results.append(bench_nccl_broadcast(nccl_group, n_bytes, args.warmup, args.iters))
+        r = bench_nccl_sendrecv(nccl_group, n_bytes, args.warmup, args.iters)
+        if r is not None:
+            results.append(r)
 
         if rank == 0:
-            print(f"\n=== {size_mb:.0f} MB ===")
-
-        # --- Gloo CPU broadcast (all ranks) ---
-        bench_gloo_broadcast(gloo_group_all, n_bytes, src=0, warmup=args.warmup, iters=args.iters)
-
-        # --- Gloo CPU send/recv (rank 0 → rank 1) ---
-        if can_p2p:
-            bench_gloo_sendrecv(gloo_group_all, n_bytes, warmup=args.warmup, iters=args.iters)
-
-        # --- NCCL GPU broadcast (all ranks) ---
-        bench_nccl_broadcast(nccl_group_all, n_bytes, src=0, warmup=args.warmup, iters=args.iters)
-
-        # --- NCCL GPU all_gather (all ranks) ---
-        if world_size >= 2:
-            bench_nccl_all_gather(nccl_group_all, n_bytes, warmup=args.warmup, iters=args.iters)
-
-        # --- NCCL GPU all_reduce (all ranks) ---
-        bench_nccl_all_reduce(nccl_group_all, n_bytes, warmup=args.warmup, iters=args.iters)
+            for r in results:
+                _print_result(r)
+            print()
 
     dist.destroy_process_group()
 

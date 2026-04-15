@@ -29,6 +29,7 @@ from sae_lens.constants import (
 from sae_lens.llm_sae_training_runner import LanguageModelSAETrainingRunner
 from sae_lens.saes.sae import TrainStepInput, TrainStepOutput
 from sae_lens.saes.topk_sae import TopKTrainingSAE
+from sae_lens.training.multi_sae_trainer import MultiSAETrainer
 from sae_lens.training.sae_trainer import SAETrainer
 from tests.helpers import build_topk_sae_training_cfg, random_params
 
@@ -409,6 +410,229 @@ def test_sae_dp_mode_ddp_accepted_without_dist() -> None:
     assert cfg.sae_dp_mode == "ddp"
 
 
+def test_multi_hook_defaults_manual_to_ddp_without_dist() -> None:
+    assert not dist.is_initialized(), "dist must not be initialized for this test"
+    with pytest.warns(UserWarning, match="defaulting sae_dp_mode to 'ddp'"):
+        cfg = LanguageModelSAERunnerConfig(
+            sae=build_topk_sae_training_cfg(),
+            hook_names=[
+                "blocks.20.hook_resid_post",
+                "blocks.21.hook_resid_post",
+            ],
+        )
+    assert cfg.sae_dp_mode == "ddp"
+
+
+def test_multi_sae_trainer_ddp_mode_allows_dp1_without_dist() -> None:
+    assert not dist.is_initialized(), "dist must not be initialized for this test"
+    hook_names = ["blocks.20.hook_resid_post", "blocks.21.hook_resid_post"]
+    base_sae_by_hook = {hook_name: _make_sae() for hook_name in hook_names}
+    trainer = MultiSAETrainer(
+        hook_names=hook_names,
+        sae_by_hook=base_sae_by_hook,
+        base_sae_by_hook=base_sae_by_hook,
+        data_provider=iter(()),
+        save_checkpoint_fn=None,
+        cfg=_make_trainer_cfg(total_training_samples=4),
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+    batch_by_hook = {
+        hook_name: torch.randn(4, base_sae_by_hook[hook_name].cfg.d_in)
+        for hook_name in hook_names
+    }
+
+    outputs = trainer._train_step(batch_by_hook, local_n=4)
+
+    assert set(outputs) == set(hook_names)
+
+
+def test_multi_sae_trainer_token_weighting_only_for_ddp_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hook_names = ["blocks.20.hook_resid_post", "blocks.21.hook_resid_post"]
+    base_sae_by_hook = {hook_name: _make_sae() for hook_name in hook_names}
+    batch_by_hook = {
+        hook_name: torch.randn(4, base_sae_by_hook[hook_name].cfg.d_in)
+        for hook_name in hook_names
+    }
+
+    trainer = MultiSAETrainer(
+        hook_names=hook_names,
+        sae_by_hook=base_sae_by_hook,
+        base_sae_by_hook=base_sae_by_hook,
+        data_provider=iter(()),
+        save_checkpoint_fn=None,
+        cfg=_make_trainer_cfg(total_training_samples=4),
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+    all_reduce_sum_calls = mock.Mock(side_effect=trainer._all_reduce_sum)
+    monkeypatch.setattr(trainer, "_all_reduce_sum", all_reduce_sum_calls)
+    trainer._train_step(batch_by_hook, local_n=4)
+    non_weighted_calls = all_reduce_sum_calls.call_count
+
+    trainer_weighted = MultiSAETrainer(
+        hook_names=hook_names,
+        sae_by_hook=base_sae_by_hook,
+        base_sae_by_hook=base_sae_by_hook,
+        data_provider=iter(()),
+        save_checkpoint_fn=None,
+        cfg=_make_trainer_cfg(total_training_samples=4),
+        dp_group=None,
+        token_count_weighted_dp=True,
+        sae_dp_mode="ddp",
+    )
+    all_reduce_sum_calls_weighted = mock.Mock(side_effect=trainer_weighted._all_reduce_sum)
+    monkeypatch.setattr(trainer_weighted, "_all_reduce_sum", all_reduce_sum_calls_weighted)
+    trainer_weighted._train_step(batch_by_hook, local_n=4)
+    # Weighted mode performs one additional global-token all-reduce.
+    assert all_reduce_sum_calls_weighted.call_count == non_weighted_calls + 1
+
+
+def test_multi_sae_trainer_checkpoint_saves_per_hook_weights_without_dist(
+    tmp_path: Path,
+) -> None:
+    assert not dist.is_initialized(), "dist must not be initialized for this test"
+    hook_names = ["blocks.20.hook_resid_post", "blocks.21.hook_resid_post"]
+    base_sae_by_hook = {hook_name: _make_sae() for hook_name in hook_names}
+    cfg = _make_trainer_cfg(total_training_samples=4)
+    cfg.checkpoint_path = str(tmp_path)
+    trainer = MultiSAETrainer(
+        hook_names=hook_names,
+        sae_by_hook=base_sae_by_hook,
+        base_sae_by_hook=base_sae_by_hook,
+        data_provider=iter(()),
+        save_checkpoint_fn=None,
+        cfg=cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+    batch_by_hook = {
+        hook_name: torch.randn(4, base_sae_by_hook[hook_name].cfg.d_in)
+        for hook_name in hook_names
+    }
+    trainer._train_step(batch_by_hook, local_n=4)
+    trainer.n_training_samples = 4
+    trainer.n_training_steps = 1
+
+    trainer.save_checkpoint("4")
+
+    checkpoint_path = tmp_path / "4"
+    assert (checkpoint_path / "multi_sae_manifest.json").exists()
+    assert (checkpoint_path / TRAINER_STATE_FILENAME).exists()
+    for hook_name in hook_names:
+        hook_dir = checkpoint_path / hook_name.replace(".", "_")
+        assert (hook_dir / SAE_WEIGHTS_FILENAME).exists()
+        assert (hook_dir / "cfg.json").exists()
+
+    resumed_base_sae_by_hook = {hook_name: _make_sae() for hook_name in hook_names}
+    resumed = MultiSAETrainer(
+        hook_names=hook_names,
+        sae_by_hook=resumed_base_sae_by_hook,
+        base_sae_by_hook=resumed_base_sae_by_hook,
+        data_provider=iter(()),
+        save_checkpoint_fn=None,
+        cfg=cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+    resumed.load_trainer_state(checkpoint_path)
+    assert resumed.n_training_samples == 4
+    assert resumed.n_training_steps == 1
+
+
+def test_multi_sae_tp_rank_falls_back_to_distributed_v2(monkeypatch: pytest.MonkeyPatch) -> None:
+    hook_names = ["blocks.21.hook_resid_post"]
+    base_sae_by_hook = {hook_name: _make_sae() for hook_name in hook_names}
+    trainer = MultiSAETrainer(
+        hook_names=hook_names,
+        sae_by_hook=base_sae_by_hook,
+        base_sae_by_hook=base_sae_by_hook,
+        data_provider=iter(()),
+        save_checkpoint_fn=None,
+        cfg=_make_trainer_cfg(total_training_samples=4),
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+    assert getattr(base_sae_by_hook[hook_names[0]], "_tp_group", None) is None
+
+    import sae_lens.distributed_v2 as v2_mod
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(v2_mod, "_initialized", True)
+    monkeypatch.setattr(v2_mod, "is_consumer", lambda: True)
+    monkeypatch.setattr(v2_mod, "get_sae_tp_rank", lambda: 1)
+
+    assert trainer._tp_rank() == 1
+
+
+def test_multi_sae_metric_writer_uses_fallback_tp_rank(monkeypatch: pytest.MonkeyPatch) -> None:
+    hook_names = ["blocks.21.hook_resid_post"]
+    base_sae_by_hook = {hook_name: _make_sae() for hook_name in hook_names}
+    trainer = MultiSAETrainer(
+        hook_names=hook_names,
+        sae_by_hook=base_sae_by_hook,
+        base_sae_by_hook=base_sae_by_hook,
+        data_provider=iter(()),
+        save_checkpoint_fn=None,
+        cfg=_make_trainer_cfg(total_training_samples=4),
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+
+    import sae_lens.distributed_v2 as v2_mod
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(v2_mod, "_initialized", True)
+    monkeypatch.setattr(v2_mod, "is_consumer", lambda: True)
+    monkeypatch.setattr(v2_mod, "get_sae_tp_rank", lambda: 1)
+
+    # dp_rank defaults to 0 when dp_group is None, so writer gating depends on tp_rank.
+    assert trainer._is_metric_writer_rank() is False
+
+
+def test_multi_sae_global_timing_uses_local_writer_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hook_names = ["blocks.21.hook_resid_post"]
+    base_sae_by_hook = {hook_name: _make_sae() for hook_name in hook_names}
+    trainer = MultiSAETrainer(
+        hook_names=hook_names,
+        sae_by_hook=base_sae_by_hook,
+        base_sae_by_hook=base_sae_by_hook,
+        data_provider=iter(()),
+        save_checkpoint_fn=None,
+        cfg=_make_trainer_cfg(total_training_samples=4),
+        dp_group=mock.MagicMock(),
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+
+    all_gather_mock = mock.Mock(side_effect=AssertionError("all_gather should not be called"))
+    monkeypatch.setattr(dist, "all_gather", all_gather_mock)
+
+    timing = trainer._global_timing_if_needed(
+        vllm_step_time_s=1.0,
+        transfer_time_s=2.0,
+        sae_time_s=3.0,
+    )
+
+    assert timing["step_time_s"] == pytest.approx(6.0)
+    assert timing["vllm_step_time_s"] == pytest.approx(1.0)
+    assert timing["transfer_time_s"] == pytest.approx(2.0)
+    assert timing["sae_time_s"] == pytest.approx(3.0)
+    all_gather_mock.assert_not_called()
+
+
 def test_sae_dp_mode_ddp_rejects_compile_sae() -> None:
     with pytest.raises(ValueError, match="compile_sae"):
         LanguageModelSAERunnerConfig(
@@ -610,11 +834,15 @@ def test_resume_limits_producer_helper_loop_to_remaining_steps(tmp_path: Path) -
         training_tokens=64,
         context_size=4,
         store_batch_size_prompts=2,
+        train_batch_size_tokens=8,
+        n_batches_in_buffer=2,
+        activations_mixing_fraction=0.0,
         resume_from_checkpoint=str(checkpoint_path),
     )
     runner = object.__new__(LanguageModelSAETrainingRunner)
     runner.cfg = cfg
     runner.vllm_dp_size = 2
+    runner.sae_dp_size = 1
     runner.activations_store = mock.MagicMock()
     runner.activations_store.training_context_size = 4
     runner.activations_store._run_producer_phase2_v2.return_value = ({}, {})
@@ -623,6 +851,30 @@ def test_resume_limits_producer_helper_loop_to_remaining_steps(tmp_path: Path) -
 
     assert runner.activations_store._run_producer_phase2_v2.call_count == 2
     assert runner.activations_store._run_nccl_p2p_exchange_v2.call_count == 2
+
+
+def test_producer_helper_loop_accounts_for_mixing_buffer_retained_samples() -> None:
+    cfg = LanguageModelSAERunnerConfig(
+        sae=build_topk_sae_training_cfg(),
+        training_tokens=196608,
+        context_size=2048,
+        store_batch_size_prompts=4,
+        train_batch_size_tokens=2048,
+        n_batches_in_buffer=2,
+        activations_mixing_fraction=0.5,
+    )
+    runner = object.__new__(LanguageModelSAETrainingRunner)
+    runner.cfg = cfg
+    runner.vllm_dp_size = 1
+    runner.sae_dp_size = 1
+    runner.activations_store = mock.MagicMock()
+    runner.activations_store.training_context_size = 2048
+    runner.activations_store._run_producer_phase2_v2.return_value = ({}, {})
+
+    runner._run_producer_helper_loop_v2()
+
+    assert runner.activations_store._run_producer_phase2_v2.call_count == 25
+    assert runner.activations_store._run_nccl_p2p_exchange_v2.call_count == 25
 
 
 def test_train_step_enters_wrapped_sae_not_base_training_forward_pass() -> None:
@@ -686,6 +938,26 @@ def test_trainer_base_sae_equals_sae_in_manual_mode() -> None:
     trainer = SAETrainer(cfg=_make_trainer_cfg(), sae=sae, data_provider=data_provider)
     assert trainer.base_sae is sae
     assert trainer._base_sae is sae
+
+
+def test_sae_trainer_metric_writer_falls_back_to_distributed_v2_tp_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sae = _make_sae()
+    data_provider = mock.MagicMock()
+    data_provider.consume_last_data_timing = None
+    trainer = SAETrainer(cfg=_make_trainer_cfg(), sae=sae, data_provider=data_provider)
+    assert getattr(sae, "_tp_group", None) is None
+
+    import sae_lens.distributed_v2 as v2_mod
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(v2_mod, "_initialized", True)
+    monkeypatch.setattr(v2_mod, "is_consumer", lambda: True)
+    monkeypatch.setattr(v2_mod, "get_sae_tp_rank", lambda: 1)
+
+    assert trainer._is_metric_writer_rank() is False
 
 
 def test_ddp_single_step_matches_full_batch_reference_and_saves_base_keys(
