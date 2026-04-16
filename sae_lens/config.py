@@ -309,11 +309,59 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     exclude_special_tokens: bool | list[int] = False
     sae_dp_mode: Literal["manual", "ddp", "fsdp"] = "manual"
     multi_sae_backward_mode: Literal["combined", "sequential"] = "combined"
+    multi_sae_backward_order: Literal["forward", "reverse", "largest_first"] = (
+        "forward"
+    )
+    multi_sae_stats_sync_mode: Literal["immediate", "deferred", "periodic"] = (
+        "immediate"
+    )
+    multi_sae_stats_sync_interval: int = 1
     multi_sae_seed_mode: Literal["same", "offset"] = "same"
+    ddp_broadcast_buffers: bool | None = None
+    ddp_find_unused_parameters: bool | None = None
+    ddp_gradient_as_bucket_view: bool | None = None
+    ddp_static_graph: bool | None = None
+    ddp_bucket_cap_mb: int | None = None
+    ddp_config_strict: bool = False
+
+    # Streaming mode (v1): vLLM and SAE on separate GPU sets, communicate via /dev/shm.
+    # sae_dp > 1 is NOT supported in v1 (independent acquire_up_to() calls diverge
+    # at stream tail, causing DDP AllReduce hangs).
+    streaming_mode: bool = False
+    streaming_chunk_size_tokens: int = 4096
+    streaming_num_chunks: int = 32
+    streaming_prefetch_chunks: int = 2
+    streaming_buffer_name: str = ""  # auto-generated unique name if empty
+    streaming_shuffle: bool = True
+    streaming_random_chunks: bool = True
 
     def __post_init__(self):
         if self.multi_sae_seed_mode not in ("same", "offset"):
             raise ValueError("multi_sae_seed_mode must be 'same' or 'offset'")
+        if self.multi_sae_backward_order not in ("forward", "reverse", "largest_first"):
+            raise ValueError(
+                "multi_sae_backward_order must be 'forward', 'reverse', or 'largest_first'"
+            )
+        if self.multi_sae_stats_sync_mode not in ("immediate", "deferred", "periodic"):
+            raise ValueError(
+                "multi_sae_stats_sync_mode must be 'immediate', 'deferred', or 'periodic'"
+            )
+        if self.multi_sae_stats_sync_interval < 1:
+            raise ValueError("multi_sae_stats_sync_interval must be >= 1")
+        if self.ddp_bucket_cap_mb is not None and self.ddp_bucket_cap_mb <= 0:
+            raise ValueError("ddp_bucket_cap_mb must be > 0 when set")
+        if self.streaming_mode:
+            if self.hook_names is not None and len(self.hook_names) > 1:
+                raise ValueError(
+                    "streaming_mode v1 supports only a single hook "
+                    "(hook_names must be None or length 1)."
+                )
+            if self.streaming_prefetch_chunks < 1:
+                raise ValueError("streaming_prefetch_chunks must be >= 1.")
+            if self.streaming_num_chunks <= self.streaming_prefetch_chunks:
+                raise ValueError(
+                    "streaming_num_chunks must be > streaming_prefetch_chunks."
+                )
         if self.hook_names is not None:
             self.hook_names = list(dict.fromkeys(self.hook_names))
             if len(self.hook_names) == 0:
@@ -520,6 +568,9 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             save_mse_every_n_steps=self.save_mse_every_n_steps,
             save_timing_every_n_steps=self.save_timing_every_n_steps,
             synchronize_timing=self.synchronize_timing,
+            multi_sae_backward_order=self.multi_sae_backward_order,
+            multi_sae_stats_sync_mode=self.multi_sae_stats_sync_mode,
+            multi_sae_stats_sync_interval=self.multi_sae_stats_sync_interval,
             total_training_samples=self.total_training_tokens,
             device=self.device,
             autocast=self.autocast,
@@ -756,6 +807,9 @@ class SAETrainerConfig:
     save_mse_every_n_steps: int
     save_timing_every_n_steps: int
     synchronize_timing: bool
+    multi_sae_backward_order: Literal["forward", "reverse", "largest_first"]
+    multi_sae_stats_sync_mode: Literal["immediate", "deferred", "periodic"]
+    multi_sae_stats_sync_interval: int
     total_training_samples: int
     device: str
     autocast: bool

@@ -47,3 +47,29 @@ def nccl_nvtx_range(
         if pushed:
             with suppress(Exception):
                 torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
+def cuda_nvtx_range(message: str) -> Iterator[None]:
+    """Emit a CUDA NVTX range when CUDA is available.
+
+    Unlike `nccl_nvtx_range`, this is not tied to a process-group backend and is
+    suitable for compute-only sections (forward/clip/optimizer phases).
+    """
+    if not torch.cuda.is_available():
+        yield
+        return
+
+    pushed = False
+    try:
+        torch.cuda.nvtx.range_push(message)
+        pushed = True
+    except Exception:
+        pushed = False
+
+    try:
+        yield
+    finally:
+        if pushed:
+            with suppress(Exception):
+                torch.cuda.nvtx.range_pop()

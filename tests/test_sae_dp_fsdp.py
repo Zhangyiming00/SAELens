@@ -70,6 +70,9 @@ def _make_trainer_cfg(
         save_mse_every_n_steps=0,
         save_timing_every_n_steps=0,
         synchronize_timing=False,
+        multi_sae_backward_order="forward",
+        multi_sae_stats_sync_mode="immediate",
+        multi_sae_stats_sync_interval=1,
         lr=1e-3,
         lr_end=1e-4,
         lr_scheduler_name="constant",
@@ -443,7 +446,7 @@ def test_multi_sae_trainer_ddp_mode_allows_dp1_without_dist() -> None:
         for hook_name in hook_names
     }
 
-    outputs = trainer._train_step(batch_by_hook, local_n=4)
+    outputs, _ = trainer._train_step(batch_by_hook, local_n=4)
 
     assert set(outputs) == set(hook_names)
 

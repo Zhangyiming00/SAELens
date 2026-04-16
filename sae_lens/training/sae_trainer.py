@@ -126,6 +126,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self.n_training_steps: int = 0
         self.n_training_samples: int = 0
         self.started_fine_tuning: bool = False
+        self._t_ready: float = time.time()
         self.mse_history_path: Path | None = None
         self.timing_history_path: Path | None = None
 
@@ -244,6 +245,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
         # Train loop
         while self.n_training_samples < self.cfg.total_training_samples:
+            step_wall_t0 = time.perf_counter()
             # Do a training step.
             if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
                 _debug_prefix_tp(
@@ -277,6 +279,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 vllm_step_time_s=vllm_step_time_s,
                 transfer_time_s=transfer_time_s,
                 sae_time_s=sae_time_s,
+                wall_time_s=time.perf_counter() - step_wall_t0,
             )
             self._checkpoint_if_needed()
             self.n_training_steps += 1
@@ -797,6 +800,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         vllm_step_time_s: float,
         transfer_time_s: float,
         sae_time_s: float,
+        wall_time_s: float = 0.0,
     ) -> None:
         if self.timing_history_path is None:
             return
@@ -807,6 +811,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         record = {
             "step": self.n_training_steps + 1,
             "n_training_samples": self.n_training_samples,
+            "elapsed_s": time.time() - self._t_ready,
+            "wall_time_s": wall_time_s,
             "vllm_step_time_s": vllm_step_time_s,
             "transfer_time_s": transfer_time_s,
             "data_time_s": data_time_s,

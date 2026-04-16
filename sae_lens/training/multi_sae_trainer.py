@@ -6,7 +6,7 @@ import math
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -25,7 +25,7 @@ from sae_lens.constants import (
     TIMING_HISTORY_FILENAME,
     TRAINER_STATE_FILENAME,
 )
-from sae_lens.profiling import nccl_nvtx_range
+from sae_lens.profiling import cuda_nvtx_range, nccl_nvtx_range
 from sae_lens.saes.sae import TrainingSAE, TrainStepInput, TrainStepOutput
 from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.optim import get_lr_scheduler
@@ -74,6 +74,15 @@ class MultiSAETrainer:
         self.sae_dp_mode = sae_dp_mode
         self.backward_mode = backward_mode
         self.seed_mode = seed_mode
+        self.backward_order: Literal["forward", "reverse", "largest_first"] = (
+            getattr(cfg, "multi_sae_backward_order", "forward")
+        )
+        self.stats_sync_mode: Literal["immediate", "deferred", "periodic"] = getattr(
+            cfg, "multi_sae_stats_sync_mode", "immediate"
+        )
+        self.stats_sync_interval: int = int(
+            getattr(cfg, "multi_sae_stats_sync_interval", 1)
+        )
         self._is_fsdp = sae_dp_mode == "fsdp"
         self._is_ddp = sae_dp_mode == "ddp"
         if not (self._is_fsdp or self._is_ddp):
@@ -82,6 +91,16 @@ class MultiSAETrainer:
             raise ValueError("MultiSAETrainer with FSDP requires a DP process group")
         if self.backward_mode not in ("combined", "sequential"):
             raise ValueError("backward_mode must be 'combined' or 'sequential'")
+        if self.backward_order not in ("forward", "reverse", "largest_first"):
+            raise ValueError(
+                "multi_sae_backward_order must be 'forward', 'reverse', or 'largest_first'"
+            )
+        if self.stats_sync_mode not in ("immediate", "deferred", "periodic"):
+            raise ValueError(
+                "multi_sae_stats_sync_mode must be 'immediate', 'deferred', or 'periodic'"
+            )
+        if self.stats_sync_interval < 1:
+            raise ValueError("multi_sae_stats_sync_interval must be >= 1")
 
         params: list[torch.nn.Parameter] = []
         for hook_name in self.hook_names:
@@ -131,9 +150,32 @@ class MultiSAETrainer:
         self.n_frac_active_samples_by_hook = {
             hook_name: 0 for hook_name in self.hook_names
         }
+        self._pending_did_fire_max_by_hook = {
+            hook_name: torch.zeros(
+                self.base_sae_by_hook[hook_name].cfg.d_sae,
+                device=cfg.device,
+                dtype=torch.int32,
+            )
+            for hook_name in self.hook_names
+        }
+        self._pending_sample_count_by_hook = {
+            hook_name: 0.0 for hook_name in self.hook_names
+        }
+        self._pending_step_count_by_hook = {
+            hook_name: 0 for hook_name in self.hook_names
+        }
+        self._trainable_param_bytes_by_hook = {
+            hook_name: sum(
+                p.numel() * p.element_size()
+                for p in self.base_sae_by_hook[hook_name].parameters()
+                if p.requires_grad
+            )
+            for hook_name in self.hook_names
+        }
 
         self.n_training_steps = 0
         self.n_training_samples = 0
+        self._t_ready: float = time.time()
         self.mse_history_path: Path | None = None
         self.timing_history_path: Path | None = None
         self.checkpoint_thresholds: list[int] = []
@@ -251,8 +293,10 @@ class MultiSAETrainer:
     def fit(self) -> dict[str, TrainingSAE[Any]]:
         pbar = tqdm(total=self.cfg.total_training_samples, desc="Training Multi SAE")
         while self.n_training_samples < self.cfg.total_training_samples:
+            step_wall_t0 = time.perf_counter()
             self._maybe_synchronize_timing()
-            batch_by_hook = next(self.data_provider)
+            with cuda_nvtx_range("multi_sae:data_fetch"):
+                batch_by_hook = next(self.data_provider)
             if not isinstance(batch_by_hook, dict):
                 raise TypeError(
                     "MultiSAETrainer expected data_provider to yield dict batches"
@@ -274,7 +318,8 @@ class MultiSAETrainer:
 
             self._maybe_synchronize_timing()
             sae_t0 = time.perf_counter()
-            outputs, sae_phase_timing = self._train_step(scaled_batch_by_hook, local_n)
+            with cuda_nvtx_range("multi_sae:train_step"):
+                outputs, sae_phase_timing = self._train_step(scaled_batch_by_hook, local_n)
             self._maybe_synchronize_timing()
             sae_time_s = time.perf_counter() - sae_t0
 
@@ -285,6 +330,7 @@ class MultiSAETrainer:
                 vllm_step_time_s=vllm_step_time_s,
                 transfer_time_s=transfer_time_s,
                 sae_time_s=sae_time_s,
+                wall_time_s=time.perf_counter() - step_wall_t0,
             )
             self._record_timing_if_needed(
                 **timing,
@@ -303,6 +349,8 @@ class MultiSAETrainer:
                 )
 
         pbar.close()
+        # Ensure periodic/deferred stats are flushed before final save/logging.
+        self._sync_deferred_stats_if_needed(force=True)
         if self.cfg.save_final_checkpoint:
             self.save_checkpoint(checkpoint_name=f"final_{self.n_training_samples}")
         return self.base_sae_by_hook
@@ -361,6 +409,8 @@ class MultiSAETrainer:
         phase_timing: dict[str, float],
     ) -> tuple[dict[str, TrainStepOutput], dict[str, float]]:
         outputs: dict[str, TrainStepOutput] = {}
+        scaled_loss_by_hook: dict[str, torch.Tensor] = {}
+        # Phase A: run forward for all hooks first.
         for hook_name in self.hook_names:
             acts = batch_by_hook[hook_name]
             if local_n == 0:
@@ -371,44 +421,59 @@ class MultiSAETrainer:
                     dtype=acts.dtype,
                 )
                 t_fwd = time.perf_counter()
-                output = self._forward_one(hook_name, dummy)
+                with cuda_nvtx_range(f"multi_sae:{hook_name}:forward"):
+                    output = self._forward_one(hook_name, dummy)
                 phase_timing["sae_forward_time_s"] += time.perf_counter() - t_fwd
                 outputs[hook_name] = output
-                scaled_loss = output.loss * 0.0
+                scaled_loss_by_hook[hook_name] = output.loss * 0.0
             else:
                 t_fwd = time.perf_counter()
-                output = self._forward_one(hook_name, acts)
+                with cuda_nvtx_range(f"multi_sae:{hook_name}:forward"):
+                    output = self._forward_one(hook_name, acts)
                 phase_timing["sae_forward_time_s"] += time.perf_counter() - t_fwd
                 outputs[hook_name] = output
                 t_stats = time.perf_counter()
-                self._update_stats(hook_name, output, local_n)
+                with cuda_nvtx_range(f"multi_sae:{hook_name}:stats_sync"):
+                    self._update_stats(hook_name, output, local_n)
                 phase_timing["sae_stats_sync_time_s"] += time.perf_counter() - t_stats
                 # SAE parameters are disjoint across hooks, so summing per-layer
                 # losses gives the same per-parameter gradients as independent
                 # single-layer training. Dividing by num_layers changes gradient
                 # clipping behavior and breaks equivalence.
-                scaled_loss = output.loss * loss_scale
+                scaled_loss_by_hook[hook_name] = output.loss * loss_scale
 
+        # Phase B: run backward in configured order.
+        for hook_name in self._ordered_hook_names_for_backward():
             t_bwd = time.perf_counter()
             with nccl_nvtx_range(
                 f"nccl:multi_sae_{self.sae_dp_mode}_backward", self.dp_group
             ):
-                self.grad_scaler.scale(scaled_loss).backward()
+                with cuda_nvtx_range(f"multi_sae:{hook_name}:backward"):
+                    self.grad_scaler.scale(scaled_loss_by_hook[hook_name]).backward()
             phase_timing["sae_backward_time_s"] += time.perf_counter() - t_bwd
 
         t_post = time.perf_counter()
-        self.grad_scaler.unscale_(self.optimizer)
+        with cuda_nvtx_range("multi_sae:optimizer_unscale"):
+            self.grad_scaler.unscale_(self.optimizer)
         for hook_name in self.hook_names:
             base_sae = self.base_sae_by_hook[hook_name]
-            base_sae.sync_tensor_parallel_gradients()
-            base_sae.clip_grad_norm_(
-                1.0,
-                dp_group=self.dp_group if self._is_fsdp else None,
-            )
+            with cuda_nvtx_range(f"multi_sae:{hook_name}:tp_sync"):
+                base_sae.sync_tensor_parallel_gradients()
+            with cuda_nvtx_range(f"multi_sae:{hook_name}:clip_grad"):
+                base_sae.clip_grad_norm_(
+                    1.0,
+                    dp_group=self.dp_group if self._is_fsdp else None,
+                )
         phase_timing["sae_post_backward_time_s"] += time.perf_counter() - t_post
         t_opt = time.perf_counter()
-        self.grad_scaler.step(self.optimizer)
-        self.grad_scaler.update()
+        with cuda_nvtx_range("multi_sae:optimizer_step"):
+            self.grad_scaler.step(self.optimizer)
+        with cuda_nvtx_range("multi_sae:scaler_update"):
+            self.grad_scaler.update()
+        t_stats = time.perf_counter()
+        with cuda_nvtx_range("multi_sae:stats_sync_tail"):
+            self._sync_deferred_stats_if_needed(force=False)
+        phase_timing["sae_stats_sync_time_s"] += time.perf_counter() - t_stats
         phase_timing["sae_optimizer_time_s"] += time.perf_counter() - t_opt
         return outputs, phase_timing
 
@@ -431,17 +496,20 @@ class MultiSAETrainer:
                     dtype=acts.dtype,
                 )
                 t_fwd = time.perf_counter()
-                output = self._forward_one(hook_name, dummy)
+                with cuda_nvtx_range(f"multi_sae:{hook_name}:forward"):
+                    output = self._forward_one(hook_name, dummy)
                 phase_timing["sae_forward_time_s"] += time.perf_counter() - t_fwd
                 outputs[hook_name] = output
                 scaled_losses.append(output.loss * 0.0)
             else:
                 t_fwd = time.perf_counter()
-                output = self._forward_one(hook_name, acts)
+                with cuda_nvtx_range(f"multi_sae:{hook_name}:forward"):
+                    output = self._forward_one(hook_name, acts)
                 phase_timing["sae_forward_time_s"] += time.perf_counter() - t_fwd
                 outputs[hook_name] = output
                 t_stats = time.perf_counter()
-                self._update_stats(hook_name, output, local_n)
+                with cuda_nvtx_range(f"multi_sae:{hook_name}:stats_sync"):
+                    self._update_stats(hook_name, output, local_n)
                 phase_timing["sae_stats_sync_time_s"] += time.perf_counter() - t_stats
                 scaled_losses.append(output.loss * loss_scale)
 
@@ -450,22 +518,32 @@ class MultiSAETrainer:
         with nccl_nvtx_range(
             f"nccl:multi_sae_{self.sae_dp_mode}_combined_backward", self.dp_group
         ):
-            self.grad_scaler.scale(total_loss).backward()
+            with cuda_nvtx_range("multi_sae:combined_backward"):
+                self.grad_scaler.scale(total_loss).backward()
         phase_timing["sae_backward_time_s"] += time.perf_counter() - t_bwd
 
         t_post = time.perf_counter()
-        self.grad_scaler.unscale_(self.optimizer)
+        with cuda_nvtx_range("multi_sae:optimizer_unscale"):
+            self.grad_scaler.unscale_(self.optimizer)
         for hook_name in self.hook_names:
             base_sae = self.base_sae_by_hook[hook_name]
-            base_sae.sync_tensor_parallel_gradients()
-            base_sae.clip_grad_norm_(
-                1.0,
-                dp_group=self.dp_group if self._is_fsdp else None,
-            )
+            with cuda_nvtx_range(f"multi_sae:{hook_name}:tp_sync"):
+                base_sae.sync_tensor_parallel_gradients()
+            with cuda_nvtx_range(f"multi_sae:{hook_name}:clip_grad"):
+                base_sae.clip_grad_norm_(
+                    1.0,
+                    dp_group=self.dp_group if self._is_fsdp else None,
+                )
         phase_timing["sae_post_backward_time_s"] += time.perf_counter() - t_post
         t_opt = time.perf_counter()
-        self.grad_scaler.step(self.optimizer)
-        self.grad_scaler.update()
+        with cuda_nvtx_range("multi_sae:optimizer_step"):
+            self.grad_scaler.step(self.optimizer)
+        with cuda_nvtx_range("multi_sae:scaler_update"):
+            self.grad_scaler.update()
+        t_stats = time.perf_counter()
+        with cuda_nvtx_range("multi_sae:stats_sync_tail"):
+            self._sync_deferred_stats_if_needed(force=False)
+        phase_timing["sae_stats_sync_time_s"] += time.perf_counter() - t_stats
         phase_timing["sae_optimizer_time_s"] += time.perf_counter() - t_opt
         return outputs, phase_timing
 
@@ -491,6 +569,22 @@ class MultiSAETrainer:
             with context:
                 return self.sae_by_hook[hook_name](step_input)
 
+    def _ordered_hook_names_for_backward(self) -> list[str]:
+        if self.backward_order == "forward":
+            return list(self.hook_names)
+        if self.backward_order == "reverse":
+            return list(reversed(self.hook_names))
+        if self.backward_order == "largest_first":
+            idx_by_hook = {hook_name: idx for idx, hook_name in enumerate(self.hook_names)}
+            return sorted(
+                self.hook_names,
+                key=lambda hook_name: (
+                    -self._trainable_param_bytes_by_hook[hook_name],
+                    idx_by_hook[hook_name],
+                ),
+            )
+        return list(self.hook_names)
+
     @torch.no_grad()
     def _update_stats(
         self, hook_name: str, output: TrainStepOutput, local_n: int
@@ -499,15 +593,89 @@ class MultiSAETrainer:
         did_fire = firing_feats.sum(-2).bool()
         if did_fire.is_sparse:
             did_fire = did_fire.to_dense()
-        did_fire_int = did_fire.to(torch.int32)
-        self._all_reduce_max(did_fire_int)
-        did_fire = did_fire_int.bool()
-        self.n_forward_passes_since_fired_by_hook[hook_name] += 1
-        self.n_forward_passes_since_fired_by_hook[hook_name][did_fire] = 0
+        did_fire_int = did_fire.to(torch.int32).contiguous()
         self.act_freq_scores_by_hook[hook_name] += firing_feats.sum(0)
-        local_n_t = torch.tensor(float(local_n), device=self.cfg.device)
-        self._all_reduce_sum(local_n_t)
-        self.n_frac_active_samples_by_hook[hook_name] += int(local_n_t.item())
+        if self.stats_sync_mode == "immediate":
+            self._apply_stats_from_global(
+                hook_name=hook_name,
+                global_did_fire_int=self._all_reduce_max(did_fire_int),
+                global_sample_count=float(
+                    self._all_reduce_sum(
+                        torch.tensor(float(local_n), device=self.cfg.device)
+                    ).item()
+                ),
+                step_increment=1,
+            )
+            return
+
+        # Deferred/periodic path: accumulate locally and reduce later.
+        self._pending_did_fire_max_by_hook[hook_name] = torch.maximum(
+            self._pending_did_fire_max_by_hook[hook_name],
+            did_fire_int,
+        )
+        self._pending_sample_count_by_hook[hook_name] += float(local_n)
+        self._pending_step_count_by_hook[hook_name] += 1
+
+    @torch.no_grad()
+    def _apply_stats_from_global(
+        self,
+        *,
+        hook_name: str,
+        global_did_fire_int: torch.Tensor,
+        global_sample_count: float,
+        step_increment: int,
+    ) -> None:
+        did_fire = global_did_fire_int.bool()
+        self.n_forward_passes_since_fired_by_hook[hook_name] += step_increment
+        self.n_forward_passes_since_fired_by_hook[hook_name][did_fire] = 0
+        self.n_frac_active_samples_by_hook[hook_name] += int(global_sample_count)
+
+    @torch.no_grad()
+    def _sync_deferred_stats_if_needed(self, *, force: bool) -> None:
+        if self.stats_sync_mode == "immediate":
+            return
+
+        if self.stats_sync_mode == "periodic" and not force:
+            if (self.n_training_steps + 1) % self.stats_sync_interval != 0:
+                return
+
+        hooks_to_sync = [
+            hook_name
+            for hook_name in self.hook_names
+            if self._pending_step_count_by_hook[hook_name] > 0
+        ]
+        if not hooks_to_sync:
+            return
+
+        did_fire_stack = torch.stack(
+            [self._pending_did_fire_max_by_hook[hook_name] for hook_name in hooks_to_sync],
+            dim=0,
+        )
+        sample_count_stack = torch.tensor(
+            [self._pending_sample_count_by_hook[hook_name] for hook_name in hooks_to_sync],
+            device=self.cfg.device,
+            dtype=torch.float32,
+        )
+        step_count_by_hook = {
+            hook_name: self._pending_step_count_by_hook[hook_name]
+            for hook_name in hooks_to_sync
+        }
+
+        with nccl_nvtx_range("nccl:multi_sae_stats_batched_max", self.dp_group):
+            self._all_reduce_max(did_fire_stack)
+        with nccl_nvtx_range("nccl:multi_sae_stats_batched_sum", self.dp_group):
+            self._all_reduce_sum(sample_count_stack)
+
+        for idx, hook_name in enumerate(hooks_to_sync):
+            self._apply_stats_from_global(
+                hook_name=hook_name,
+                global_did_fire_int=did_fire_stack[idx],
+                global_sample_count=float(sample_count_stack[idx].item()),
+                step_increment=step_count_by_hook[hook_name],
+            )
+            self._pending_did_fire_max_by_hook[hook_name].zero_()
+            self._pending_sample_count_by_hook[hook_name] = 0.0
+            self._pending_step_count_by_hook[hook_name] = 0
 
     def save_final(self, output_path: str) -> None:
         base_output = Path(output_path)
@@ -531,6 +699,9 @@ class MultiSAETrainer:
             "shared_hyperparams": True,
             "sae_dp_mode": self.sae_dp_mode,
             "backward_mode": self.backward_mode,
+            "backward_order": self.backward_order,
+            "stats_sync_mode": self.stats_sync_mode,
+            "stats_sync_interval": self.stats_sync_interval,
             "seed_mode": self.seed_mode,
         }
 
@@ -654,6 +825,9 @@ class MultiSAETrainer:
                 "lr_scheduler": self.lr_scheduler.state_dict(),
                 "sae_dp_mode": self.sae_dp_mode,
                 "backward_mode": self.backward_mode,
+                "backward_order": self.backward_order,
+                "stats_sync_mode": self.stats_sync_mode,
+                "stats_sync_interval": self.stats_sync_interval,
                 "seed_mode": self.seed_mode,
             },
             checkpoint_path / TRAINER_STATE_FILENAME,
@@ -828,6 +1002,7 @@ class MultiSAETrainer:
         vllm_step_time_s: float,
         transfer_time_s: float,
         sae_time_s: float,
+        wall_time_s: float = 0.0,
     ) -> dict[str, float]:
         data_time_s = vllm_step_time_s + transfer_time_s
         step_time_s = data_time_s + sae_time_s
@@ -842,6 +1017,7 @@ class MultiSAETrainer:
             "dp_allreduce_time_s": 0.0,
             "sae_time_s": sae_time_s,
             "step_time_s": step_time_s,
+            "wall_time_s": wall_time_s,
         }
 
     def _should_record_mse_step(self) -> bool:
@@ -920,6 +1096,7 @@ class MultiSAETrainer:
         vllm_time_s: float,
         sae_time_s: float,
         step_time_s: float,
+        wall_time_s: float = 0.0,
         dp_allreduce_time_s: float = 0.0,
         sae_forward_time_s: float = 0.0,
         sae_stats_sync_time_s: float = 0.0,
@@ -932,6 +1109,8 @@ class MultiSAETrainer:
         record = {
             "step": self.n_training_steps + 1,
             "n_training_samples": self.n_training_samples,
+            "elapsed_s": time.time() - self._t_ready,
+            "wall_time_s": wall_time_s,
             "vllm_step_time_s": vllm_step_time_s,
             "transfer_time_s": transfer_time_s,
             "data_time_s": data_time_s,

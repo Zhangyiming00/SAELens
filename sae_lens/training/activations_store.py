@@ -755,6 +755,111 @@ class ActivationsStore:
             return activations_by_hook
         return activations_by_hook[self.hook_name]
 
+    def get_streaming_activations(
+        self, chunk_size_tokens: int
+    ) -> tuple[torch.Tensor | None, int]:
+        """Gather up to chunk_size_tokens activations for streaming_mode v1.
+
+        ALL vLLM TP ranks must call this together.
+        Under external_launcher (torchrun TP), each rank has its own LLM instance
+        and all ranks call generate() simultaneously; TP all-gathers happen inside
+        vLLM (HookedVLLMModel.run_with_cache calls dist.all_gather for sharded hooks).
+        Therefore non-root ranks must participate in every inference call.
+
+        Internal protocol (three phases per batch iteration):
+
+          Phase A: root decides whether to run another batch (ctrl broadcast).
+                   Root fetches batch_tokens from the dataset; on StopIteration or
+                   when enough tokens accumulated, broadcasts ctrl=0 to signal stop.
+          Phase B: root broadcasts batch_tokens to non-root ranks (CUDA tensor).
+                   Only reached when ctrl=1.
+          Phase C: ALL TP ranks call _get_activations_local(batch_tokens) together.
+
+        Returns:
+            (acts_cpu, valid_tokens) on TP root — shape (<=chunk_size_tokens, d_model).
+            (None, 0) on TP non-root ranks (always).
+            (None, 0) on TP root when dataset is exhausted.
+        """
+        import os
+
+        import sae_lens.distributed_streaming as ds
+
+        tp_group = ds.get_vllm_tp_group()
+        tp_root_world = ds.get_producer_tp_root()
+        is_root = ds.is_vllm_tp_root()
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        ctrl_dev = torch.device(f"cuda:{local_rank}")
+        ctrl = torch.zeros(1, dtype=torch.int32, device=ctrl_dev)
+
+        if is_root and not hasattr(self, "_stream_residual"):
+            self._stream_residual: torch.Tensor | None = None
+            self._stream_exhausted = False
+
+        if is_root:
+            collected: list[torch.Tensor] = []
+            if self._stream_residual is not None:
+                collected.append(self._stream_residual)
+                self._stream_residual = None
+            tokens_so_far = sum(t.shape[0] for t in collected)
+
+        while True:
+            # Phase A: root decides; broadcasts ctrl to all TP ranks
+            if is_root:
+                if self._stream_exhausted or tokens_so_far >= chunk_size_tokens:
+                    ctrl[0] = 0
+                else:
+                    try:
+                        batch_tokens = self._get_batch_tokens_local(
+                            self.store_batch_size_prompts
+                        )
+                        ctrl[0] = 1
+                    except StopIteration:
+                        self._stream_exhausted = True
+                        ctrl[0] = 0
+            if tp_group is not None:
+                dist.broadcast(ctrl, src=tp_root_world, group=tp_group)
+            if int(ctrl[0]) == 0:
+                break  # all TP ranks exit together
+
+            # Phase B: broadcast batch_tokens to non-root ranks
+            # Shape is (store_batch_size_prompts, context_size) — fixed config values.
+            if tp_group is not None:
+                if not is_root:
+                    batch_tokens = torch.zeros(
+                        self.store_batch_size_prompts,
+                        self.context_size,
+                        dtype=torch.long,
+                        device=ctrl_dev,
+                    )
+                batch_tokens_cuda = batch_tokens.to(ctrl_dev)
+                dist.broadcast(batch_tokens_cuda, src=tp_root_world, group=tp_group)
+                batch_tokens = batch_tokens_cuda
+
+            # Phase C: ALL TP ranks call inference together
+            acts = self._get_activations_local(batch_tokens)
+
+            if is_root:
+                if isinstance(acts, dict):
+                    acts = next(iter(acts.values()))
+                if acts.ndim == 3:
+                    acts = acts.reshape(-1, acts.shape[-1])
+                collected.append(acts.cpu())
+                tokens_so_far += acts.shape[0]
+
+        if not is_root:
+            return None, 0
+
+        if tokens_so_far == 0:
+            return None, 0
+
+        full = torch.cat(collected, dim=0)
+        if full.shape[0] > chunk_size_tokens:
+            self._stream_residual = full[chunk_size_tokens:]
+            full = full[:chunk_size_tokens]
+
+        return full, full.shape[0]
+
     def _postprocess_hook_activations(
         self, layerwise_activations: torch.Tensor
     ) -> torch.Tensor:

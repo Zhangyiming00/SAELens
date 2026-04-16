@@ -1,7 +1,10 @@
 import json
+import math
 import os
 import signal
 import sys
+import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,6 +144,7 @@ class LanguageModelSAETrainingRunner:
         sae_dp_size: int = 1,
         vllm_dp_size: int = 1,
         use_shard_routing: bool = True,
+        streaming_mode: bool = False,
     ):
         if override_dataset is not None:
             logger.warning(
@@ -201,6 +205,11 @@ class LanguageModelSAETrainingRunner:
                     "vllm_tp_size does not match "
                     "cfg.model_from_pretrained_kwargs['tensor_parallel_size']"
                 )
+
+        self.streaming_mode = streaming_mode or cfg.streaming_mode
+        if self.streaming_mode:
+            self._streaming_init(cfg)
+            return
 
         # Initialize distributed process groups for SAE TP/DP.
         # With torchrun, dist.init_process_group is already called; skip it.
@@ -458,11 +467,13 @@ class LanguageModelSAETrainingRunner:
                     device_ids = [device_index]
                     output_device = device_index
                 self._compile_sae_if_needed()
+                ddp_kwargs = self._resolve_ddp_kwargs()
                 self.sae = DDP(
                     self._base_sae,
                     process_group=sae_dp_group,
                     device_ids=device_ids,
                     output_device=output_device,
+                    **ddp_kwargs,
                 )
         else:
             self._compile_sae_if_needed()
@@ -488,6 +499,11 @@ class LanguageModelSAETrainingRunner:
             )
         if self.cfg.sae_dp_mode == "fsdp" and sae_dp_group is None:
             raise ValueError("Multi-layer SAE training with FSDP requires an SAE DP group.")
+        ddp_kwargs_multi = (
+            self._resolve_ddp_kwargs()
+            if self.cfg.sae_dp_mode == "ddp" and sae_dp_world_size > 1
+            else {}
+        )
 
         for idx, hook_name in enumerate(self.hook_names):
             seed = (
@@ -553,10 +569,51 @@ class LanguageModelSAETrainingRunner:
                     process_group=sae_dp_group,
                     device_ids=device_ids,
                     output_device=output_device,
+                    **ddp_kwargs_multi,
                 )
             else:
                 wrapped = sae
             self.sae_by_hook[hook_name] = wrapped
+
+    def _resolve_ddp_kwargs(self) -> dict[str, Any]:
+        ddp_kwargs: dict[str, Any] = {}
+        if self.cfg.ddp_broadcast_buffers is not None:
+            ddp_kwargs["broadcast_buffers"] = self.cfg.ddp_broadcast_buffers
+        if self.cfg.ddp_find_unused_parameters is not None:
+            ddp_kwargs["find_unused_parameters"] = self.cfg.ddp_find_unused_parameters
+        if self.cfg.ddp_gradient_as_bucket_view is not None:
+            ddp_kwargs["gradient_as_bucket_view"] = self.cfg.ddp_gradient_as_bucket_view
+        if self.cfg.ddp_static_graph is not None:
+            ddp_kwargs["static_graph"] = self.cfg.ddp_static_graph
+        if self.cfg.ddp_bucket_cap_mb is not None:
+            ddp_kwargs["bucket_cap_mb"] = self.cfg.ddp_bucket_cap_mb
+
+        if (
+            ddp_kwargs.get("static_graph") is True
+            and ddp_kwargs.get("find_unused_parameters") is True
+        ):
+            message = (
+                "DDP config conflict: static_graph=True with "
+                "find_unused_parameters=True is not recommended."
+            )
+            if self.cfg.ddp_config_strict:
+                raise ValueError(message)
+            logger.warning(message + " Overriding find_unused_parameters=False.")
+            ddp_kwargs["find_unused_parameters"] = False
+
+        effective = {
+            "broadcast_buffers": ddp_kwargs.get("broadcast_buffers", "torch_default"),
+            "find_unused_parameters": ddp_kwargs.get(
+                "find_unused_parameters", "torch_default"
+            ),
+            "gradient_as_bucket_view": ddp_kwargs.get(
+                "gradient_as_bucket_view", "torch_default"
+            ),
+            "static_graph": ddp_kwargs.get("static_graph", "torch_default"),
+            "bucket_cap_mb": ddp_kwargs.get("bucket_cap_mb", "torch_default"),
+        }
+        logger.info(f"Effective DDP config: {effective}")
+        return ddp_kwargs
 
     def _sync_run_paths_across_ranks(self) -> None:
         if not dist.is_initialized() or dist.get_world_size() <= 1:
@@ -570,6 +627,14 @@ class LanguageModelSAETrainingRunner:
         """
         Run the training of the SAE.
         """
+        if self.streaming_mode:
+            import sae_lens.distributed_streaming as ds
+            if ds.is_producer():
+                self._run_streaming_producer_loop()
+                return None
+            else:
+                return self._run_streaming_consumer_loop()
+
         if self.use_shard_routing and self.vllm_active and not self.sae_active:
             self._load_producer_resume_state_if_needed()
             self._run_producer_helper_loop_v2()
@@ -1031,6 +1096,357 @@ class LanguageModelSAETrainingRunner:
                 trainer.save_checkpoint(checkpoint_name=str(trainer.n_training_samples))
                 logger.info("done saving")
             raise
+
+    # ------------------------------------------------------------------
+    # Streaming mode (v1) — sae_dp=1 only
+    # ------------------------------------------------------------------
+
+    def _streaming_init(self, cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG]) -> None:
+        import sae_lens.distributed_streaming as ds
+        from sae_lens.training.shared_activation_buffer import SharedActivationBuffer
+
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+
+        ds.init_distributed_streaming(
+            vllm_tp=self.vllm_tp_size,
+            vllm_dp=self.vllm_dp_size,
+            sae_tp=self.sae_tp_size,
+            sae_dp=1,
+        )
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.device = torch.device(f"cuda:{local_rank}")
+
+        # Buffer name: rank 0 generates, all ranks receive via CUDA tensor broadcast (NCCL)
+        buffer_name = cfg.streaming_buffer_name
+        if not buffer_name:
+            name_buf = torch.zeros(32, dtype=torch.int32, device=self.device)
+            if dist.get_rank() == 0:
+                uid = uuid.uuid4().hex[:24]
+                for i, c in enumerate(uid):
+                    name_buf[i] = ord(c)
+            dist.broadcast(name_buf, src=0)
+            buffer_name = "sae_buf_" + "".join(
+                chr(int(c)) for c in name_buf.tolist() if c > 0
+            )
+
+        self._streaming_buffer_name = buffer_name
+        target_chunks = math.ceil(cfg.training_tokens / cfg.streaming_chunk_size_tokens)
+
+        # Rank 0 creates the shared buffer; all other ranks attach after barrier
+        if dist.get_rank() == 0:
+            self._streaming_buffer = SharedActivationBuffer(
+                name=buffer_name,
+                num_chunks=cfg.streaming_num_chunks,
+                chunk_size_tokens=cfg.streaming_chunk_size_tokens,
+                d_model=cfg.sae.d_in,
+                num_producers=self.vllm_dp_size,
+                target_chunks=target_chunks,
+                create=True,
+            )
+        dist.barrier()
+        if dist.get_rank() != 0:
+            self._streaming_buffer = SharedActivationBuffer(
+                name=buffer_name,
+                num_chunks=cfg.streaming_num_chunks,
+                chunk_size_tokens=cfg.streaming_chunk_size_tokens,
+                d_model=cfg.sae.d_in,
+                num_producers=self.vllm_dp_size,
+                target_chunks=target_chunks,
+                create=False,
+            )
+
+        self.sae_active = ds.is_consumer()
+        self.vllm_active = ds.is_producer()
+        self.uses_split_roles = True
+        self.uses_vllm_dp_fan_in = False
+        self.uses_matched_dp = False
+
+        # Pre-initialize vLLM parallel state on ALL ranks before any rank calls LLM().
+        # vLLM creates 5+ process groups (WORLD, TP, DCP, PCP, PP, DP) even with tp=1;
+        # these are collective, so all ranks must participate — even non-vLLM consumers.
+        # SAELENS_VLLM_WORLD_RANKS tells vLLM's init_distributed_environment the subset
+        # of world ranks that belong to vLLM, so its world-size check passes when the
+        # process group was pre-initialized with fewer ranks than torch world_size.
+        vllm_world_ranks = list(range(self.vllm_dp_size * self.vllm_tp_size))
+        os.environ["SAELENS_VLLM_WORLD_RANKS"] = ",".join(str(r) for r in vllm_world_ranks)
+        preinit_vllm_distributed(vllm_world_ranks, self.vllm_tp_size)
+
+        self._sync_run_paths_across_ranks()
+        self._init_streaming_logger()
+
+        if ds.is_producer():
+            self._streaming_init_producer(cfg)
+        else:
+            self._streaming_init_consumer(cfg)
+
+    def _streaming_init_producer(
+        self, cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG]
+    ) -> None:
+        import sae_lens.distributed_streaming as ds
+
+        self.model = load_model(  # type: ignore[assignment]
+            cfg.model_class_name,
+            cfg.model_name,
+            device=str(self.device),
+            model_from_pretrained_kwargs=cfg.model_from_pretrained_kwargs,
+        )
+        self.activations_store = ActivationsStore.from_config(
+            self.model,
+            cfg,
+            dataset_shard_index=ds.get_producer_idx(),
+            dataset_shard_count=ds.get_vllm_dp_size(),
+        )
+        self.sae = None
+        self._base_sae = None
+
+    def _streaming_init_consumer(
+        self, cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG]
+    ) -> None:
+        import sae_lens.distributed_streaming as ds
+
+        self.model = None  # type: ignore[assignment]
+        self.activations_store = None  # type: ignore[assignment]
+
+        with temporary_seed(cfg.seed):
+            sae = TrainingSAE.from_dict(
+                TrainingSAEConfig.from_dict(
+                    cfg.get_training_sae_cfg_dict(),
+                ).to_dict()
+            )
+        sae.to(self.device)
+
+        if self.sae_tp_size > 1:
+            tp_group = ds.get_sae_tp_group()
+            if tp_group is not None and hasattr(sae, "shard_weights"):
+                sae.shard_weights(tp_group)
+
+        self._base_sae = sae
+        self.sae = sae
+
+    def _init_streaming_logger(self) -> None:
+        import logging
+        self._logger = logging.getLogger("saelens.streaming.null")
+        self._logger.addHandler(logging.NullHandler())
+        self._logger.propagate = False
+
+    def _run_streaming_producer_loop(self) -> None:
+        import sae_lens.distributed_streaming as ds
+
+        vllm_tp_group = ds.get_vllm_tp_group()
+        is_tp_root = ds.is_vllm_tp_root()
+        tp_root_world = ds.get_producer_tp_root()
+        chunk_size = self.cfg.streaming_chunk_size_tokens
+        total_tokens = self.cfg.training_tokens
+        buf = self._streaming_buffer
+        store = self.activations_store
+
+        # Set up per-chunk timing and shm management logs (TP root only)
+        timing_path: Path | None = None
+        shm_log_path: Path | None = None
+        t_ready = time.time()
+        if is_tp_root and self.cfg.output_path is not None:
+            out_dir = Path(self.cfg.output_path)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if self.cfg.save_timing_every_n_steps > 0:
+                timing_path = out_dir / "timing_history_vllm.jsonl"
+                timing_path.write_text("")
+            shm_log_path = out_dir / "shm_log_vllm.jsonl"
+            shm_log_path.write_text("")
+
+        def _shm_log(record: dict) -> None:
+            if shm_log_path is None:
+                return
+            record["elapsed_s"] = time.time() - t_ready
+            with open(shm_log_path, "a") as f:
+                json.dump(record, f)
+                f.write("\n")
+
+        ctrl = torch.zeros(1, dtype=torch.int32, device=self.device)
+        chunk_idx = -1
+        seq_no = -1
+        chunk_step = 0
+
+        while True:
+            # Outer Phase 1: quota check — root tries to allocate a chunk slot
+            if is_tp_root:
+                result = buf.allocate_write_chunk()
+                ctrl[0] = 0 if result is None else 1
+                if result is not None:
+                    chunk_idx, seq_no = result
+                    _shm_log({"event": "chunk_allocated", "chunk_idx": chunk_idx, "seq_no": seq_no})
+            if vllm_tp_group is not None:
+                dist.broadcast(ctrl, src=tp_root_world, group=vllm_tp_group)
+            if int(ctrl[0]) == 0:
+                if is_tp_root:
+                    _shm_log({"event": "quota_exhausted", "total_chunks": chunk_step})
+                break  # global quota exhausted; all TP ranks exit together
+
+            # Compute exact token limit for this chunk (root knows seq_no; non-root uses full chunk_size)
+            if is_tp_root:
+                max_this_chunk = max(1, min(chunk_size, total_tokens - seq_no * chunk_size))
+            else:
+                max_this_chunk = chunk_size  # non-root: ignored, root drives the internal loop
+
+            # All TP ranks participate in inference (required by vLLM external_launcher semantics)
+            t_infer_start = time.perf_counter()
+            acts_cpu, valid_tokens = store.get_streaming_activations(max_this_chunk)
+            t_infer_end = time.perf_counter()
+
+            # Outer Phase 2: EOF check — did dataset run dry?
+            if is_tp_root:
+                ctrl[0] = 0 if acts_cpu is None else 1
+            if vllm_tp_group is not None:
+                dist.broadcast(ctrl, src=tp_root_world, group=vllm_tp_group)
+            if int(ctrl[0]) == 0:
+                if is_tp_root:
+                    buf.abort_write_chunk(chunk_idx)  # WRITING → FREE
+                    _shm_log({"event": "dataset_exhausted", "chunk_idx": chunk_idx, "total_chunks": chunk_step})
+                break  # dataset exhausted; all TP ranks exit together
+
+            # Write to buffer (TP root only)
+            if is_tp_root:
+                t_write_start = time.perf_counter()
+                buf.write_chunk(
+                    chunk_idx,
+                    acts_cpu.to(torch.bfloat16),  # type: ignore[union-attr]
+                    valid_tokens,
+                    producer_id=ds.get_producer_idx(),
+                )
+                buf.mark_ready(chunk_idx)
+                t_write_end = time.perf_counter()
+
+                chunk_step += 1
+                inference_time_s = t_infer_end - t_infer_start
+                write_time_s = t_write_end - t_write_start
+                _shm_log({
+                    "event": "chunk_written",
+                    "chunk_idx": chunk_idx,
+                    "seq_no": seq_no,
+                    "step": chunk_step,
+                    "valid_tokens": valid_tokens,
+                    "total_tokens": seq_no * chunk_size + valid_tokens,
+                    "inference_time_s": inference_time_s,
+                    "write_time_s": write_time_s,
+                    "buffer_state": buf.queue_counts(),
+                })
+
+                if timing_path is not None and chunk_step % self.cfg.save_timing_every_n_steps == 0:
+                    record = {
+                        "step": chunk_step,
+                        "elapsed_s": time.time() - t_ready,
+                        "inference_time_s": inference_time_s,
+                        "write_time_s": write_time_s,
+                        "chunk_time_s": inference_time_s + write_time_s,
+                        "valid_tokens": valid_tokens,
+                        "total_tokens": seq_no * chunk_size + valid_tokens,
+                    }
+                    with open(timing_path, "a") as f:
+                        json.dump(record, f)
+                        f.write("\n")
+
+        if is_tp_root:
+            buf.signal_done()
+            _shm_log({"event": "producer_done", "total_chunks": chunk_step})
+        buf.close()
+
+    def _run_streaming_consumer_loop(self) -> TrainingSAE[Any]:
+        import sae_lens.distributed_streaming as ds
+        from sae_lens.training.streaming_activation_provider import StreamingActivationProvider
+
+        sae_tp_group = ds.get_sae_tp_group()
+        sae_tp_size = ds.get_sae_tp_size()
+
+        # shm log and buffer monitor written by TP root only
+        shm_log_path: Path | None = None
+        buffer_monitor_path: Path | None = None
+        if ds.is_sae_tp_root() and self.cfg.output_path is not None:
+            out_dir = Path(self.cfg.output_path)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            shm_log_path = out_dir / "shm_log_sae.jsonl"
+            buffer_monitor_path = out_dir / "buffer_monitor.jsonl"
+
+        from sae_lens.util import str_to_dtype
+        provider = StreamingActivationProvider(
+            buffer=self._streaming_buffer,
+            train_batch_size_tokens=self.cfg.train_batch_size_tokens,
+            prefetch_chunks=self.cfg.streaming_prefetch_chunks,
+            device=self.device,
+            sae_tp_group=sae_tp_group if sae_tp_size > 1 else None,
+            sae_tp_rank=ds.get_sae_tp_rank(),
+            sae_tp_root_global_rank=ds.get_consumer_tp_root(),
+            d_model=self.cfg.sae.d_in,
+            dtype=str_to_dtype(self.cfg.dtype),
+            shm_log_path=shm_log_path,
+            shuffle=self.cfg.streaming_shuffle,
+            random_chunks=self.cfg.streaming_random_chunks,
+            buffer_monitor_path=buffer_monitor_path,
+        )
+
+        trainer = SAETrainer(
+            sae=self.sae,
+            base_sae=self._base_sae,
+            data_provider=provider,
+            evaluator=None,
+            save_checkpoint_fn=self._streaming_save_checkpoint,
+            cfg=self.cfg.to_sae_trainer_config(),
+            dp_group=None,
+            token_count_weighted_dp=False,
+        )
+
+        try:
+            signal.signal(signal.SIGINT, interrupt_callback)
+            signal.signal(signal.SIGTERM, interrupt_callback)
+            sae = trainer.fit()
+        except StopIteration:
+            # Data provider exhausted before training_tokens reached (e.g. dataset
+            # shorter than configured).  Treat as normal end-of-data termination.
+            sae = trainer.sae
+        except (KeyboardInterrupt, InterruptedException):
+            if self.cfg.checkpoint_path is not None:
+                checkpoint_path = Path(self.cfg.checkpoint_path) / str(
+                    trainer.n_training_samples
+                )
+                self._streaming_save_checkpoint(checkpoint_path)
+            raise
+
+        self._streaming_buffer.close()
+
+        if self.cfg.output_path is not None:
+            self._streaming_save_final(sae, self.cfg.output_path, trainer.log_feature_sparsity)
+
+        return sae
+
+    def _streaming_save_checkpoint(self, checkpoint_path: Path | None) -> None:
+        """Called by ALL SAE TP ranks — save_inference_model is collective when sae_tp > 1."""
+        if checkpoint_path is None:
+            return
+        import sae_lens.distributed_streaming as ds
+        checkpoint_path.mkdir(exist_ok=True, parents=True)
+        self._base_sae.save_inference_model(str(checkpoint_path))  # type: ignore[union-attr]
+        if ds.is_sae_tp_root():
+            runner_config = self.cfg.to_dict()
+            with open(checkpoint_path / RUNNER_CFG_FILENAME, "w") as f:
+                json.dump(runner_config, f)
+
+    def _streaming_save_final(
+        self,
+        sae: TrainingSAE[Any],
+        output_path: str,
+        log_feature_sparsity: torch.Tensor | None,
+    ) -> None:
+        """Called by ALL SAE TP ranks — save_inference_model is collective when sae_tp > 1."""
+        import sae_lens.distributed_streaming as ds
+        base = Path(output_path)
+        base.mkdir(exist_ok=True, parents=True)
+        sae.save_inference_model(str(base))
+        if ds.is_sae_tp_root():
+            if log_feature_sparsity is not None:
+                save_file({"sparsity": log_feature_sparsity}, base / SPARSITY_FILENAME)
+            runner_config = self.cfg.to_dict()
+            with open(base / RUNNER_CFG_FILENAME, "w") as f:
+                json.dump(runner_config, f)
 
     def save_checkpoint(
         self,

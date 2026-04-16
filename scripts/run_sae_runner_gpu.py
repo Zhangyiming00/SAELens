@@ -51,14 +51,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Comma-separated hook names for multi-layer independent SAE training.",
     )
-    parser.add_argument("--d-sae", type=int, default=32768)
+    parser.add_argument("--d-sae", type=int, default=32768*2)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--vllm-tp-size", type=int, default=None)
     parser.add_argument("--sae-tp-size", type=int, default=None)
     parser.add_argument("--vllm-dp-size", type=int, default=1)
     parser.add_argument("--sae-dp-size", type=int, default=1)
-    parser.add_argument("--training-tokens", type=int, default=2048*32)
+    parser.add_argument("--training-tokens", type=int, default=2048*512)
     parser.add_argument("--train-batch-size-tokens", type=int, default=2048)
     parser.add_argument("--context-size", type=int, default=2048)
     parser.add_argument("--store-batch-size-prompts", type=int, default=4)
@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/results_1.35_16+21/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_1.41_streaming/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
     parser.add_argument("--save-mse-every-n-steps", type=int, default=1)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=1)
@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
             "This can perturb runtime; keep disabled for throughput/overlap runs."
         ),
     )
-    parser.add_argument("--checkpoint-path", default="checkpoints/ck1.35_21")
+    parser.add_argument("--checkpoint-path", default="checkpoints/checkpoint2")
     parser.add_argument("--n-checkpoints", type=int, default=0)
     parser.add_argument("--save-final-checkpoint", action="store_true", default=True)
     parser.add_argument(
@@ -123,6 +123,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--multi-sae-backward-order",
+        default="forward",
+        choices=["forward", "reverse", "largest_first"],
+        help="Backward order for sequential multi-layer backward mode.",
+    )
+    parser.add_argument(
+        "--multi-sae-stats-sync-mode",
+        default="immediate",
+        choices=["immediate", "deferred", "periodic"],
+        help="When to DP-sync per-layer firing/token stats in multi-layer mode.",
+    )
+    parser.add_argument(
+        "--multi-sae-stats-sync-interval",
+        type=int,
+        default=1,
+        help="Sync interval for --multi-sae-stats-sync-mode=periodic.",
+    )
+    parser.add_argument(
         "--multi-sae-seed-mode",
         default="same",
         choices=["same", "offset"],
@@ -132,6 +150,116 @@ def parse_args() -> argparse.Namespace:
             "'offset' uses seed + hook_index for each hook."
         ),
     )
+    parser.add_argument(
+        "--ddp-broadcast-buffers",
+        dest="ddp_broadcast_buffers",
+        action="store_true",
+        default=None,
+        help="Explicitly set DDP broadcast_buffers=True.",
+    )
+    parser.add_argument(
+        "--no-ddp-broadcast-buffers",
+        dest="ddp_broadcast_buffers",
+        action="store_false",
+        help="Explicitly set DDP broadcast_buffers=False.",
+    )
+    parser.add_argument(
+        "--ddp-find-unused-parameters",
+        dest="ddp_find_unused_parameters",
+        action="store_true",
+        default=None,
+        help="Explicitly set DDP find_unused_parameters=True.",
+    )
+    parser.add_argument(
+        "--no-ddp-find-unused-parameters",
+        dest="ddp_find_unused_parameters",
+        action="store_false",
+        help="Explicitly set DDP find_unused_parameters=False.",
+    )
+    parser.add_argument(
+        "--ddp-gradient-as-bucket-view",
+        dest="ddp_gradient_as_bucket_view",
+        action="store_true",
+        default=None,
+        help="Explicitly set DDP gradient_as_bucket_view=True.",
+    )
+    parser.add_argument(
+        "--no-ddp-gradient-as-bucket-view",
+        dest="ddp_gradient_as_bucket_view",
+        action="store_false",
+        help="Explicitly set DDP gradient_as_bucket_view=False.",
+    )
+    parser.add_argument(
+        "--ddp-static-graph",
+        dest="ddp_static_graph",
+        action="store_true",
+        default=None,
+        help="Explicitly set DDP static_graph=True.",
+    )
+    parser.add_argument(
+        "--no-ddp-static-graph",
+        dest="ddp_static_graph",
+        action="store_false",
+        help="Explicitly set DDP static_graph=False.",
+    )
+    parser.add_argument(
+        "--ddp-bucket-cap-mb",
+        type=int,
+        default=None,
+        help="Explicitly set DDP bucket_cap_mb.",
+    )
+    parser.add_argument(
+        "--ddp-config-strict",
+        action="store_true",
+        default=False,
+        help="Fail fast on invalid DDP config combinations instead of fallback.",
+    )
+    # Streaming mode (v1): vLLM and SAE processes on separate GPU sets via /dev/shm.
+    # Requires sae_dp_size=1. World size = vllm_tp * vllm_dp + sae_tp * 1.
+    parser.add_argument(
+        "--streaming-mode",
+        action="store_true",
+        default=False,
+        help="Enable streaming_mode v1 (vLLM producers + SAE consumers via /dev/shm).",
+    )
+    parser.add_argument(
+        "--streaming-chunk-size-tokens",
+        type=int,
+        default=4096,
+        help="Tokens per shared-memory chunk in streaming_mode.",
+    )
+    parser.add_argument(
+        "--streaming-num-chunks",
+        type=int,
+        default=32,
+        help="Number of shared-memory chunk slots in streaming_mode.",
+    )
+    parser.add_argument(
+        "--streaming-prefetch-chunks",
+        type=int,
+        default=2,
+        help="Max chunks to acquire per consumer refill in streaming_mode.",
+    )
+    parser.add_argument(
+        "--streaming-buffer-name",
+        type=str,
+        default="",
+        help="Shared buffer name (auto-generated if empty) in streaming_mode.",
+    )
+    parser.add_argument(
+        "--no-streaming-shuffle",
+        action="store_false",
+        dest="streaming_shuffle",
+        help="Disable per-refill token shuffle in streaming_mode.",
+    )
+    parser.set_defaults(streaming_shuffle=True)
+    parser.add_argument(
+        "--no-streaming-random-chunks",
+        action="store_false",
+        dest="streaming_random_chunks",
+        help="Disable random chunk selection in streaming_mode (use lowest-index READY slots).",
+    )
+    parser.set_defaults(streaming_random_chunks=True)
     return parser.parse_args()
 
 
@@ -215,20 +343,31 @@ def main() -> None:
                 "is not an integer-multiple ratio — automatically enabling --use-shard-routing."
             )
             args.use_shard_routing = True
-    expected_world_size = max(
-        vllm_tp_size * args.vllm_dp_size, sae_tp_size * args.sae_dp_size
-    )
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if expected_world_size > 1 and world_size == 1:
-        raise ValueError(
-            "This configuration requires torchrun. "
-            f"Expected WORLD_SIZE={expected_world_size}, got {world_size}."
+    if args.streaming_mode:
+        if args.sae_dp_size != 1:
+            raise ValueError("--streaming-mode requires --sae-dp-size 1")
+        args.use_shard_routing = False
+        expected_world_size = vllm_tp_size * args.vllm_dp_size + sae_tp_size * 1
+        if world_size not in (1, expected_world_size):
+            raise ValueError(
+                f"streaming_mode: WORLD_SIZE={world_size} does not match "
+                f"vllm_tp*vllm_dp + sae_tp = {expected_world_size}."
+            )
+    else:
+        expected_world_size = max(
+            vllm_tp_size * args.vllm_dp_size, sae_tp_size * args.sae_dp_size
         )
-    if world_size not in (1, expected_world_size):
-        raise ValueError(
-            f"WORLD_SIZE={world_size} does not match "
-            f"the expected world size {expected_world_size}."
-        )
+        if expected_world_size > 1 and world_size == 1:
+            raise ValueError(
+                "This configuration requires torchrun. "
+                f"Expected WORLD_SIZE={expected_world_size}, got {world_size}."
+            )
+        if world_size not in (1, expected_world_size):
+            raise ValueError(
+                f"WORLD_SIZE={world_size} does not match "
+                f"the expected world size {expected_world_size}."
+            )
 
     training_tokens = args.training_tokens
     train_batch_size_tokens = args.train_batch_size_tokens
@@ -326,7 +465,23 @@ def main() -> None:
         verbose=True,
         sae_dp_mode=args.sae_dp_mode,
         multi_sae_backward_mode=args.multi_sae_backward_mode,
+        multi_sae_backward_order=args.multi_sae_backward_order,
+        multi_sae_stats_sync_mode=args.multi_sae_stats_sync_mode,
+        multi_sae_stats_sync_interval=args.multi_sae_stats_sync_interval,
         multi_sae_seed_mode=args.multi_sae_seed_mode,
+        ddp_broadcast_buffers=args.ddp_broadcast_buffers,
+        ddp_find_unused_parameters=args.ddp_find_unused_parameters,
+        ddp_gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,
+        ddp_static_graph=args.ddp_static_graph,
+        ddp_bucket_cap_mb=args.ddp_bucket_cap_mb,
+        ddp_config_strict=args.ddp_config_strict,
+        streaming_mode=args.streaming_mode,
+        streaming_chunk_size_tokens=args.streaming_chunk_size_tokens,
+        streaming_num_chunks=args.streaming_num_chunks,
+        streaming_prefetch_chunks=args.streaming_prefetch_chunks,
+        streaming_buffer_name=args.streaming_buffer_name,
+        streaming_shuffle=args.streaming_shuffle,
+        streaming_random_chunks=args.streaming_random_chunks,
     )
 
     print("Starting runner with:")
@@ -350,7 +505,22 @@ def main() -> None:
     print(f"  sae_dp_mode={cfg.sae_dp_mode}")
     if hook_names is not None:
         print(f"  multi_sae_backward_mode={cfg.multi_sae_backward_mode}")
+        print(f"  multi_sae_backward_order={cfg.multi_sae_backward_order}")
+        print(f"  multi_sae_stats_sync_mode={cfg.multi_sae_stats_sync_mode}")
+        print(f"  multi_sae_stats_sync_interval={cfg.multi_sae_stats_sync_interval}")
         print(f"  multi_sae_seed_mode={cfg.multi_sae_seed_mode}")
+    if args.ddp_broadcast_buffers is not None:
+        print(f"  ddp_broadcast_buffers={args.ddp_broadcast_buffers}")
+    if args.ddp_find_unused_parameters is not None:
+        print(f"  ddp_find_unused_parameters={args.ddp_find_unused_parameters}")
+    if args.ddp_gradient_as_bucket_view is not None:
+        print(f"  ddp_gradient_as_bucket_view={args.ddp_gradient_as_bucket_view}")
+    if args.ddp_static_graph is not None:
+        print(f"  ddp_static_graph={args.ddp_static_graph}")
+    if args.ddp_bucket_cap_mb is not None:
+        print(f"  ddp_bucket_cap_mb={args.ddp_bucket_cap_mb}")
+    if args.ddp_config_strict:
+        print("  ddp_config_strict=True")
     if args.save_mse_every_n_steps > 0:
         print(f"  save_mse_every_n_steps={args.save_mse_every_n_steps}")
     if args.save_timing_every_n_steps > 0:
@@ -374,6 +544,7 @@ def main() -> None:
         vllm_dp_size=args.vllm_dp_size,
         sae_dp_size=args.sae_dp_size,
         use_shard_routing=args.use_shard_routing,
+        streaming_mode=args.streaming_mode,
     )
     try:
         runner.run()

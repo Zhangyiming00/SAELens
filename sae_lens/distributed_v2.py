@@ -4,16 +4,22 @@ Provides ``init_distributed_v2()`` as a standalone replacement for ``init_distri
 when ``use_shard_routing=True``.  Supports arbitrary ``vllm_dp:sae_dp`` ratios without
 requiring integer multiples.
 
-World layout (overlapping, matching existing legacy convention):
+Two world layouts are supported via the ``disjoint`` parameter:
 
+Overlapping (default, ``disjoint=False``):
     world_size = max(P * vllm_tp, Q * sae_tp)
-
     Producer ranks:  [0, P * vllm_tp)
     Consumer ranks:  [0, Q * sae_tp)
     Dual-role ranks: [0, min(P * vllm_tp, Q * sae_tp))
+    Producer group p: ranks [p * vllm_tp, (p+1) * vllm_tp).
+    Consumer group c: ranks [c * sae_tp,  (c+1) * sae_tp).
 
-Producer group p: ranks [p * vllm_tp, (p+1) * vllm_tp).
-Consumer group c: ranks [c * sae_tp,  (c+1) * sae_tp).
+Disjoint (``disjoint=True``, used by streaming_mode v1):
+    world_size = P * vllm_tp + Q * sae_tp
+    Producer ranks:  [0, P * vllm_tp)
+    Consumer ranks:  [P * vllm_tp, P * vllm_tp + Q * sae_tp)
+    Producer group p: ranks [p * vllm_tp, (p+1) * vllm_tp).
+    Consumer group c: ranks [P*vllm_tp + c*sae_tp, P*vllm_tp + (c+1)*sae_tp).
 """
 
 from __future__ import annotations
@@ -91,6 +97,7 @@ def init_distributed_v2(
     vllm_tp_size: int,
     sae_tp_size: int,
     batch_size: int,
+    disjoint: bool = False,
 ) -> None:
     """Initialize all process groups for the unified shard-routing path.
 
@@ -111,6 +118,12 @@ def init_distributed_v2(
         Rows per producer per step (``store_batch_size_prompts * training_context_size``).
         Used to build the routing table.  Must be large enough that every connected
         producer→consumer edge receives at least 1 row.
+    disjoint:
+        When True, use a disjoint topology where producer and consumer ranks do not
+        overlap.  Producer ranks are ``[0, P*vllm_tp_size)`` and consumer ranks are
+        ``[P*vllm_tp_size, P*vllm_tp_size + Q*sae_tp_size)``, so
+        ``world_size = P*vllm_tp_size + Q*sae_tp_size``.  When False (default), use
+        the overlapping topology where ``world_size = max(P*vllm_tp, Q*sae_tp)``.
     """
     global _initialized, _P, _Q, _vllm_tp_size, _sae_tp_size
     global _is_producer, _is_consumer, _producer_idx, _consumer_idx
@@ -123,11 +136,18 @@ def init_distributed_v2(
     assert dist.is_initialized(), "Call dist.init_process_group() before init_distributed_v2()"
 
     world_size = dist.get_world_size()
-    expected = max(P * vllm_tp_size, Q * sae_tp_size)
-    assert world_size == expected, (
-        f"world_size={world_size} != max(P*vllm_tp, Q*sae_tp)={expected} "
-        f"(P={P}, vllm_tp={vllm_tp_size}, Q={Q}, sae_tp={sae_tp_size})"
-    )
+    if disjoint:
+        expected = P * vllm_tp_size + Q * sae_tp_size
+        assert world_size == expected, (
+            f"world_size={world_size} != P*vllm_tp + Q*sae_tp={expected} "
+            f"(P={P}, vllm_tp={vllm_tp_size}, Q={Q}, sae_tp={sae_tp_size})"
+        )
+    else:
+        expected = max(P * vllm_tp_size, Q * sae_tp_size)
+        assert world_size == expected, (
+            f"world_size={world_size} != max(P*vllm_tp, Q*sae_tp)={expected} "
+            f"(P={P}, vllm_tp={vllm_tp_size}, Q={Q}, sae_tp={sae_tp_size})"
+        )
 
     rank = dist.get_rank()
     _P = P
@@ -141,8 +161,10 @@ def init_distributed_v2(
         _producer_world_ranks[p] = ranks
         _producer_tp_root[p] = ranks[0]
 
+    consumer_offset = P * vllm_tp_size if disjoint else 0
     for c in range(Q):
-        ranks = list(range(c * sae_tp_size, (c + 1) * sae_tp_size))
+        base = consumer_offset + c * sae_tp_size
+        ranks = list(range(base, base + sae_tp_size))
         _consumer_world_ranks[c] = ranks
         _consumer_tp_root[c] = ranks[0]
 
