@@ -368,7 +368,7 @@ class SAE(HookedRootModule, Generic[T_SAE_CONFIG], ABC):
         nn.init.kaiming_uniform_(w_dec_data)
         self.W_dec = nn.Parameter(w_dec_data)
 
-        w_enc_data = self.W_dec.data.T.clone().detach().contiguous()
+        w_enc_data = self.W_dec.data.T.contiguous()
         self.W_enc = nn.Parameter(w_enc_data)
 
     @abstractmethod
@@ -970,7 +970,7 @@ class TrainingSAE(SAE[T_TRAINING_SAE_CONFIG], ABC):
             with torch.no_grad():
                 self.W_dec.data /= self.W_dec.norm(dim=-1, keepdim=True)
                 self.W_dec.data *= self.cfg.decoder_init_norm
-            self.W_enc.data = self.W_dec.data.T.clone().detach().contiguous()
+            self.W_enc.data = self.W_dec.data.T.contiguous()
 
     @abstractmethod
     def calculate_aux_loss(

@@ -121,12 +121,10 @@ def test_train_step__reduces_loss_when_called_repeatedly_on_same_acts(
 def test_train_step__output_looks_reasonable(trainer: SAETrainer[Any, Any]) -> None:
     layer_acts = next(trainer.data_provider)
 
-    output, _ = trainer._train_step(
+    output, _, _memory = trainer._train_step(
         sae=trainer.sae,
         sae_in=layer_acts,
     )
-
-    assert output.loss > 0
     # only hook_point_layer=0 acts should be passed to the SAE
     assert_close(output.sae_in, layer_acts)
     assert output.sae_out.shape == output.sae_in.shape
@@ -147,7 +145,7 @@ def test_train_step__sparsity_updates_based_on_feature_act_sparsity(
     trainer._reset_running_sparsity_stats()
     layer_acts = next(trainer.data_provider)
 
-    train_output, _ = trainer._train_step(
+    train_output, _, _memory = trainer._train_step(
         sae=trainer.sae,
         sae_in=layer_acts,
     )

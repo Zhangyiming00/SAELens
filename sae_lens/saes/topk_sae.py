@@ -410,10 +410,17 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
             return tensor.detach().clone()
 
         tp_size = dist.get_world_size(self._tp_group)
-        parts = [torch.zeros_like(tensor) for _ in range(tp_size)]
+        full_shape = list(tensor.shape)
+        full_shape[shard_dim] *= tp_size
+        output = torch.empty(full_shape, dtype=tensor.dtype, device=tensor.device)
+        src = tensor.detach().contiguous()
         with nccl_nvtx_range("nccl:topk_tp_state_all_gather", self._tp_group):
-            dist.all_gather(parts, tensor.detach().contiguous(), group=self._tp_group)
-        return torch.cat(parts, dim=shard_dim)
+            if shard_dim == 0:
+                dist.all_gather_into_tensor(output, src, group=self._tp_group)
+            else:
+                parts = list(output.split(tensor.shape[shard_dim], dim=shard_dim))
+                dist.all_gather(parts, src, group=self._tp_group)
+        return output
 
     def _slice_tp_tensor(
         self,
@@ -454,9 +461,13 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
         start = tp_rank * shard_size
         end = start + shard_size
         self._tp_group = tp_group
+        old_W_enc_data = self.W_enc.data
+        old_W_dec_data = self.W_dec.data
+        old_b_enc_data = self.b_enc.data
         self.W_enc = nn.Parameter(self.W_enc.data[:, start:end].contiguous())
-        self.W_dec = nn.Parameter(self.W_dec.data[start:end, :].contiguous())
-        self.b_enc = nn.Parameter(self.b_enc.data[start:end].contiguous())
+        self.W_dec = nn.Parameter(self.W_dec.data[start:end, :].clone())
+        self.b_enc = nn.Parameter(self.b_enc.data[start:end].clone())
+        del old_W_enc_data, old_W_dec_data, old_b_enc_data
 
     @override
     def process_state_dict_for_saving(self, state_dict: dict[str, Any]) -> None:

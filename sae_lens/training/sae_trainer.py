@@ -129,6 +129,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self._t_ready: float = time.time()
         self.mse_history_path: Path | None = None
         self.timing_history_path: Path | None = None
+        self.memory_history_path: Path | None = None
 
         _update_sae_lens_training_version(self._base_sae)
 
@@ -144,6 +145,23 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             output_path.mkdir(exist_ok=True, parents=True)
             self.timing_history_path = output_path / TIMING_HISTORY_FILENAME
             self.timing_history_path.write_text("")
+
+        # Memory profiling: each rank writes its own file (global_rank for multi-node safety).
+        if dist.is_available() and dist.is_initialized():
+            _global_rank = dist.get_rank()
+        else:
+            _global_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        self._memory_rank: int = _global_rank
+        self._profile_memory: bool = (
+            cfg.output_path is not None and cfg.save_memory_every_n_steps > 0
+        )
+        if self._profile_memory:
+            output_path = Path(cfg.output_path)  # type: ignore[arg-type]
+            output_path.mkdir(exist_ok=True, parents=True)
+            self.memory_history_path = (
+                output_path / f"memory_history_rank{_global_rank}.jsonl"
+            )
+            self.memory_history_path.write_text("")
 
         self.checkpoint_thresholds = []
         if self.cfg.n_checkpoints > 0:
@@ -264,7 +282,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
             self._maybe_synchronize_timing()
             sae_t0 = time.perf_counter()
-            step_output, _dp_allreduce_time_s = self._train_step(
+            step_output, _dp_allreduce_time_s, memory_stats = self._train_step(
                 sae=self.sae, sae_in=scaled_batch
             )
             self._maybe_synchronize_timing()
@@ -281,6 +299,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 sae_time_s=sae_time_s,
                 wall_time_s=time.perf_counter() - step_wall_t0,
             )
+            self._record_memory_if_needed(memory_stats)
             self._checkpoint_if_needed()
             self.n_training_steps += 1
             self._update_pbar(step_output, pbar)
@@ -360,6 +379,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             save_file(state_dict, model_weights_path)
             with open(cfg_path, "w") as f:
                 json.dump(self._base_sae.cfg.to_dict(), f)
+        del state_dict
+        torch.cuda.empty_cache()
         if tp_group is not None:
             dist.barrier(group=tp_group)
         return model_weights_path, cfg_path
@@ -582,6 +603,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         # routes through forward() which triggers FSDP's parameter-gather lifecycle.
         # In manual mode self.sae == self._base_sae and the dispatch in
         # TrainingSAE.forward() calls training_forward_pass identically.
+        if self._profile_memory:
+            torch.cuda.reset_peak_memory_stats(self._base_sae.device)
         with self.autocast_if_enabled:
             fsdp_forward_context = (
                 nccl_nvtx_range("nccl:sae_fsdp_forward_param_all_gather", self.dp_group)
@@ -590,6 +613,11 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             )
             with fsdp_forward_context:
                 train_step_output = self.sae(step_input)  # type: ignore[arg-type]
+
+        if self._profile_memory:
+            _peak_fwd_alloc = torch.cuda.max_memory_allocated(self._base_sae.device) / 1024**2
+            _peak_fwd_res = torch.cuda.max_memory_reserved(self._base_sae.device) / 1024**2
+            torch.cuda.reset_peak_memory_stats(self._base_sae.device)
 
         with torch.no_grad():
             # calling .bool() should be equivalent to .abs() > 0, and work with coo tensors
@@ -689,6 +717,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         # In FSDP mode pass dp_group so the norm all-reduce covers the DP shard dimension.
         dp_group_for_clip = self.dp_group if self._is_fsdp else None
         self._base_sae.clip_grad_norm_(1.0, dp_group=dp_group_for_clip)
+
+        if self._profile_memory:
+            _peak_bwd_alloc = torch.cuda.max_memory_allocated(self._base_sae.device) / 1024**2
+            _peak_bwd_res = torch.cuda.max_memory_reserved(self._base_sae.device) / 1024**2
+            torch.cuda.reset_peak_memory_stats(self._base_sae.device)
+
         self.grad_scaler.step(
             self.optimizer
         )  # just ctx.optimizer.step() if not autocasting
@@ -701,7 +735,23 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         for scheduler in self.coefficient_schedulers.values():
             scheduler.step()
 
-        return train_step_output, 0.0
+        if self._profile_memory:
+            _peak_opt_alloc = torch.cuda.max_memory_allocated(self._base_sae.device) / 1024**2
+            _peak_opt_res = torch.cuda.max_memory_reserved(self._base_sae.device) / 1024**2
+            _memory_stats: dict[str, float] = {
+                "peak_forward_allocated_mb": _peak_fwd_alloc,
+                "peak_forward_reserved_mb": _peak_fwd_res,
+                "peak_backward_allocated_mb": _peak_bwd_alloc,
+                "peak_backward_reserved_mb": _peak_bwd_res,
+                "peak_optimizer_allocated_mb": _peak_opt_alloc,
+                "peak_optimizer_reserved_mb": _peak_opt_res,
+                "peak_step_allocated_mb": max(_peak_fwd_alloc, _peak_bwd_alloc, _peak_opt_alloc),
+                "peak_step_reserved_mb": max(_peak_fwd_res, _peak_bwd_res, _peak_opt_res),
+            }
+        else:
+            _memory_stats = {}
+
+        return train_step_output, 0.0, _memory_stats
 
     def _is_logging_step(self) -> bool:
         return (
@@ -821,6 +871,21 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             "step_time_s": data_time_s + sae_time_s,
         }
         with open(self.timing_history_path, "a") as f:
+            json.dump(record, f)
+            f.write("\n")
+
+    def _record_memory_if_needed(self, memory_stats: dict[str, float]) -> None:
+        if self.memory_history_path is None:
+            return
+        if (self.n_training_steps + 1) % self.cfg.save_memory_every_n_steps != 0:
+            return
+        record: dict[str, object] = {
+            "step": self.n_training_steps + 1,
+            "n_training_samples": self.n_training_samples,
+            "rank": self._memory_rank,
+            **memory_stats,
+        }
+        with open(self.memory_history_path, "a") as f:
             json.dump(record, f)
             f.write("\n")
 

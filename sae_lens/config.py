@@ -203,6 +203,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         output_path (str | None): The path to save outputs. Set to None to disable output saving. (default is "output")
         save_mse_every_n_steps (int): Save an `mse_history.jsonl` record every N training steps. 0 disables it. (default is 0)
         save_timing_every_n_steps (int): Save a `timing_history.jsonl` record every N training steps with separate `vllm_step_time_s`, `transfer_time_s`, and `sae_time_s` wall times. 0 disables it. (default is 0)
+        save_memory_every_n_steps (int): Save a `memory_history_rank{rank}.jsonl` record every N training steps with peak GPU memory stats per training phase. 0 disables it. Uses PyTorch allocator stats (not nvidia-smi). (default is 0)
         synchronize_timing (bool): If True, call `torch.cuda.synchronize()` around timed sections for accurate GPU timings. This changes observed runtime and should only be used for profiling. (default is False)
         verbose (bool): Whether to print verbose output. (default is True)
         model_kwargs (dict[str, Any]): Keyword arguments for `model.run_with_cache`
@@ -297,6 +298,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     output_path: str | None = "output"
     save_mse_every_n_steps: int = 0
     save_timing_every_n_steps: int = 0
+    save_memory_every_n_steps: int = 0
     synchronize_timing: bool = False
     resume_from_checkpoint: str | None = None
 
@@ -431,6 +433,12 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         if self.save_timing_every_n_steps > 0 and self.output_path is None:
             raise ValueError(
                 "save_timing_every_n_steps requires output_path to be set"
+            )
+        if self.save_memory_every_n_steps < 0:
+            raise ValueError("save_memory_every_n_steps must be >= 0")
+        if self.save_memory_every_n_steps > 0 and self.output_path is None:
+            raise ValueError(
+                "save_memory_every_n_steps requires output_path to be set"
             )
 
         unique_id = self.logger.wandb_id
@@ -567,6 +575,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             output_path=self.output_path,
             save_mse_every_n_steps=self.save_mse_every_n_steps,
             save_timing_every_n_steps=self.save_timing_every_n_steps,
+            save_memory_every_n_steps=self.save_memory_every_n_steps,
             synchronize_timing=self.synchronize_timing,
             multi_sae_backward_order=self.multi_sae_backward_order,
             multi_sae_stats_sync_mode=self.multi_sae_stats_sync_mode,
@@ -806,6 +815,7 @@ class SAETrainerConfig:
     output_path: str | None
     save_mse_every_n_steps: int
     save_timing_every_n_steps: int
+    save_memory_every_n_steps: int
     synchronize_timing: bool
     multi_sae_backward_order: Literal["forward", "reverse", "largest_first"]
     multi_sae_stats_sync_mode: Literal["immediate", "deferred", "periodic"]

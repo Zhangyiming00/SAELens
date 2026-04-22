@@ -1104,6 +1104,7 @@ class LanguageModelSAETrainingRunner:
     def _streaming_init(self, cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG]) -> None:
         import sae_lens.distributed_streaming as ds
         from sae_lens.training.shared_activation_buffer import SharedActivationBuffer
+        from sae_lens.util import str_to_dtype
 
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
@@ -1144,6 +1145,7 @@ class LanguageModelSAETrainingRunner:
                 num_producers=self.vllm_dp_size,
                 target_chunks=target_chunks,
                 create=True,
+                dtype=str_to_dtype(cfg.dtype),
             )
         dist.barrier()
         if dist.get_rank() != 0:
@@ -1310,7 +1312,7 @@ class LanguageModelSAETrainingRunner:
                 t_write_start = time.perf_counter()
                 buf.write_chunk(
                     chunk_idx,
-                    acts_cpu.to(torch.bfloat16),  # type: ignore[union-attr]
+                    acts_cpu,
                     valid_tokens,
                     producer_id=ds.get_producer_idx(),
                 )

@@ -26,8 +26,10 @@ For multi-GPU shared TP:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -49,16 +51,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hook-names",
         default=None,
+        # default="blocks.16.hook_resid_post,blocks.21.hook_resid_post,blocks.26.hook_resid_post,blocks.31.hook_resid_post",        
         help="Comma-separated hook names for multi-layer independent SAE training.",
     )
-    parser.add_argument("--d-sae", type=int, default=32768*2)
+    parser.add_argument("--d-sae", type=int, default=32768)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--vllm-tp-size", type=int, default=None)
     parser.add_argument("--sae-tp-size", type=int, default=None)
     parser.add_argument("--vllm-dp-size", type=int, default=1)
     parser.add_argument("--sae-dp-size", type=int, default=1)
-    parser.add_argument("--training-tokens", type=int, default=2048*512)
+    parser.add_argument("--training-tokens", type=int, default=2048*48)
     parser.add_argument("--train-batch-size-tokens", type=int, default=2048)
     parser.add_argument("--context-size", type=int, default=2048)
     parser.add_argument("--store-batch-size-prompts", type=int, default=4)
@@ -71,10 +74,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/results_1.41_streaming/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_1.45_hook31/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
     parser.add_argument("--save-mse-every-n-steps", type=int, default=1)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=1)
+    parser.add_argument("--save-memory-every-n-steps", type=int, default=1)
     parser.add_argument(
         "--synchronize-timing",
         action="store_true",
@@ -84,7 +88,7 @@ def parse_args() -> argparse.Namespace:
             "This can perturb runtime; keep disabled for throughput/overlap runs."
         ),
     )
-    parser.add_argument("--checkpoint-path", default="checkpoints/checkpoint2")
+    parser.add_argument("--checkpoint-path", default="checkpoints/")
     parser.add_argument("--n-checkpoints", type=int, default=0)
     parser.add_argument("--save-final-checkpoint", action="store_true", default=True)
     parser.add_argument(
@@ -308,6 +312,51 @@ def _validate_checkpoint_args(args: argparse.Namespace) -> None:
         )
 
 
+def _is_writer_rank() -> bool:
+    if not dist.is_available() or not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
+
+
+def _append_total_runtime_record(
+    *,
+    output_path_arg: str | None,
+    run_id: str,
+    total_time_s: float,
+    vllm_tp_size: int,
+    sae_tp_size: int,
+    vllm_dp_size: int,
+    sae_dp_size: int,
+    sae_dp_mode: str,
+    status: str,
+    error: str | None,
+) -> None:
+    if output_path_arg is None or not _is_writer_rank():
+        return
+    output_path = Path(output_path_arg)
+    log_path = output_path.parent / "total_time_history.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "run_id": run_id,
+        "status": status,
+        "total_time_s": total_time_s,
+        "config": {
+            "vllm_tp_size": vllm_tp_size,
+            "sae_tp_size": sae_tp_size,
+            "vllm_dp_size": vllm_dp_size,
+            "sae_dp_size": sae_dp_size,
+            "sae_dp_mode": sae_dp_mode,
+        },
+    }
+    if error is not None:
+        record["error"] = error
+    with open(log_path, "a") as f:
+        json.dump(record, f)
+        f.write("\n")
+    print(f"[INFO] Appended total runtime record to {log_path}")
+
+
 def main() -> None:
     args = parse_args()
     _validate_checkpoint_args(args)
@@ -460,6 +509,7 @@ def main() -> None:
         output_path=output_path,
         save_mse_every_n_steps=args.save_mse_every_n_steps,
         save_timing_every_n_steps=args.save_timing_every_n_steps,
+        save_memory_every_n_steps=args.save_memory_every_n_steps,
         synchronize_timing=args.synchronize_timing,
         seed=args.seed,
         verbose=True,
@@ -546,9 +596,29 @@ def main() -> None:
         use_shard_routing=args.use_shard_routing,
         streaming_mode=args.streaming_mode,
     )
+    run_id = Path(args.output_path).name if args.output_path is not None else "unknown_run_id"
+    run_t0 = time.perf_counter()
+    run_status = "ok"
+    run_error: str | None = None
     try:
         runner.run()
+    except Exception as exc:
+        run_status = "error"
+        run_error = repr(exc)
+        raise
     finally:
+        _append_total_runtime_record(
+            output_path_arg=args.output_path,
+            run_id=run_id,
+            total_time_s=time.perf_counter() - run_t0,
+            vllm_tp_size=vllm_tp_size,
+            sae_tp_size=sae_tp_size,
+            vllm_dp_size=args.vllm_dp_size,
+            sae_dp_size=args.sae_dp_size,
+            sae_dp_mode=args.sae_dp_mode,
+            status=run_status,
+            error=run_error,
+        )
         if dist.is_initialized():
             dist.destroy_process_group()
 

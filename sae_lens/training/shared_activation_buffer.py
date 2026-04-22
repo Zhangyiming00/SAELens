@@ -5,17 +5,19 @@ Layout (5 files in base_dir, default /dev/shm):
   {name}_state.bin   — int8 memmap  (num_chunks,)
   {name}_meta.bin    — int32 memmap (num_chunks, 4)
                          [0] valid_tokens  [1] producer_id  [2] seq_no  [3] reserved
-  {name}_header.bin  — int32 memmap (6,)
+  {name}_header.bin  — int32 memmap (8,)
                          [0] num_producers
                          [1] done_count       (each producer increments on finish)
                          [2] target_chunks    (global chunk budget, set at create)
                          [3] next_claim_seq   (monotonically incremented under lock)
-                         [4-5] reserved
-  {name}_data.bin    — uint16 memmap (num_chunks, chunk_size_tokens, d_model)
-                         bfloat16 stored as raw uint16 bit-pattern
+                         [4] dtype_code       (0=bfloat16, 1=float32)
+                         [5-7] reserved
+  {name}_data.bin    — dtype-dependent memmap (num_chunks, chunk_size_tokens, d_model)
+                         bfloat16: uint16 memmap, bfloat16 stored as raw uint16 bit-pattern
+                         float32:  float32 memmap
   {name}.lock        — empty file used for fcntl.flock
 
-v1 dtype: bfloat16 only.
+v1 dtype: bfloat16 (dtype_code=0) or float32 (dtype_code=1).
 """
 
 import fcntl
@@ -43,14 +45,14 @@ class SharedActivationBuffer:
 
     Producer side:
       - allocate_write_chunk()  → (chunk_idx, seq_no) or None when quota done
-      - write_chunk()           → write bfloat16 activations into slot
+      - write_chunk()           → write activations into slot (cast to buffer dtype)
       - mark_ready()            → mark slot as consumable
       - abort_write_chunk()     → return slot to FREE on dataset EOF
       - signal_done()           → signal this producer has finished
 
     Consumer side:
       - acquire_up_to(n)        → claim up to n READY slots (returns 1..n); StopIteration on EOF
-      - read_chunk(i)           → read activations back as bfloat16
+      - read_chunk(i)           → read activations back in buffer dtype
       - release_chunk(i)        → return slot to FREE
 
     Locking: fcntl.flock exclusive lock for all state-machine transitions.
@@ -67,6 +69,7 @@ class SharedActivationBuffer:
         target_chunks: int = 0,
         create: bool = False,
         base_dir: str = "/dev/shm",
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         self._name = name
         self._num_chunks = num_chunks
@@ -80,14 +83,24 @@ class SharedActivationBuffer:
         data_path = self._base / f"{name}_data.bin"
         lock_path = self._base / f"{name}.lock"
 
+        _DTYPE_TO_CODE = {torch.bfloat16: 0, torch.float32: 1}
+        _CODE_TO_NP = {0: np.uint16, 1: np.float32}
+        _CODE_TO_TORCH = {0: torch.bfloat16, 1: torch.float32}
+
         if create:
+            if dtype not in _DTYPE_TO_CODE:
+                raise ValueError(f"SharedActivationBuffer only supports bfloat16 or float32, got {dtype}")
+            dtype_code = _DTYPE_TO_CODE[dtype]
+            np_dtype = _CODE_TO_NP[dtype_code]
+            elem_bytes = 2 if dtype_code == 0 else 4
+
             if state_path.exists():
                 import logging
                 logging.getLogger("saelens.streaming").warning(
                     "SharedActivationBuffer: stale files found for %s, overwriting.", name
                 )
             # Check disk space
-            data_bytes = num_chunks * chunk_size_tokens * d_model * 2  # uint16
+            data_bytes = num_chunks * chunk_size_tokens * d_model * elem_bytes
             free = shutil.disk_usage(str(self._base)).free
             if free < data_bytes + 1024 * 1024:  # 1 MB headroom
                 raise RuntimeError(
@@ -97,17 +110,18 @@ class SharedActivationBuffer:
             # Create and zero-initialise all files
             self._create_file(state_path, num_chunks, dtype=np.int8)
             self._create_file(meta_path, num_chunks * 4, dtype=np.int32)
-            hdr = self._create_file(header_path, 6, dtype=np.int32)
+            hdr = self._create_file(header_path, 8, dtype=np.int32)
             hdr[0] = num_producers
             hdr[1] = 0
             hdr[2] = target_chunks
             hdr[3] = 0
+            hdr[4] = dtype_code
             hdr.flush()
-            self._create_file(data_path, num_chunks * chunk_size_tokens * d_model, dtype=np.uint16)
+            self._create_file(data_path, num_chunks * chunk_size_tokens * d_model, dtype=np_dtype)
             lock_path.touch(exist_ok=True)
 
-        # Open memmaps
-        mode = "r+" if create else "r+"
+        # Open memmaps — read dtype_code from header to support attach (create=False)
+        mode = "r+"
         self._state: np.ndarray = np.memmap(
             str(state_path), dtype=np.int8, mode=mode, shape=(num_chunks,)
         )
@@ -115,11 +129,15 @@ class SharedActivationBuffer:
             str(meta_path), dtype=np.int32, mode=mode, shape=(num_chunks, 4)
         )
         self._header: np.ndarray = np.memmap(
-            str(header_path), dtype=np.int32, mode=mode, shape=(6,)
+            str(header_path), dtype=np.int32, mode=mode, shape=(8,)
         )
+        dtype_code = int(self._header[4])
+        np_dtype = _CODE_TO_NP.get(dtype_code, np.uint16)
+        self._dtype: torch.dtype = _CODE_TO_TORCH.get(dtype_code, torch.bfloat16)
+        self._dtype_code: int = dtype_code
         self._data: np.ndarray = np.memmap(
             str(data_path),
-            dtype=np.uint16,
+            dtype=np_dtype,
             mode=mode,
             shape=(num_chunks, chunk_size_tokens, d_model),
         )
@@ -174,20 +192,24 @@ class SharedActivationBuffer:
         valid_tokens: int,
         producer_id: int = 0,
     ) -> None:
-        """Write bfloat16 activations (CPU tensor) into the data memmap as uint16.
+        """Write activations (CPU tensor) into the data memmap.
 
-        activations must be on CPU and have dtype bfloat16 or be castable to it.
+        activations will be cast to the buffer's dtype (bfloat16 or float32).
         valid_tokens rows are written; remaining rows are zero-filled.
         """
         assert int(self._state[chunk_idx]) == ChunkState.WRITING
-        if activations.dtype != torch.bfloat16:
-            activations = activations.to(torch.bfloat16)
+        if activations.dtype != self._dtype:
+            activations = activations.to(self._dtype)
         if activations.device.type != "cpu":
             activations = activations.cpu()
 
         rows = min(int(valid_tokens), self._chunk_size_tokens)
-        # View bfloat16 as int16, then reinterpret as uint16 via numpy
-        arr = activations[:rows].contiguous().view(torch.int16).numpy().view(np.uint16)
+        if self._dtype_code == 0:
+            # bfloat16: view as int16 → uint16 for memmap storage
+            arr = activations[:rows].contiguous().view(torch.int16).numpy().view(np.uint16)
+        else:
+            # float32: store directly
+            arr = activations[:rows].contiguous().numpy()
         self._data[chunk_idx, :rows, :] = arr
         if rows < self._chunk_size_tokens:
             self._data[chunk_idx, rows:, :] = 0
@@ -252,14 +274,17 @@ class SharedActivationBuffer:
     def read_chunk(self, chunk_idx: int) -> tuple[torch.Tensor, int]:
         """Read a CONSUMING slot. Returns (activations, valid_tokens).
 
-        activations has shape (valid_tokens, d_model) with dtype bfloat16.
+        activations has shape (valid_tokens, d_model) with the buffer's dtype.
         No lock needed — the slot is exclusively CONSUMING for this caller.
         """
         valid_tokens = int(self._meta[chunk_idx, 0])
-        # Slice only valid rows; copy to avoid holding memmap reference
-        raw_uint16 = np.array(self._data[chunk_idx, :valid_tokens, :])  # (valid, d_model)
-        # Reinterpret uint16 → int16 → bfloat16
-        tensor = torch.from_numpy(raw_uint16.view(np.int16)).view(torch.bfloat16)
+        raw = np.array(self._data[chunk_idx, :valid_tokens, :])  # (valid, d_model)
+        if self._dtype_code == 0:
+            # bfloat16: reinterpret uint16 → int16 → bfloat16
+            tensor = torch.from_numpy(raw.view(np.int16)).view(torch.bfloat16)
+        else:
+            # float32: direct conversion
+            tensor = torch.from_numpy(raw)
         return tensor, valid_tokens
 
     def release_chunk(self, chunk_idx: int) -> None:

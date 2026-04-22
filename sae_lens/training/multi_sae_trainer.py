@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import os
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -178,6 +179,7 @@ class MultiSAETrainer:
         self._t_ready: float = time.time()
         self.mse_history_path: Path | None = None
         self.timing_history_path: Path | None = None
+        self.memory_history_path: Path | None = None
         self.checkpoint_thresholds: list[int] = []
         if self.cfg.n_checkpoints > 0:
             self.checkpoint_thresholds = list(
@@ -209,6 +211,24 @@ class MultiSAETrainer:
             output_path.mkdir(exist_ok=True, parents=True)
             self.timing_history_path = output_path / TIMING_HISTORY_FILENAME
             self.timing_history_path.write_text("")
+
+        # Memory profiling: each rank writes its own file (global_rank for multi-node safety).
+        if dist.is_available() and dist.is_initialized():
+            _global_rank = dist.get_rank()
+        else:
+            _global_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        self._memory_rank: int = _global_rank
+        self._profile_memory: bool = (
+            cfg.output_path is not None
+            and getattr(cfg, "save_memory_every_n_steps", 0) > 0
+        )
+        if self._profile_memory:
+            output_path = Path(cfg.output_path)  # type: ignore[arg-type]
+            output_path.mkdir(exist_ok=True, parents=True)
+            self.memory_history_path = (
+                output_path / f"memory_history_rank{_global_rank}.jsonl"
+            )
+            self.memory_history_path.write_text("")
 
     def _dp_world_size(self) -> int:
         if (
@@ -318,10 +338,20 @@ class MultiSAETrainer:
 
             self._maybe_synchronize_timing()
             sae_t0 = time.perf_counter()
+            if self._profile_memory:
+                torch.cuda.reset_peak_memory_stats(self.cfg.device)
             with cuda_nvtx_range("multi_sae:train_step"):
                 outputs, sae_phase_timing = self._train_step(scaled_batch_by_hook, local_n)
             self._maybe_synchronize_timing()
             sae_time_s = time.perf_counter() - sae_t0
+
+            if self._profile_memory:
+                memory_stats: dict[str, float] = {
+                    "peak_step_allocated_mb": torch.cuda.max_memory_allocated(self.cfg.device) / 1024**2,
+                    "peak_step_reserved_mb": torch.cuda.max_memory_reserved(self.cfg.device) / 1024**2,
+                }
+            else:
+                memory_stats = {}
 
             self._record_mse_if_needed(outputs, local_n)
             vllm_step_time_s = data_timing["vllm_step_time_s"]
@@ -336,6 +366,7 @@ class MultiSAETrainer:
                 **timing,
                 **sae_phase_timing,
             )
+            self._record_memory_if_needed(memory_stats)
             self.n_training_steps += 1
             self.lr_scheduler.step()
             self._checkpoint_if_needed()
@@ -788,6 +819,8 @@ class MultiSAETrainer:
             {"sparsity": self.log_feature_sparsity_by_hook[hook_name]},
             out_dir / SPARSITY_FILENAME,
         )
+        del state_dict
+        torch.cuda.empty_cache()
         if not self._is_fsdp:
             self._tp_barrier()
 
@@ -969,8 +1002,15 @@ class MultiSAETrainer:
         sae = self.sae_by_hook[hook_name]
         base_sae = self.base_sae_by_hook[hook_name]
         hook_dir = checkpoint_path / sanitize_hook_name_for_path(hook_name)
-        state_dict = load_file(hook_dir / SAE_WEIGHTS_FILENAME)
-        base_sae.process_state_dict_for_loading(state_dict)
+        filepath = hook_dir / SAE_WEIGHTS_FILENAME
+
+        tp_group = getattr(base_sae, "_tp_group", None)
+        if tp_group is not None and dist.get_world_size(tp_group) > 1:
+            state_dict = _load_tp_sharded_state_dict(filepath, base_sae, tp_group)
+        else:
+            state_dict = load_file(filepath)
+            base_sae.process_state_dict_for_loading(state_dict)
+
         if self._is_fsdp:
             with FSDP.state_dict_type(sae, StateDictType.FULL_STATE_DICT):
                 sae.load_state_dict(state_dict)
@@ -978,6 +1018,7 @@ class MultiSAETrainer:
             sae.module.load_state_dict(state_dict)
         else:
             base_sae.load_state_dict(state_dict)
+        del state_dict
 
     def _maybe_synchronize_timing(self) -> None:
         if not self.cfg.synchronize_timing:
@@ -1127,3 +1168,95 @@ class MultiSAETrainer:
         with open(self.timing_history_path, "a") as f:
             json.dump(record, f)
             f.write("\n")
+
+    def _record_memory_if_needed(self, memory_stats: dict[str, float]) -> None:
+        if self.memory_history_path is None:
+            return
+        save_every = getattr(self.cfg, "save_memory_every_n_steps", 0)
+        if (self.n_training_steps + 1) % save_every != 0:
+            return
+        record: dict[str, object] = {
+            "step": self.n_training_steps + 1,
+            "n_training_samples": self.n_training_samples,
+            "rank": self._memory_rank,
+            **memory_stats,
+        }
+        with open(self.memory_history_path, "a") as f:
+            json.dump(record, f)
+            f.write("\n")
+
+
+def _load_tp_sharded_state_dict(
+    filepath: Path,
+    base_sae: Any,
+    tp_group: dist.ProcessGroup,
+) -> dict[str, torch.Tensor]:
+    """Load a checkpoint such that only tp_rank=0 reads the full file.
+
+    tp_rank=0 loads the full state_dict, then scatters each parameter's shard
+    to the corresponding rank. Non-sharded parameters (shard_dim=None) are
+    broadcast from tp_rank=0. Returns a state_dict containing only this rank's
+    shard — callers must NOT call process_state_dict_for_loading afterwards.
+    """
+    from safetensors import safe_open
+    from sae_lens.util import str_to_dtype
+
+    tp_rank = dist.get_rank(tp_group)
+    tp_size = dist.get_world_size(tp_group)
+    shard_dims: dict[str, int | None] = base_sae._tp_param_shard_dims()
+
+    # tp_rank=0 loads full tensors; others only need metadata for pre-allocation
+    full_state: dict[str, torch.Tensor] | None = None
+    if tp_rank == 0:
+        full_state = load_file(str(filepath))
+
+    _safetensors_dtype_map = {
+        "F32": "float32", "BF16": "bfloat16", "F16": "float16",
+        "F64": "float64", "I32": "int32", "I64": "int64",
+    }
+
+    state_dict: dict[str, torch.Tensor] = {}
+    with safe_open(str(filepath), framework="pt", device="cpu") as f:
+        for k in f.keys():
+            sl = f.get_slice(k)
+            shape = list(sl.get_shape())
+            dtype_str = str(sl.get_dtype())
+            dtype = str_to_dtype(_safetensors_dtype_map.get(dtype_str, dtype_str.lower()))
+            shard_dim = shard_dims.get(k)
+
+            if shard_dim is None:
+                # Non-sharded parameter (e.g. b_dec): broadcast from rank 0
+                if tp_rank == 0:
+                    tensor = full_state[k]  # type: ignore[index]
+                else:
+                    tensor = torch.empty(shape, dtype=dtype)
+                dist.broadcast(tensor, src=dist.get_global_rank(tp_group, 0), group=tp_group)
+                state_dict[k] = tensor
+            else:
+                # Sharded parameter: scatter shard_dim slices to each rank
+                full_size = shape[shard_dim]
+                assert full_size % tp_size == 0, (
+                    f"Checkpoint tensor '{k}' size {full_size} on dim {shard_dim} "
+                    f"not divisible by tp_size={tp_size}"
+                )
+                shard_size = full_size // tp_size
+                shard_shape = shape[:]
+                shard_shape[shard_dim] = shard_size
+                recv_buf = torch.empty(shard_shape, dtype=dtype)
+                if tp_rank == 0:
+                    chunks = full_state[k].split(shard_size, dim=shard_dim)  # type: ignore[index]
+                    scatter_list = [c.contiguous() for c in chunks]
+                else:
+                    scatter_list = None
+                dist.scatter(
+                    recv_buf,
+                    scatter_list,
+                    src=dist.get_global_rank(tp_group, 0),
+                    group=tp_group,
+                )
+                state_dict[k] = recv_buf
+
+    if tp_rank == 0:
+        del full_state
+
+    return state_dict
