@@ -53,6 +53,7 @@ class StreamingActivationProvider:
         shuffle: bool = True,
         random_chunks: bool = True,
         buffer_monitor_path: Path | None = None,
+        hook_names: list[str] | None = None,
     ) -> None:
         self._buffer = buffer
         self._batch_size = train_batch_size_tokens
@@ -66,6 +67,11 @@ class StreamingActivationProvider:
 
         self._shuffle = shuffle
         self._random_chunks = random_chunks
+
+        self._hook_names = hook_names
+        self._num_hooks = len(hook_names) if hook_names else 1
+        self._is_multi_hook = self._num_hooks > 1
+        self._tokens_per_hook = train_batch_size_tokens
 
         self._pool: torch.Tensor | None = None
         self._pool_start: int = 0
@@ -92,12 +98,13 @@ class StreamingActivationProvider:
             buffer_monitor_path.parent.mkdir(parents=True, exist_ok=True)
             buffer_monitor_path.write_text("")
 
-    def __iter__(self) -> Iterator[torch.Tensor]:
+    def __iter__(self) -> Iterator[torch.Tensor | dict[str, torch.Tensor]]:
         return self
 
-    def __next__(self) -> torch.Tensor:
+    def __next__(self) -> torch.Tensor | dict[str, torch.Tensor]:
+        take_size = self._batch_size * self._num_hooks
         # Serve from pool if a full batch is available
-        if self._pool is not None and self._pool_start + self._batch_size <= self._pool_len:
+        if self._pool is not None and self._pool_start + take_size <= self._pool_len:
             return self._take()
         # Otherwise refill; on StopIteration, serve any remaining partial batch first
         try:
@@ -238,7 +245,9 @@ class StreamingActivationProvider:
             self._last_transfer_time_s = time.perf_counter() - t0
 
         # Shuffle new data
-        if self._shuffle:
+        if self._is_multi_hook:
+            new_data = self._reinterleave_hooks(new_data)
+        elif self._shuffle:
             perm = torch.randperm(new_data.shape[0], device=self._device)
             new_data = new_data[perm]
 
@@ -251,18 +260,85 @@ class StreamingActivationProvider:
         self._pool_start = 0
         self._pool_len = self._pool.shape[0]
 
-    def _take(self) -> torch.Tensor:
-        """Return next batch from the pool, updating pool_start and consumed_tokens."""
-        end = min(self._pool_start + self._batch_size, self._pool_len)
+    def _take(self) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Return next batch from the pool, updating pool_start and consumed_tokens.
+
+        For multi-hook, the pool stores interleaved hooks:
+        [hook0_batch, hook1_batch, hook0_batch, hook1_batch, ...].
+        We take batch_size * num_hooks rows and split into a dict.
+        """
+        take_size = self._batch_size * self._num_hooks
+        end = min(self._pool_start + take_size, self._pool_len)
         batch = self._pool[self._pool_start:end]
         self._pool_start = end
-        self._consumed_tokens += batch.shape[0]
+        self._consumed_tokens += batch.shape[0] // self._num_hooks
         self._consume_step += 1
         self._shm_log({
             "event": "consume",
             "step": self._consume_step,
-            "batch_tokens": batch.shape[0],
+            "batch_tokens": batch.shape[0] // self._num_hooks,
             "pool_tokens_remaining": self._pool_len - self._pool_start,
             "cumulative_tokens": self._consumed_tokens,
         })
+        if self._is_multi_hook:
+            assert self._hook_names is not None
+            tph = batch.shape[0] // self._num_hooks
+            return {
+                name: batch[i * tph : (i + 1) * tph]
+                for i, name in enumerate(self._hook_names)
+            }
         return batch
+
+    def _reinterleave_hooks(self, data: torch.Tensor) -> torch.Tensor:
+        """Re-interleave multi-hook chunk data into batch-sized blocks.
+
+        Input layout (from buffer chunks):
+          [chunk0_hook0, chunk0_hook1, chunk1_hook0, chunk1_hook1, ...]
+          where each block is variable-sized but total rows per hook are equal.
+
+        Output layout (for _take()):
+          [hook0_batch, hook1_batch, hook0_batch, hook1_batch, ...]
+          where each block is batch_size rows.
+
+        Each hook's data is shuffled independently if shuffle is enabled.
+        """
+        nh = self._num_hooks
+        total = data.shape[0]
+        tokens_per_hook = total // nh
+
+        # Split concatenated chunks into per-hook streams.
+        # Chunks are laid out as [h0, h1, h0, h1, ...] with each h_i block
+        # being chunk_size_tokens rows.  Reshape to (num_chunks, nh, chunk_tokens, d)
+        # then transpose to (nh, num_chunks * chunk_tokens, d).
+        per_hook: list[torch.Tensor] = []
+        # Robust path: iterate chunk-sized blocks and gather per-hook slices.
+        chunk_rows = self._buffer._chunk_size_tokens if hasattr(self._buffer, '_chunk_size_tokens') else total
+        # Each chunk in the buffer has nh * per_hook_chunk rows.
+        per_hook_chunk = chunk_rows // nh
+        hook_parts: list[list[torch.Tensor]] = [[] for _ in range(nh)]
+        pos = 0
+        while pos < total:
+            for h in range(nh):
+                end = min(pos + per_hook_chunk, total)
+                hook_parts[h].append(data[pos:end])
+                pos = end
+        per_hook = [torch.cat(parts, dim=0) for parts in hook_parts]
+
+        if self._shuffle:
+            for h in range(nh):
+                perm = torch.randperm(per_hook[h].shape[0], device=self._device)
+                per_hook[h] = per_hook[h][perm]
+
+        # Interleave in batch_size blocks: [h0_batch, h1_batch, h0_batch, ...]
+        bs = self._batch_size
+        result_parts: list[torch.Tensor] = []
+        n_batches = tokens_per_hook // bs
+        for b in range(n_batches):
+            for h in range(nh):
+                result_parts.append(per_hook[h][b * bs : (b + 1) * bs])
+        # Remainder (partial batch)
+        rem = tokens_per_hook - n_batches * bs
+        if rem > 0:
+            for h in range(nh):
+                result_parts.append(per_hook[h][n_batches * bs : n_batches * bs + rem])
+        return torch.cat(result_parts, dim=0)

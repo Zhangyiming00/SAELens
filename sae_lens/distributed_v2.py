@@ -209,8 +209,8 @@ def init_distributed_v2(
         if _is_consumer and _sae_tp_rank == tp_r:
             _sae_dp_group = grp
 
-    # --- Compute routing table ---
-    _routing_table = compute_routing_table(P, Q, batch_size)
+    # --- Compute routing table (empty when P=0 — no producers) ---
+    _routing_table = compute_routing_table(P, Q, batch_size) if P > 0 else []
 
     # --- Create Q per-consumer NCCL P2P groups ---
     # Uses NCCL for efficient GPU-to-GPU activation transfers.

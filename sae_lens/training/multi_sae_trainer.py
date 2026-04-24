@@ -310,13 +310,20 @@ class MultiSAETrainer:
             for hook_name in self.hook_names
         }
 
-    def fit(self) -> dict[str, TrainingSAE[Any]]:
+    def fit(
+        self,
+        quiesce_request_path: Path | str | None = None,
+        quiesce_ack_path: Path | str | None = None,
+    ) -> dict[str, TrainingSAE[Any]]:
         pbar = tqdm(total=self.cfg.total_training_samples, desc="Training Multi SAE")
         while self.n_training_samples < self.cfg.total_training_samples:
             step_wall_t0 = time.perf_counter()
             self._maybe_synchronize_timing()
             with cuda_nvtx_range("multi_sae:data_fetch"):
-                batch_by_hook = next(self.data_provider)
+                try:
+                    batch_by_hook = next(self.data_provider)
+                except StopIteration:
+                    break
             if not isinstance(batch_by_hook, dict):
                 raise TypeError(
                     "MultiSAETrainer expected data_provider to yield dict batches"
@@ -378,6 +385,12 @@ class MultiSAETrainer:
                 pbar.set_description(
                     f"{self.n_training_steps}| avg_loss: {avg_loss:.5f}"
                 )
+
+            if quiesce_request_path is not None and Path(quiesce_request_path).exists():
+                self.save_checkpoint(checkpoint_name=f"quiesce_{self.n_training_samples}")
+                if quiesce_ack_path is not None and self._is_metric_writer_rank():
+                    Path(quiesce_ack_path).touch()
+                break
 
         pbar.close()
         # Ensure periodic/deferred stats are flushed before final save/logging.

@@ -108,6 +108,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         dp_group: dist.ProcessGroup | None = None,
         token_count_weighted_dp: bool = False,
         base_sae: T_TRAINING_SAE | None = None,
+        append_logs: bool = False,
     ) -> None:
         self.sae = sae
         # base_sae is the unwrapped module when sae is an FSDP/DDP wrapper.
@@ -138,13 +139,15 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             output_path = Path(self.cfg.output_path)
             output_path.mkdir(exist_ok=True, parents=True)
             self.mse_history_path = output_path / MSE_HISTORY_FILENAME
-            self.mse_history_path.write_text("")
+            if not append_logs:
+                self.mse_history_path.write_text("")
         if self._should_write_timing_metrics():
             assert self.cfg.output_path is not None
             output_path = Path(self.cfg.output_path)
             output_path.mkdir(exist_ok=True, parents=True)
             self.timing_history_path = output_path / TIMING_HISTORY_FILENAME
-            self.timing_history_path.write_text("")
+            if not append_logs:
+                self.timing_history_path.write_text("")
 
         # Memory profiling: each rank writes its own file (global_rank for multi-node safety).
         if dist.is_available() and dist.is_initialized():
@@ -250,7 +253,11 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
     def dead_neurons(self) -> torch.Tensor:
         return (self.n_forward_passes_since_fired > self.cfg.dead_feature_window).bool()
 
-    def fit(self) -> T_TRAINING_SAE:
+    def fit(
+        self,
+        quiesce_request_path: Path | str | None = None,
+        quiesce_ack_path: Path | str | None = None,
+    ) -> T_TRAINING_SAE:
         self.sae.to(self.cfg.device)
         pbar = tqdm(total=self.cfg.total_training_samples, desc="Training SAE")
 
@@ -270,7 +277,10 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                     f"trainer next() start samples={self.n_training_samples}"
                 )
             self._maybe_synchronize_timing()
-            batch = next(self.data_provider).to(self._base_sae.device)
+            try:
+                batch = next(self.data_provider).to(self._base_sae.device)
+            except StopIteration:
+                break
             self._maybe_synchronize_timing()
             data_timing = self._consume_data_provider_timing()
             vllm_step_time_s = data_timing["vllm_step_time_s"]
@@ -303,6 +313,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             self._checkpoint_if_needed()
             self.n_training_steps += 1
             self._update_pbar(step_output, pbar)
+
+            if quiesce_request_path is not None and Path(quiesce_request_path).exists():
+                self.save_checkpoint(checkpoint_name=f"quiesce_{self.n_training_samples}")
+                if quiesce_ack_path is not None and self._is_metric_writer_rank():
+                    Path(quiesce_ack_path).touch()
+                break
 
         # fold the estimated norm scaling factor into the sae weights
         if self.activation_scaler.scaling_factor is not None:
@@ -414,6 +430,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
         if tp_rank != 0:
             return
+        tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
         torch.save(
             {
                 **optimizer_state,
@@ -426,47 +443,54 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 "started_fine_tuning": self.started_fine_tuning,
                 "coefficient_schedulers": scheduler_state_dicts,
                 "sae_dp_mode": self.sae_dp_mode,
+                "elapsed_s": time.time() - self._t_ready,
+                "sae_tp_size": tp_size,
             },
             str(checkpoint_path / TRAINER_STATE_FILENAME),
         )
         activation_scaler_path = checkpoint_path / ACTIVATION_SCALER_CFG_FILENAME
         self.activation_scaler.save(str(activation_scaler_path))
 
-    def load_trainer_state(self, checkpoint_path: Path | str) -> None:
+    def load_trainer_state(
+        self,
+        checkpoint_path: Path | str,
+        skip_optimizer: bool = False,
+    ) -> None:
         checkpoint_path = Path(checkpoint_path)
         self.activation_scaler.load(checkpoint_path / ACTIVATION_SCALER_CFG_FILENAME)
         state_dict = torch.load(
             checkpoint_path / TRAINER_STATE_FILENAME, map_location="cpu"
         )
-        saved_mode = state_dict.get("sae_dp_mode", "manual")
-        current_mode = self.sae_dp_mode
-        if saved_mode != current_mode:
-            raise ValueError(
-                f"Cannot resume: checkpoint was saved with sae_dp_mode='{saved_mode}' "
-                f"but current mode is '{current_mode}'. Cross-mode optimizer resume is "
-                "not supported in v1."
-            )
-        if self._is_fsdp:
-            if state_dict.get("optimizer_state_format") != FSDP_OPTIMIZER_STATE_FORMAT:
+        if not skip_optimizer:
+            saved_mode = state_dict.get("sae_dp_mode", "manual")
+            current_mode = self.sae_dp_mode
+            if saved_mode != current_mode:
                 raise ValueError(
-                    "Cannot resume FSDP checkpoint: missing "
-                    f"optimizer_state_format='{FSDP_OPTIMIZER_STATE_FORMAT}'."
+                    f"Cannot resume: checkpoint was saved with sae_dp_mode='{saved_mode}' "
+                    f"but current mode is '{current_mode}'. Cross-mode optimizer resume is "
+                    "not supported in v1."
                 )
-            expected_dp_size = state_dict.get("fsdp_dp_size")
-            current_dp_size = (
-                dist.get_world_size(self.dp_group) if self.dp_group is not None else 1
-            )
-            if expected_dp_size != current_dp_size:
-                raise ValueError(
-                    "Cannot resume FSDP checkpoint with a different sae_dp_size: "
-                    f"checkpoint has {expected_dp_size}, current run has {current_dp_size}."
+            if self._is_fsdp:
+                if state_dict.get("optimizer_state_format") != FSDP_OPTIMIZER_STATE_FORMAT:
+                    raise ValueError(
+                        "Cannot resume FSDP checkpoint: missing "
+                        f"optimizer_state_format='{FSDP_OPTIMIZER_STATE_FORMAT}'."
+                    )
+                expected_dp_size = state_dict.get("fsdp_dp_size")
+                current_dp_size = (
+                    dist.get_world_size(self.dp_group) if self.dp_group is not None else 1
                 )
-            self._load_fsdp_optimizer_state(checkpoint_path)
-        elif "optimizer_by_name" in state_dict:
-            self._load_named_optimizer_state(state_dict["optimizer_by_name"])
-        else:
-            self.optimizer.load_state_dict(state_dict["optimizer"])
-        self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
+                if expected_dp_size != current_dp_size:
+                    raise ValueError(
+                        "Cannot resume FSDP checkpoint with a different sae_dp_size: "
+                        f"checkpoint has {expected_dp_size}, current run has {current_dp_size}."
+                    )
+                self._load_fsdp_optimizer_state(checkpoint_path)
+            elif "optimizer_by_name" in state_dict:
+                self._load_named_optimizer_state(state_dict["optimizer_by_name"])
+            else:
+                self.optimizer.load_state_dict(state_dict["optimizer"])
+            self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
         self.n_training_samples = state_dict["n_training_samples"]
         self.n_training_steps = state_dict["n_training_steps"]
         self.act_freq_scores = state_dict["act_freq_scores"].to(self.cfg.device)
@@ -477,6 +501,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self.started_fine_tuning = state_dict["started_fine_tuning"]
         for name, scheduler_state_dict in state_dict["coefficient_schedulers"].items():
             self.coefficient_schedulers[name].load_state_dict(scheduler_state_dict)
+        if "elapsed_s" in state_dict:
+            self._t_ready = time.time() - state_dict["elapsed_s"]
 
     def _fsdp_optimizer_state_path(self, checkpoint_path: Path) -> Path:
         dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0

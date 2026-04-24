@@ -27,7 +27,7 @@ import time
 from contextlib import contextmanager
 from enum import IntEnum
 from pathlib import Path
-from typing import Generator
+from typing import Callable, Generator
 
 import numpy as np
 import torch
@@ -148,11 +148,15 @@ class SharedActivationBuffer:
     # Producer API
     # ------------------------------------------------------------------
 
-    def allocate_write_chunk(self) -> tuple[int, int] | None:
+    def allocate_write_chunk(
+        self,
+        stop_check: "Callable[[], bool] | None" = None,
+    ) -> tuple[int, int] | None:
         """Claim a FREE slot and increment the global sequence counter.
 
         Returns (chunk_idx, seq_no) if quota remains, or None if
-        next_claim_seq >= target_chunks (global budget exhausted).
+        next_claim_seq >= target_chunks (global budget exhausted) or
+        stop_check() returns True.
 
         Blocks with backoff until a FREE slot is available.
         """
@@ -173,6 +177,8 @@ class SharedActivationBuffer:
                     self._state.flush()
                     self._backoff_count = 0
                     return free_idx, seq
+            if stop_check is not None and stop_check():
+                return None
             time.sleep(self._backoff())
 
     def abort_write_chunk(self, chunk_idx: int) -> None:
@@ -325,6 +331,25 @@ class SharedActivationBuffer:
         for arr in (self._state, self._meta, self._header, self._data):
             arr.flush()
         self._lock_fd.close()
+
+    def reset_for_restart(self, new_num_producers: int) -> None:
+        """Reset buffer state for a new producer group after quiesce.
+
+        Resets any WRITING chunks to FREE (abandoned mid-write), updates
+        num_producers to the new vllm_dp value, and zeroes done_count so the
+        new producer group can signal completion independently.
+
+        Called by the supervisor before relaunching workers. No workers should
+        be alive when this is called.
+        """
+        with self._locked():
+            for i in range(self._num_chunks):
+                if int(self._state[i]) == ChunkState.WRITING:
+                    self._state[i] = ChunkState.FREE
+            self._state.flush()
+            self._header[0] = new_num_producers
+            self._header[1] = 0
+            self._header.flush()
 
     # NOTE: No destroy() method in v1. Producers only call close().
     # Stale /dev/shm files are detected on the next create (logged + overwritten).

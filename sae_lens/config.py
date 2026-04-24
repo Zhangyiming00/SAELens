@@ -353,11 +353,6 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         if self.ddp_bucket_cap_mb is not None and self.ddp_bucket_cap_mb <= 0:
             raise ValueError("ddp_bucket_cap_mb must be > 0 when set")
         if self.streaming_mode:
-            if self.hook_names is not None and len(self.hook_names) > 1:
-                raise ValueError(
-                    "streaming_mode v1 supports only a single hook "
-                    "(hook_names must be None or length 1)."
-                )
             if self.streaming_prefetch_chunks < 1:
                 raise ValueError("streaming_prefetch_chunks must be >= 1.")
             if self.streaming_num_chunks <= self.streaming_prefetch_chunks:

@@ -24,19 +24,20 @@ def init_distributed_streaming(
 ) -> None:
     """Initialize process groups for streaming_mode v1.
 
-    Enforces sae_dp == 1 (sae_dp > 1 is not supported in v1 — independent
-    acquire_up_to() calls diverge at stream tail, causing DDP AllReduce hangs).
+    sae_dp must be 0 or 1.  sae_dp=0 means no SAE consumers (vLLM-only topology,
+    all ranks are producers).  sae_dp>1 is not supported — independent
+    acquire_up_to() calls diverge at stream tail, causing DDP AllReduce hangs.
     """
-    if sae_dp != 1:
+    if sae_dp not in (0, 1):
         raise ValueError(
-            f"streaming_mode v1 requires sae_dp=1, got sae_dp={sae_dp}. "
+            f"streaming_mode v1 requires sae_dp in {{0, 1}}, got sae_dp={sae_dp}. "
             "sae_dp > 1 is not supported in v1."
         )
     global _vllm_dp_size
     _vllm_dp_size = vllm_dp
     _v2.init_distributed_v2(
         P=vllm_dp,
-        Q=1,
+        Q=sae_dp,
         vllm_tp_size=vllm_tp,
         sae_tp_size=sae_tp,
         batch_size=1,

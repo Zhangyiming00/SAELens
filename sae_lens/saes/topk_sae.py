@@ -518,6 +518,7 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
     def sync_tensor_parallel_gradients(self) -> None:
         if self._tp_group is None:
             return
+        tp_size = dist.get_world_size(self._tp_group)
 
         for name, param in self.named_parameters():
             if param.grad is None:
@@ -526,6 +527,7 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 continue
             with nccl_nvtx_range("nccl:topk_tp_replicated_grad_all_reduce", self._tp_group):
                 dist.all_reduce(param.grad, group=self._tp_group)
+            param.grad /= tp_size
 
     @override
     def save_model(self, path: str | Path) -> tuple[Path, Path]:
@@ -658,12 +660,7 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
             if self.cfg.rescale_acts_by_decoder_norm:
                 local_acts = local_acts * (1 / self.W_dec.norm(dim=-1))
             _debug_topk_tp("decode allreduce start")
-            # b_dec also appears in process_sae_in(). Its encode-path gradient is sharded
-            # across TP ranks, while its decode-path gradient is replicated on every rank.
-            # Scale only the decode-path backward contribution so the later TP all-reduce on
-            # b_dec.grad reconstructs the single-rank gradient exactly.
-            decode_bias = _scale_gradient(self.b_dec, 1.0 / tp_size)
-            sae_out_pre = tp_allreduce(local_acts @ self.W_dec, self._tp_group) + decode_bias
+            sae_out_pre = tp_allreduce(local_acts @ self.W_dec, self._tp_group) + self.b_dec
             _debug_topk_tp("decode allreduce done")
         else:
             sae_out_pre = (

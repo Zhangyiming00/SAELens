@@ -123,6 +123,7 @@ class ActivationsStore:
         dataset_shard_index: int = 0,
         dataset_shard_count: int = 1,
         consumer_only: bool = False,
+        mixing_shard_index: int | None = None,
     ) -> ActivationsStore:
         if isinstance(cfg, CacheActivationsRunnerConfig):
             return cls.from_cache_activations(model, cfg)
@@ -187,6 +188,7 @@ class ActivationsStore:
             dataset_shard_index=dataset_shard_index,
             dataset_shard_count=dataset_shard_count,
             consumer_only=consumer_only,
+            mixing_shard_index=mixing_shard_index if mixing_shard_index is not None else dataset_shard_index,
         )
 
     @classmethod
@@ -267,6 +269,7 @@ class ActivationsStore:
         dataset_shard_index: int = 0,
         dataset_shard_count: int = 1,
         consumer_only: bool = False,
+        mixing_shard_index: int | None = None,
     ):
         self.model = model
         if model_kwargs is None:
@@ -276,7 +279,23 @@ class ActivationsStore:
         if isinstance(dataset, str):
             dataset_path = Path(dataset)
             if dataset_path.exists() and dataset_path.is_dir():
-                self.dataset = datasets.load_from_disk(str(dataset_path))
+                parquet_files = sorted(dataset_path.glob("*.parquet"))
+                if parquet_files:
+                    self.dataset = load_dataset(
+                        "parquet",
+                        data_files=[str(p) for p in parquet_files],
+                        split="train",
+                        streaming=streaming,  # type: ignore
+                    )
+                else:
+                    self.dataset = datasets.load_from_disk(str(dataset_path))
+            elif dataset_path.exists() and dataset_path.suffix == ".parquet":
+                self.dataset = load_dataset(
+                    "parquet",
+                    data_files=str(dataset_path),
+                    split="train",
+                    streaming=streaming,  # type: ignore
+                )
             else:
                 self.dataset = load_dataset(
                     dataset,
@@ -330,7 +349,8 @@ class ActivationsStore:
         # (e.g. extra model/SAE initialization paths in multi-hook runs).
         if mixing_seed is not None:
             self._mixing_generator = torch.Generator()
-            self._mixing_generator.manual_seed(int(mixing_seed) + int(dataset_shard_index))
+            _mix_idx = mixing_shard_index if mixing_shard_index is not None else dataset_shard_index
+            self._mixing_generator.manual_seed(int(mixing_seed) + int(_mix_idx))
         self._current_data_timing = {
             "vllm_step_time_s": 0.0,
             "transfer_time_s": 0.0,
@@ -795,13 +815,21 @@ class ActivationsStore:
         if is_root and not hasattr(self, "_stream_residual"):
             self._stream_residual: torch.Tensor | None = None
             self._stream_exhausted = False
+            self._stream_collected_by_hook: dict[str, list[torch.Tensor]] = {}
 
         if is_root:
             collected: list[torch.Tensor] = []
-            if self._stream_residual is not None:
-                collected.append(self._stream_residual)
-                self._stream_residual = None
-            tokens_so_far = sum(t.shape[0] for t in collected)
+            if self.is_multi_hook:
+                if not self._stream_collected_by_hook:
+                    self._stream_collected_by_hook = {h: [] for h in self.hook_names}
+                tokens_so_far = sum(
+                    t.shape[0] for t in self._stream_collected_by_hook[self.hook_names[0]]
+                )
+            else:
+                if self._stream_residual is not None:
+                    collected.append(self._stream_residual)
+                    self._stream_residual = None
+                tokens_so_far = sum(t.shape[0] for t in collected)
 
         while True:
             # Phase A: root decides; broadcasts ctrl to all TP ranks
@@ -841,11 +869,23 @@ class ActivationsStore:
 
             if is_root:
                 if isinstance(acts, dict):
-                    acts = next(iter(acts.values()))
-                if acts.ndim == 3:
-                    acts = acts.reshape(-1, acts.shape[-1])
-                collected.append(acts.cpu())
-                tokens_so_far += acts.shape[0]
+                    # Multi-hook: collect each hook separately, concatenate
+                    # by hook at the end so chunk layout is [all_h0, all_h1, ...].
+                    if not hasattr(self, "_stream_collected_by_hook"):
+                        self._stream_collected_by_hook: dict[str, list[torch.Tensor]] = {
+                            h: [] for h in self.hook_names
+                        }
+                    for hook_name in self.hook_names:
+                        a = acts[hook_name]
+                        if a.ndim == 3:
+                            a = a.reshape(-1, a.shape[-1])
+                        self._stream_collected_by_hook[hook_name].append(a.cpu())
+                    tokens_so_far += next(iter(acts.values())).reshape(-1, acts[self.hook_names[0]].shape[-1]).shape[0]
+                else:
+                    if acts.ndim == 3:
+                        acts = acts.reshape(-1, acts.shape[-1])
+                    collected.append(acts.cpu())
+                    tokens_so_far += acts.shape[0]
 
         if not is_root:
             return None, 0
@@ -853,10 +893,24 @@ class ActivationsStore:
         if tokens_so_far == 0:
             return None, 0
 
-        full = torch.cat(collected, dim=0)
-        if full.shape[0] > chunk_size_tokens:
-            self._stream_residual = full[chunk_size_tokens:]
-            full = full[:chunk_size_tokens]
+        if self.is_multi_hook:
+            num_hooks = len(self.hook_names)
+            per_hook_cats = [
+                torch.cat(self._stream_collected_by_hook[h], dim=0)
+                for h in self.hook_names
+            ]
+            trimmed = [cat[:chunk_size_tokens] for cat in per_hook_cats]
+            full = torch.cat(trimmed, dim=0)
+            for i, h in enumerate(self.hook_names):
+                if per_hook_cats[i].shape[0] > chunk_size_tokens:
+                    self._stream_collected_by_hook[h] = [per_hook_cats[i][chunk_size_tokens:]]
+                else:
+                    self._stream_collected_by_hook[h] = []
+        else:
+            full = torch.cat(collected, dim=0)
+            if full.shape[0] > chunk_size_tokens:
+                self._stream_residual = full[chunk_size_tokens:]
+                full = full[:chunk_size_tokens]
 
         return full, full.shape[0]
 
@@ -1600,7 +1654,9 @@ class ActivationsStore:
 
     def save_to_checkpoint(self, checkpoint_path: str | Path):
         """Save the state dict to a checkpoint path"""
-        self.save(str(Path(checkpoint_path) / ACTIVATIONS_STORE_STATE_FILENAME))
+        checkpoint_path = Path(checkpoint_path)
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
+        self.save(str(checkpoint_path / ACTIVATIONS_STORE_STATE_FILENAME))
 
     def load_from_checkpoint(self, checkpoint_path: str | Path):
         """Load the state dict from a checkpoint path"""

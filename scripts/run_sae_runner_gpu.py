@@ -41,6 +41,8 @@ from sae_lens.config import LanguageModelSAERunnerConfig, LoggingConfig
 from sae_lens.constants import SAE_WEIGHTS_FILENAME, TRAINER_STATE_FILENAME
 from sae_lens.llm_sae_training_runner import LanguageModelSAETrainingRunner
 from sae_lens.saes.topk_sae import TopKTrainingSAEConfig
+from sae_lens.training.multi_sae_trainer import MULTI_SAE_MANIFEST_FILENAME
+from sae_lens.topology_control import BufferParams, read_control_state, write_control_state
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +73,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="float32")
     parser.add_argument("--autocast", action="store_true")
     parser.add_argument("--autocast-lm", action="store_true")
+    parser.add_argument(
+        "--is-dataset-tokenized",
+        dest="is_dataset_tokenized",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no-is-dataset-tokenized",
+        dest="is_dataset_tokenized",
+        action="store_false",
+        help="Dataset has a 'text' column (not pre-tokenized).",
+    )
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
@@ -264,6 +278,16 @@ def parse_args() -> argparse.Namespace:
         help="Disable random chunk selection in streaming_mode (use lowest-index READY slots).",
     )
     parser.set_defaults(streaming_random_chunks=True)
+    parser.add_argument(
+        "--control-state-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to control_state.json written by topology_supervisor.py. "
+            "When provided, topology (vllm_tp, vllm_dp, sae_tp), buffer_name, "
+            "and checkpoint_path are read from this file and override CLI args."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -300,9 +324,15 @@ def _validate_checkpoint_args(args: argparse.Namespace) -> None:
         raise ValueError(f"--resume-from-checkpoint does not exist: {resume_path}")
     if not resume_path.is_dir():
         raise ValueError(f"--resume-from-checkpoint must be a directory: {resume_path}")
+    is_multi_sae = (resume_path / MULTI_SAE_MANIFEST_FILENAME).exists()
+    required_files = (
+        [TRAINER_STATE_FILENAME, MULTI_SAE_MANIFEST_FILENAME]
+        if is_multi_sae
+        else [TRAINER_STATE_FILENAME, SAE_WEIGHTS_FILENAME]
+    )
     missing = [
         filename
-        for filename in (TRAINER_STATE_FILENAME, SAE_WEIGHTS_FILENAME)
+        for filename in required_files
         if not (resume_path / filename).exists()
     ]
     if missing:
@@ -359,6 +389,32 @@ def _append_total_runtime_record(
 
 def main() -> None:
     args = parse_args()
+
+    # If a control state file is provided, override topology and checkpoint args.
+    if args.control_state_path is not None:
+        ctrl = read_control_state(args.control_state_path)
+        args.vllm_tp_size = ctrl.topology.vllm_tp
+        args.vllm_dp_size = ctrl.topology.vllm_dp
+        args.sae_tp_size = ctrl.topology.sae_tp
+        args.sae_dp_size = ctrl.topology.sae_dp
+        args.streaming_buffer_name = ctrl.buffer_name
+        if args.resume_from_checkpoint is None and ctrl.checkpoint_path is not None:
+            args.resume_from_checkpoint = ctrl.checkpoint_path
+        print(
+            f"[INFO] control_state_path={args.control_state_path}: "
+            f"topology=vllm_tp={ctrl.topology.vllm_tp} vllm_dp={ctrl.topology.vllm_dp} "
+            f"sae_tp={ctrl.topology.sae_tp} buffer={ctrl.buffer_name} "
+            f"checkpoint={ctrl.checkpoint_path}"
+        )
+
+    # Derive quiesce_dir from control_state_path so workers look for quiesce
+    # signals in run_dir (where the supervisor writes them), not in checkpoint_path.
+    quiesce_dir = (
+        Path(args.control_state_path).parent
+        if args.control_state_path is not None
+        else None
+    )
+
     _validate_checkpoint_args(args)
     vllm_tp_size = (
         args.vllm_tp_size if args.vllm_tp_size is not None else args.tp_size
@@ -368,10 +424,10 @@ def main() -> None:
         raise ValueError("--vllm-tp-size must be >= 1")
     if sae_tp_size < 1:
         raise ValueError("--sae-tp-size must be >= 1")
-    if args.vllm_dp_size < 1:
-        raise ValueError("--vllm-dp-size must be >= 1")
-    if args.sae_dp_size < 1:
-        raise ValueError("--sae-dp-size must be >= 1")
+    if args.vllm_dp_size < 0:
+        raise ValueError("--vllm-dp-size must be >= 0")
+    if args.sae_dp_size < 0:
+        raise ValueError("--sae-dp-size must be >= 0")
     if args.context_size < 1:
         raise ValueError("--context-size must be >= 1")
     if args.train_batch_size_tokens < 1:
@@ -394,14 +450,14 @@ def main() -> None:
             args.use_shard_routing = True
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if args.streaming_mode:
-        if args.sae_dp_size != 1:
-            raise ValueError("--streaming-mode requires --sae-dp-size 1")
+        if args.sae_dp_size not in (0, 1):
+            raise ValueError("--streaming-mode requires --sae-dp-size 0 or 1")
         args.use_shard_routing = False
-        expected_world_size = vllm_tp_size * args.vllm_dp_size + sae_tp_size * 1
+        expected_world_size = vllm_tp_size * args.vllm_dp_size + sae_tp_size * args.sae_dp_size
         if world_size not in (1, expected_world_size):
             raise ValueError(
                 f"streaming_mode: WORLD_SIZE={world_size} does not match "
-                f"vllm_tp*vllm_dp + sae_tp = {expected_world_size}."
+                f"vllm_tp*vllm_dp + sae_tp*sae_dp = {expected_world_size}."
             )
     else:
         expected_world_size = max(
@@ -487,7 +543,7 @@ def main() -> None:
         dataset_path=args.dataset_path,
         dataset_trust_remote_code=False,
         streaming=False,
-        is_dataset_tokenized=True,
+        is_dataset_tokenized=args.is_dataset_tokenized,
         context_size=args.context_size,
         training_tokens=training_tokens,
         train_batch_size_tokens=train_batch_size_tokens,
@@ -595,7 +651,31 @@ def main() -> None:
         sae_dp_size=args.sae_dp_size,
         use_shard_routing=args.use_shard_routing,
         streaming_mode=args.streaming_mode,
+        quiesce_dir=quiesce_dir,
     )
+
+    # Write buffer name and params to control state on first run (rank 0 only).
+    # The supervisor needs this to reset the buffer on topology switch.
+    if (
+        args.control_state_path is not None
+        and args.streaming_mode
+        and (not dist.is_initialized() or dist.get_rank() == 0)
+        and hasattr(runner, "_streaming_buffer_name")
+        and runner._streaming_buffer_name
+    ):
+        ctrl = read_control_state(args.control_state_path)
+        if not ctrl.buffer_name:
+            ctrl.buffer_name = runner._streaming_buffer_name
+            num_hooks = len(hook_names) if hook_names is not None else 1
+            ctrl.buffer_params = BufferParams(
+                num_chunks=args.streaming_num_chunks,
+                chunk_size_tokens=args.streaming_chunk_size_tokens * num_hooks,
+                d_model=d_in,
+                dtype=args.dtype,
+                num_hooks=num_hooks,
+            )
+            write_control_state(args.control_state_path, ctrl)
+            print(f"[INFO] Wrote buffer name to control state: {runner._streaming_buffer_name}")
     run_id = Path(args.output_path).name if args.output_path is not None else "unknown_run_id"
     run_t0 = time.perf_counter()
     run_status = "ok"

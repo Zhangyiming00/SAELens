@@ -207,6 +207,7 @@ docs/.sae_config_cache/
 results/
 logs/
 scripts/tests/
+scripts/integration_tests/
 scripts/run_sae_runner_gpu.py
 *.tar.gz
 scripts/scripts/

@@ -21,6 +21,7 @@ from typing_extensions import deprecated
 from sae_lens import logger
 from sae_lens.config import HfDataset, LanguageModelSAERunnerConfig
 from sae_lens.constants import (
+    ACTIVATIONS_STORE_STATE_FILENAME,
     RUNNER_CFG_FILENAME,
     SAE_CFG_FILENAME,
     SAE_WEIGHTS_FILENAME,
@@ -53,7 +54,7 @@ from sae_lens.saes.sae import (
 )
 from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.activations_store import ActivationsStore
-from sae_lens.training.multi_sae_trainer import MultiSAETrainer
+from sae_lens.training.multi_sae_trainer import MultiSAETrainer, sanitize_hook_name_for_path
 from sae_lens.training.sae_trainer import SAETrainer
 from sae_lens.training.types import DataProvider
 from sae_lens.util import temporary_seed
@@ -145,6 +146,7 @@ class LanguageModelSAETrainingRunner:
         vllm_dp_size: int = 1,
         use_shard_routing: bool = True,
         streaming_mode: bool = False,
+        quiesce_dir: Path | None = None,
     ):
         if override_dataset is not None:
             logger.warning(
@@ -206,6 +208,7 @@ class LanguageModelSAETrainingRunner:
                     "cfg.model_from_pretrained_kwargs['tensor_parallel_size']"
                 )
 
+        self._quiesce_dir = quiesce_dir
         self.streaming_mode = streaming_mode or cfg.streaming_mode
         if self.streaming_mode:
             self._streaming_init(cfg)
@@ -351,15 +354,19 @@ class LanguageModelSAETrainingRunner:
         # Determine dataset shard params for vLLM DP.
         ds_shard_index = 0
         ds_shard_count = 1
+        mixing_shard_index = 0
         if dist.is_initialized() and vllm_dp_size > 1:
             if use_shard_routing:
                 import sae_lens.distributed_v2 as v2_mod
                 if v2_mod.is_producer():
                     ds_shard_index = v2_mod.get_producer_idx()
                     ds_shard_count = vllm_dp_size
+                if v2_mod.is_consumer():
+                    mixing_shard_index = v2_mod.get_consumer_idx()
             else:
                 ds_shard_index = get_vllm_dp_rank()
                 ds_shard_count = vllm_dp_size
+                mixing_shard_index = ds_shard_index
 
         consumer_only = use_shard_routing and self.sae_active and not self.vllm_active
         self.activations_store = ActivationsStore.from_config(
@@ -369,6 +376,7 @@ class LanguageModelSAETrainingRunner:
             dataset_shard_index=ds_shard_index,
             dataset_shard_count=ds_shard_count,
             consumer_only=consumer_only,
+            mixing_shard_index=mixing_shard_index,
         )
 
         self.sae_by_hook: dict[str, Any] = {}
@@ -1113,7 +1121,7 @@ class LanguageModelSAETrainingRunner:
             vllm_tp=self.vllm_tp_size,
             vllm_dp=self.vllm_dp_size,
             sae_tp=self.sae_tp_size,
-            sae_dp=1,
+            sae_dp=self.sae_dp_size,
         )
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -1133,14 +1141,23 @@ class LanguageModelSAETrainingRunner:
             )
 
         self._streaming_buffer_name = buffer_name
+        self._streaming_num_hooks = len(self.hook_names)
         target_chunks = math.ceil(cfg.training_tokens / cfg.streaming_chunk_size_tokens)
 
-        # Rank 0 creates the shared buffer; all other ranks attach after barrier
-        if dist.get_rank() == 0:
+        # Multi-hook: each chunk stores all hooks' activations concatenated.
+        buf_chunk_size = cfg.streaming_chunk_size_tokens * self._streaming_num_hooks
+
+        # True when no existing buffer was provided — we just generated a fresh name.
+        # False on restart — cfg.streaming_buffer_name was set from control state.
+        is_new_buffer = not cfg.streaming_buffer_name
+
+        # On first run: rank 0 creates the buffer, others attach after barrier.
+        # On restart: all ranks attach to the existing buffer (READY chunks preserved).
+        if is_new_buffer and dist.get_rank() == 0:
             self._streaming_buffer = SharedActivationBuffer(
                 name=buffer_name,
                 num_chunks=cfg.streaming_num_chunks,
-                chunk_size_tokens=cfg.streaming_chunk_size_tokens,
+                chunk_size_tokens=buf_chunk_size,
                 d_model=cfg.sae.d_in,
                 num_producers=self.vllm_dp_size,
                 target_chunks=target_chunks,
@@ -1148,11 +1165,11 @@ class LanguageModelSAETrainingRunner:
                 dtype=str_to_dtype(cfg.dtype),
             )
         dist.barrier()
-        if dist.get_rank() != 0:
+        if not (is_new_buffer and dist.get_rank() == 0):
             self._streaming_buffer = SharedActivationBuffer(
                 name=buffer_name,
                 num_chunks=cfg.streaming_num_chunks,
-                chunk_size_tokens=cfg.streaming_chunk_size_tokens,
+                chunk_size_tokens=buf_chunk_size,
                 d_model=cfg.sae.d_in,
                 num_producers=self.vllm_dp_size,
                 target_chunks=target_chunks,
@@ -1173,7 +1190,10 @@ class LanguageModelSAETrainingRunner:
         # process group was pre-initialized with fewer ranks than torch world_size.
         vllm_world_ranks = list(range(self.vllm_dp_size * self.vllm_tp_size))
         os.environ["SAELENS_VLLM_WORLD_RANKS"] = ",".join(str(r) for r in vllm_world_ranks)
-        preinit_vllm_distributed(vllm_world_ranks, self.vllm_tp_size)
+        # Skip preinit when there are no vLLM ranks (vllm_dp=0 topology).
+        # No LLM() is constructed in that case, so no deadlock can occur.
+        if vllm_world_ranks:
+            preinit_vllm_distributed(vllm_world_ranks, self.vllm_tp_size)
 
         self._sync_run_paths_across_ranks()
         self._init_streaming_logger()
@@ -1200,8 +1220,46 @@ class LanguageModelSAETrainingRunner:
             dataset_shard_index=ds.get_producer_idx(),
             dataset_shard_count=ds.get_vllm_dp_size(),
         )
+        if self._quiesce_dir is not None:
+            best_state = self._find_best_producer_dataset_state(self._quiesce_dir)
+            if best_state is not None:
+                self.activations_store.load_from_checkpoint(best_state)
         self.sae = None
         self._base_sae = None
+
+    @staticmethod
+    def _find_best_producer_dataset_state(qdir: Path) -> Path | None:
+        """Find the producer dataset state with the highest n_dataset_processed.
+
+        When vllm_dp changes across switches, multiple per-producer state dirs
+        may exist. We pick the one that advanced furthest so the new producer(s)
+        fast-forward past all data that was already consumed.
+        """
+        from safetensors.torch import load_file
+        best_path: Path | None = None
+        best_n = -1
+        for p in sorted(qdir.glob("producer_dataset_state_*")):
+            state_file = p / ACTIVATIONS_STORE_STATE_FILENAME
+            if not state_file.exists():
+                continue
+            try:
+                sd = load_file(str(state_file))
+                n = int(sd["n_dataset_processed"].item())
+                if n > best_n:
+                    best_n = n
+                    best_path = p
+            except Exception:
+                continue
+        return best_path
+
+    def _checkpoint_tp_size_changed(self, checkpoint_path: str) -> bool:
+        """Return True if the checkpoint was saved with a different sae_tp_size."""
+        state_path = Path(checkpoint_path) / TRAINER_STATE_FILENAME
+        if not state_path.exists():
+            return False
+        state_dict = torch.load(str(state_path), map_location="cpu")
+        saved_tp = state_dict.get("sae_tp_size", 1)
+        return saved_tp != self.sae_tp_size
 
     def _streaming_init_consumer(
         self, cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG]
@@ -1210,6 +1268,10 @@ class LanguageModelSAETrainingRunner:
 
         self.model = None  # type: ignore[assignment]
         self.activations_store = None  # type: ignore[assignment]
+
+        if self.is_multi_sae:
+            self._streaming_init_consumer_multi(cfg)
+            return
 
         with temporary_seed(cfg.seed):
             sae = TrainingSAE.from_dict(
@@ -1224,8 +1286,56 @@ class LanguageModelSAETrainingRunner:
             if tp_group is not None and hasattr(sae, "shard_weights"):
                 sae.shard_weights(tp_group)
 
+        if cfg.resume_from_checkpoint is not None:
+            logger.info(
+                f"[streaming-consumer] Loading weights from checkpoint: "
+                f"{cfg.resume_from_checkpoint}"
+            )
+            sae.load_weights_from_checkpoint(cfg.resume_from_checkpoint)
+        else:
+            logger.info("[streaming-consumer] No checkpoint to resume from — using fresh weights")
+
         self._base_sae = sae
         self.sae = sae
+
+    def _streaming_init_consumer_multi(
+        self, cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG]
+    ) -> None:
+        import sae_lens.distributed_streaming as ds
+
+        self.sae_by_hook: dict[str, Any] = {}
+        self.base_sae_by_hook: dict[str, TrainingSAE[Any]] = {}
+
+        for idx, hook_name in enumerate(self.hook_names):
+            seed = (
+                cfg.seed
+                if cfg.multi_sae_seed_mode == "same"
+                else cfg.seed + idx
+            )
+            with temporary_seed(seed):
+                sae = TrainingSAE.from_dict(
+                    TrainingSAEConfig.from_dict(
+                        cfg.get_training_sae_cfg_dict(),
+                    ).to_dict()
+                )
+            sae.to(self.device)
+            sae.cfg.metadata.hook_name = hook_name
+
+            if self.sae_tp_size > 1:
+                tp_group = ds.get_sae_tp_group()
+                if tp_group is not None and hasattr(sae, "shard_weights"):
+                    sae.shard_weights(tp_group)
+
+            if cfg.resume_from_checkpoint is not None:
+                hook_ckpt = Path(cfg.resume_from_checkpoint) / sanitize_hook_name_for_path(hook_name)
+                if hook_ckpt.exists():
+                    sae.load_weights_from_checkpoint(str(hook_ckpt))
+
+            self.base_sae_by_hook[hook_name] = sae
+            self.sae_by_hook[hook_name] = sae
+
+        self._base_sae = None  # type: ignore[assignment]
+        self.sae = None
 
     def _init_streaming_logger(self) -> None:
         import logging
@@ -1270,10 +1380,45 @@ class LanguageModelSAETrainingRunner:
         seq_no = -1
         chunk_step = 0
 
+        # Quiesce signal paths — use quiesce_dir if provided (supervisor mode),
+        # otherwise fall back to checkpoint_path (standalone mode).
+        quiesce_request_path: Path | None = None
+        quiesce_ack_path: Path | None = None
+        _qdir = self._quiesce_dir or (
+            Path(self.cfg.checkpoint_path) if self.cfg.checkpoint_path is not None else None
+        )
+        if _qdir is not None and is_tp_root:
+            quiesce_request_path = _qdir / "quiesce_request"
+            quiesce_ack_path = _qdir / f"quiesce_ack_producer_{ds.get_producer_idx()}"
+
         while True:
-            # Outer Phase 1: quota check — root tries to allocate a chunk slot
+            # Quiesce check: after at least one chunk written, check for stop signal.
+            # Root checks the file; result is broadcast to all TP ranks.
+            if chunk_step > 0:
+                if is_tp_root:
+                    ctrl[0] = (
+                        1
+                        if quiesce_request_path is not None
+                        and quiesce_request_path.exists()
+                        else 0
+                    )
+                if vllm_tp_group is not None:
+                    dist.broadcast(ctrl, src=tp_root_world, group=vllm_tp_group)
+                if int(ctrl[0]) == 1:
+                    if is_tp_root:
+                        if _qdir is not None:
+                            store.save_to_checkpoint(_qdir / f"producer_dataset_state_{ds.get_producer_idx()}")
+                        _shm_log({"event": "quiesce_ack", "total_chunks": chunk_step})
+                        if quiesce_ack_path is not None:
+                            quiesce_ack_path.touch()
+                    break
+            # Outer Phase 1: quota check — root tries to allocate a chunk slot.
+            # Pass a stop_check so allocate_write_chunk can bail out when quiesce
+            # is requested (avoids deadlock when buffer is full and consumer has stopped).
             if is_tp_root:
-                result = buf.allocate_write_chunk()
+                def _quiesce_stop() -> bool:
+                    return quiesce_request_path is not None and quiesce_request_path.exists()
+                result = buf.allocate_write_chunk(stop_check=_quiesce_stop if chunk_step > 0 else None)
                 ctrl[0] = 0 if result is None else 1
                 if result is not None:
                     chunk_idx, seq_no = result
@@ -1282,8 +1427,15 @@ class LanguageModelSAETrainingRunner:
                 dist.broadcast(ctrl, src=tp_root_world, group=vllm_tp_group)
             if int(ctrl[0]) == 0:
                 if is_tp_root:
-                    _shm_log({"event": "quota_exhausted", "total_chunks": chunk_step})
-                break  # global quota exhausted; all TP ranks exit together
+                    if quiesce_request_path is not None and quiesce_request_path.exists():
+                        if _qdir is not None:
+                            store.save_to_checkpoint(_qdir / f"producer_dataset_state_{ds.get_producer_idx()}")
+                        _shm_log({"event": "quiesce_ack", "total_chunks": chunk_step})
+                        if quiesce_ack_path is not None:
+                            quiesce_ack_path.touch()
+                    else:
+                        _shm_log({"event": "quota_exhausted", "total_chunks": chunk_step})
+                break  # quota exhausted or quiesce; all TP ranks exit together
 
             # Compute exact token limit for this chunk (root knows seq_no; non-root uses full chunk_size)
             if is_tp_root:
@@ -1360,7 +1512,6 @@ class LanguageModelSAETrainingRunner:
         sae_tp_group = ds.get_sae_tp_group()
         sae_tp_size = ds.get_sae_tp_size()
 
-        # shm log and buffer monitor written by TP root only
         shm_log_path: Path | None = None
         buffer_monitor_path: Path | None = None
         if ds.is_sae_tp_root() and self.cfg.output_path is not None:
@@ -1384,8 +1535,14 @@ class LanguageModelSAETrainingRunner:
             shuffle=self.cfg.streaming_shuffle,
             random_chunks=self.cfg.streaming_random_chunks,
             buffer_monitor_path=buffer_monitor_path,
+            hook_names=self.hook_names if self.is_multi_sae else None,
         )
 
+        if self.is_multi_sae:
+            return self._run_streaming_consumer_multi(provider, ds)
+        return self._run_streaming_consumer_single(provider, ds)
+
+    def _run_streaming_consumer_single(self, provider: Any, ds: Any) -> TrainingSAE[Any]:
         trainer = SAETrainer(
             sae=self.sae,
             base_sae=self._base_sae,
@@ -1395,15 +1552,26 @@ class LanguageModelSAETrainingRunner:
             cfg=self.cfg.to_sae_trainer_config(),
             dp_group=None,
             token_count_weighted_dp=False,
+            append_logs=self.cfg.resume_from_checkpoint is not None,
         )
+
+        if self.cfg.resume_from_checkpoint is not None:
+            trainer.load_trainer_state(self.cfg.resume_from_checkpoint)
+            logger.info(
+                f"[streaming-consumer] Resumed trainer: "
+                f"n_samples={trainer.n_training_samples} n_steps={trainer.n_training_steps}"
+            )
+
+        consumer_quiesce_request, consumer_quiesce_ack = self._streaming_quiesce_paths(ds)
 
         try:
             signal.signal(signal.SIGINT, interrupt_callback)
             signal.signal(signal.SIGTERM, interrupt_callback)
-            sae = trainer.fit()
+            sae = trainer.fit(
+                quiesce_request_path=consumer_quiesce_request,
+                quiesce_ack_path=consumer_quiesce_ack,
+            )
         except StopIteration:
-            # Data provider exhausted before training_tokens reached (e.g. dataset
-            # shorter than configured).  Treat as normal end-of-data termination.
             sae = trainer.sae
         except (KeyboardInterrupt, InterruptedException):
             if self.cfg.checkpoint_path is not None:
@@ -1420,13 +1588,72 @@ class LanguageModelSAETrainingRunner:
 
         return sae
 
+    def _run_streaming_consumer_multi(self, provider: Any, ds: Any) -> TrainingSAE[Any]:
+        trainer = MultiSAETrainer(
+            hook_names=self.hook_names,
+            sae_by_hook=self.sae_by_hook,
+            base_sae_by_hook=self.base_sae_by_hook,
+            data_provider=provider,
+            save_checkpoint_fn=self._streaming_save_checkpoint,
+            cfg=self.cfg.to_sae_trainer_config(),
+            dp_group=None,
+            token_count_weighted_dp=False,
+            sae_dp_mode="ddp",
+            backward_mode=self.cfg.multi_sae_backward_mode,
+            seed_mode=self.cfg.multi_sae_seed_mode,
+        )
+
+        if self.cfg.resume_from_checkpoint is not None:
+            trainer.load_trainer_state(self.cfg.resume_from_checkpoint)
+
+        consumer_quiesce_request, consumer_quiesce_ack = self._streaming_quiesce_paths(ds)
+
+        try:
+            signal.signal(signal.SIGINT, interrupt_callback)
+            signal.signal(signal.SIGTERM, interrupt_callback)
+            trainer.fit(
+                quiesce_request_path=consumer_quiesce_request,
+                quiesce_ack_path=consumer_quiesce_ack,
+            )
+        except StopIteration:
+            pass
+        except (KeyboardInterrupt, InterruptedException):
+            if self.cfg.checkpoint_path is not None:
+                trainer.save_checkpoint(
+                    checkpoint_name=str(trainer.n_training_samples)
+                )
+            raise
+
+        self._streaming_buffer.close()
+
+        if self.cfg.output_path is not None:
+            trainer.save_final(self.cfg.output_path)
+
+        first_hook = self.hook_names[0]
+        return self.base_sae_by_hook[first_hook]
+
+    def _streaming_quiesce_paths(self, ds: Any) -> tuple[Path | None, Path | None]:
+        consumer_quiesce_request: Path | None = None
+        consumer_quiesce_ack: Path | None = None
+        _qdir = self._quiesce_dir or (
+            Path(self.cfg.checkpoint_path) if self.cfg.checkpoint_path is not None else None
+        )
+        if _qdir is not None:
+            consumer_quiesce_request = _qdir / "quiesce_request"
+            if ds.is_sae_tp_root():
+                consumer_quiesce_ack = _qdir / "quiesce_ack_consumer"
+        return consumer_quiesce_request, consumer_quiesce_ack
+
     def _streaming_save_checkpoint(self, checkpoint_path: Path | None) -> None:
-        """Called by ALL SAE TP ranks — save_inference_model is collective when sae_tp > 1."""
+        """Called by TP root only (from SAETrainer.save_checkpoint's save_checkpoint_fn guard).
+
+        SAE weights are already saved by the trainer's _save_model (collective).
+        We only need to persist the runner config here.
+        """
         if checkpoint_path is None:
             return
         import sae_lens.distributed_streaming as ds
         checkpoint_path.mkdir(exist_ok=True, parents=True)
-        self._base_sae.save_inference_model(str(checkpoint_path))  # type: ignore[union-attr]
         if ds.is_sae_tp_root():
             runner_config = self.cfg.to_dict()
             with open(checkpoint_path / RUNNER_CFG_FILENAME, "w") as f:
