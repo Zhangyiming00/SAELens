@@ -50,6 +50,7 @@ from sae_lens.profiling import nccl_nvtx_range
 from sae_lens.saes.sae import SAE, T_SAE_CONFIG, T_TRAINING_SAE_CONFIG
 from sae_lens.tokenization_and_batching import concat_and_batch_sequences
 from sae_lens.training.mixing_buffer import mixing_buffer
+from sae_lens.training.multi_sae_trainer import sanitize_hook_name_for_path
 from sae_lens.util import (
     extract_layer_from_tlens_hook_name,
     extract_stop_at_layer_from_tlens_hook_name,
@@ -124,6 +125,10 @@ class ActivationsStore:
         dataset_shard_count: int = 1,
         consumer_only: bool = False,
         mixing_shard_index: int | None = None,
+        cached_shard_index: int = 0,
+        cached_shard_count: int = 1,
+        hook_names_override: list[str] | None = None,
+        skip_raw_dataset_load: bool = False,
     ) -> ActivationsStore:
         if isinstance(cfg, CacheActivationsRunnerConfig):
             return cls.from_cache_activations(model, cfg)
@@ -136,7 +141,11 @@ class ActivationsStore:
         ):
             cached_activations_path = None
 
-        if override_dataset is None and cfg.dataset_path == "":
+        if (
+            override_dataset is None
+            and cfg.dataset_path == ""
+            and not skip_raw_dataset_load
+        ):
             raise ValueError(
                 "You must either pass in a dataset or specify a dataset_path in your configutation."
             )
@@ -151,17 +160,22 @@ class ActivationsStore:
             exclude_special_tokens = torch.tensor(
                 exclude_special_tokens, dtype=torch.long, device=device
             )
+        if hook_names_override is not None:
+            resolved_hook_names = list(hook_names_override)
+        elif (
+            isinstance(cfg, LanguageModelSAERunnerConfig)
+            and cfg.hook_names is not None
+        ):
+            resolved_hook_names = list(cfg.hook_names)
+        else:
+            resolved_hook_names = [cfg.hook_name]
+
         return cls(
             model=model,
             dataset=override_dataset or cfg.dataset_path,
             streaming=cfg.streaming,
             hook_name=cfg.hook_name,
-            hook_names=(
-                cfg.hook_names
-                if isinstance(cfg, LanguageModelSAERunnerConfig)
-                and cfg.hook_names is not None
-                else [cfg.hook_name]
-            ),
+            hook_names=resolved_hook_names,
             hook_head_index=cfg.hook_head_index,
             context_size=cfg.context_size,
             d_in=cfg.d_in
@@ -189,6 +203,9 @@ class ActivationsStore:
             dataset_shard_count=dataset_shard_count,
             consumer_only=consumer_only,
             mixing_shard_index=mixing_shard_index if mixing_shard_index is not None else dataset_shard_index,
+            cached_shard_index=cached_shard_index,
+            cached_shard_count=cached_shard_count,
+            skip_raw_dataset_load=skip_raw_dataset_load,
         )
 
     @classmethod
@@ -270,13 +287,19 @@ class ActivationsStore:
         dataset_shard_count: int = 1,
         consumer_only: bool = False,
         mixing_shard_index: int | None = None,
+        cached_shard_index: int = 0,
+        cached_shard_count: int = 1,
+        skip_raw_dataset_load: bool = False,
     ):
         self.model = model
         if model_kwargs is None:
             model_kwargs = {}
         self.model_kwargs = model_kwargs
         self._consumer_only = consumer_only
-        if isinstance(dataset, str):
+        self._skip_raw_dataset_load = skip_raw_dataset_load
+        if skip_raw_dataset_load:
+            self.dataset = None  # type: ignore[assignment]
+        elif isinstance(dataset, str):
             dataset_path = Path(dataset)
             if dataset_path.exists() and dataset_path.is_dir():
                 parquet_files = sorted(dataset_path.glob("*.parquet"))
@@ -343,6 +366,8 @@ class ActivationsStore:
         self.activations_mixing_fraction = activations_mixing_fraction
         self._dataset_shard_index = dataset_shard_index
         self._dataset_shard_count = dataset_shard_count
+        self._cached_shard_index = cached_shard_index
+        self._cached_shard_count = cached_shard_count
         self._mixing_generator: torch.Generator | None = None
         # Use a dedicated per-store generator so activation mixing order is
         # deterministic and decoupled from unrelated global RNG consumption
@@ -362,7 +387,7 @@ class ActivationsStore:
 
         self.n_dataset_processed = 0
 
-        if consumer_only:
+        if consumer_only or skip_raw_dataset_load:
             # Consumer-only ranks in shard-routing mode are recv-only.
             # They must not inspect or iterate the dataset locally.
             self.is_dataset_tokenized = True
@@ -416,7 +441,11 @@ class ActivationsStore:
                     "Dataset is not tokenized. Pre-tokenizing will improve performance and allows for more control over special tokens. See https://decoderesearch.github.io/SAELens/training_saes/#pretokenizing-datasets for more info."
                 )
 
-        self.iterable_sequences = self._iterate_tokenized_sequences() if not consumer_only else None  # type: ignore[assignment]
+        self.iterable_sequences = (
+            self._iterate_tokenized_sequences()
+            if not consumer_only and not skip_raw_dataset_load
+            else None
+        )  # type: ignore[assignment]
 
         self.cached_activation_dataset = self.load_cached_activation_dataset() if not consumer_only else None
 
@@ -537,10 +566,6 @@ class ActivationsStore:
         """
         if self.cached_activations_path is None:
             return None
-        if self.is_multi_hook:
-            raise ValueError(
-                "Cached activations are not supported for multi-layer hook_names."
-            )
 
         assert self.cached_activations_path is not None  # keep pyright happy
         # Sanity check: does the cache directory exist?
@@ -550,35 +575,144 @@ class ActivationsStore:
                 "Consider double-checking your dataset, model, and hook names."
             )
 
+        cached_path = Path(self.cached_activations_path)
+        manifest_path = cached_path / "cache_activations_manifest.json"
+        if manifest_path.exists():
+            return self._load_split_cached_activation_datasets(
+                cached_path,
+                manifest_path,
+            )
+
         # ---
         # Actual code
         activations_dataset = datasets.load_from_disk(self.cached_activations_path)
-        columns = [self.hook_name]
+        if self._cached_shard_count > 1:
+            activations_dataset = activations_dataset.select(
+                range(self._cached_shard_index, len(activations_dataset), self._cached_shard_count)
+            )
+            self._cached_shard_index = 0
+            self._cached_shard_count = 1
+        columns = list(self.hook_names)
         if "token_ids" in activations_dataset.column_names:
             columns.append("token_ids")
         activations_dataset.set_format(
             type="torch", columns=columns, device=self.device, dtype=self.dtype
         )
-        self.current_row_idx = 0  # idx to load next batch from
+        self.current_row_idx = self._cached_shard_index  # idx to load next batch from
         # ---
 
         assert isinstance(activations_dataset, Dataset)
 
-        # multiple in hooks future
-        if not set([self.hook_name]).issubset(activations_dataset.column_names):
+        if not set(self.hook_names).issubset(activations_dataset.column_names):
             raise ValueError(
                 f"loaded dataset does not include hook activations, got {activations_dataset.column_names}"
             )
 
-        if activations_dataset.features[self.hook_name].shape != (
-            self.context_size,
-            self.d_in,
-        ):
-            raise ValueError(
-                f"Given dataset of shape {activations_dataset.features[self.hook_name].shape} does not match context_size ({self.context_size}) and d_in ({self.d_in})"
-            )
+        for hook_name in self.hook_names:
+            if activations_dataset.features[hook_name].shape != (
+                self.context_size,
+                self.d_in,
+            ):
+                raise ValueError(
+                    f"Given dataset of shape {activations_dataset.features[hook_name].shape} does not match context_size ({self.context_size}) and d_in ({self.d_in})"
+                )
 
         return activations_dataset
+
+    def _load_split_cached_activation_datasets(
+        self,
+        cached_path: Path,
+        manifest_path: Path,
+    ) -> Dataset:
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("format") != "split_hook_cached_activations_v1":
+            raise ValueError(
+                f"Unsupported split cached activations format in {manifest_path}: "
+                f"{manifest.get('format')}"
+            )
+
+        manifest_hook_names = manifest.get("hook_names")
+        if not isinstance(manifest_hook_names, list):
+            raise ValueError(f"Invalid hook_names in {manifest_path}")
+        missing_hooks = set(self.hook_names) - set(manifest_hook_names)
+        if missing_hooks:
+            raise ValueError(
+                f"Split cache is missing hook activations for {sorted(missing_hooks)}. "
+                f"Manifest hooks: {manifest_hook_names}"
+            )
+
+        hook_to_dir = manifest.get("hook_to_dir", {})
+        if not isinstance(hook_to_dir, dict):
+            raise ValueError(f"Invalid hook_to_dir in {manifest_path}")
+
+        datasets_by_hook: dict[str, Dataset] = {}
+        expected_len: int | None = None
+        token_ids_present: bool | None = None
+
+        for hook_name in self.hook_names:
+            hook_dir_name = str(
+                hook_to_dir.get(hook_name, sanitize_hook_name_for_path(hook_name))
+            )
+            hook_path = cached_path / hook_dir_name
+            if not hook_path.exists():
+                raise FileNotFoundError(
+                    f"Split cache directory for hook {hook_name} does not exist: "
+                    f"{hook_path}"
+                )
+
+            hook_dataset = datasets.load_from_disk(str(hook_path))
+            if self._cached_shard_count > 1:
+                hook_dataset = hook_dataset.select(
+                    range(self._cached_shard_index, len(hook_dataset), self._cached_shard_count)
+                )
+            if hook_name not in hook_dataset.column_names:
+                raise ValueError(
+                    f"Split cache dataset {hook_path} does not include hook "
+                    f"{hook_name}; got {hook_dataset.column_names}"
+                )
+
+            if expected_len is None:
+                expected_len = len(hook_dataset)
+            elif len(hook_dataset) != expected_len:
+                raise ValueError(
+                    f"Split cache dataset {hook_path} has length {len(hook_dataset)}, "
+                    f"expected {expected_len}."
+                )
+
+            has_token_ids = "token_ids" in hook_dataset.column_names
+            if token_ids_present is None:
+                token_ids_present = has_token_ids
+            elif has_token_ids != token_ids_present:
+                raise ValueError(
+                    "Split cache datasets must either all include token_ids or all "
+                    f"omit token_ids; {hook_path} differs."
+                )
+
+            columns = [hook_name]
+            if has_token_ids:
+                columns.append("token_ids")
+            hook_dataset.set_format(
+                type="torch", columns=columns, device=self.device, dtype=self.dtype
+            )
+
+            if hook_dataset.features[hook_name].shape != (
+                self.context_size,
+                self.d_in,
+            ):
+                raise ValueError(
+                    f"Given dataset of shape {hook_dataset.features[hook_name].shape} "
+                    f"for {hook_name} does not match context_size "
+                    f"({self.context_size}) and d_in ({self.d_in})"
+                )
+
+            datasets_by_hook[hook_name] = hook_dataset
+
+        self.cached_activation_datasets_by_hook = datasets_by_hook
+        if self._cached_shard_count > 1:
+            self._cached_shard_index = 0
+            self._cached_shard_count = 1
+        self.current_row_idx = self._cached_shard_index
+        return datasets_by_hook[self.hook_names[0]]
 
     def shuffle_input_dataset(self, seed: int, buffer_size: int = 1):
         """
@@ -741,7 +875,7 @@ class ActivationsStore:
         self, batch_tokens: torch.Tensor
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         model_device = _get_model_device(self.model)
-        hook_names = self.hook_names
+        hook_names = getattr(self, "_all_hook_names", None) or self.hook_names
         hook_layers = [
             layer
             for hook_name in hook_names
@@ -972,7 +1106,7 @@ class ActivationsStore:
         self,
         raise_on_epoch_end: bool,
     ) -> tuple[
-        torch.Tensor,
+        torch.Tensor | dict[str, torch.Tensor],
         torch.Tensor | None,
     ]:
         """
@@ -988,44 +1122,114 @@ class ActivationsStore:
         batch_size = self.store_batch_size_prompts
         d_in = self.d_in
 
-        # In future, could be a list of multiple hook names
-        if self.hook_name not in self.cached_activation_dataset.column_names:
+        if hasattr(self, "cached_activation_datasets_by_hook"):
+            return self._load_raw_llm_batch_from_split_cached(raise_on_epoch_end)
+
+        missing = set(self.hook_names) - set(self.cached_activation_dataset.column_names)
+        if missing:
             raise ValueError(
-                f"Missing columns in dataset. Expected {self.hook_name}, "
+                f"Missing columns in dataset. Expected {sorted(missing)}, "
                 f"got {self.cached_activation_dataset.column_names}."
             )
 
-        if self.current_row_idx > len(self.cached_activation_dataset) - batch_size:
-            self.current_row_idx = 0
-            if raise_on_epoch_end:
-                raise StopIteration
+        indices = self._next_cached_row_indices(
+            len(self.cached_activation_dataset),
+            batch_size,
+            raise_on_epoch_end,
+        )
+        ds_slice = self.cached_activation_dataset[indices]
 
-        ds_slice = self.cached_activation_dataset[
-            self.current_row_idx : self.current_row_idx + batch_size
-        ]
-        # Load activations for each hook.
-        # Usually faster to first slice dataset then pick column
-        acts_buffer = ds_slice[self.hook_name]
-        if acts_buffer.shape != (batch_size, context_size, d_in):
-            raise ValueError(
-                f"acts_buffer has shape {acts_buffer.shape}, "
-                f"but expected ({batch_size}, {context_size}, {d_in})."
-            )
-
-        self.current_row_idx += batch_size
-        acts_buffer = acts_buffer.reshape(batch_size * context_size, d_in)
+        acts_by_hook: dict[str, torch.Tensor] = {}
+        for hook_name in self.hook_names:
+            acts_buffer = ds_slice[hook_name]
+            if acts_buffer.shape != (batch_size, context_size, d_in):
+                raise ValueError(
+                    f"acts_buffer for {hook_name} has shape {acts_buffer.shape}, "
+                    f"but expected ({batch_size}, {context_size}, {d_in})."
+                )
+            acts_by_hook[hook_name] = acts_buffer.reshape(batch_size * context_size, d_in)
 
         if "token_ids" not in self.cached_activation_dataset.column_names:
-            return acts_buffer, None
+            token_ids_buffer = None
+        else:
+            token_ids_buffer = ds_slice["token_ids"]
+            if token_ids_buffer.shape != (batch_size, context_size):
+                raise ValueError(
+                    f"token_ids_buffer has shape {token_ids_buffer.shape}, "
+                    f"but expected ({batch_size}, {context_size})."
+                )
+            token_ids_buffer = token_ids_buffer.reshape(batch_size * context_size)
+        if self.is_multi_hook:
+            return acts_by_hook, token_ids_buffer
+        return acts_by_hook[self.hook_name], token_ids_buffer
 
-        token_ids_buffer = ds_slice["token_ids"]
-        if token_ids_buffer.shape != (batch_size, context_size):
-            raise ValueError(
-                f"token_ids_buffer has shape {token_ids_buffer.shape}, "
-                f"but expected ({batch_size}, {context_size})."
-            )
-        token_ids_buffer = token_ids_buffer.reshape(batch_size * context_size)
-        return acts_buffer, token_ids_buffer
+    def _load_raw_llm_batch_from_split_cached(
+        self,
+        raise_on_epoch_end: bool,
+    ) -> tuple[torch.Tensor | dict[str, torch.Tensor], torch.Tensor | None]:
+        batch_size = self.store_batch_size_prompts
+        context_size = self.context_size
+        d_in = self.d_in
+        first_dataset = self.cached_activation_datasets_by_hook[self.hook_names[0]]
+        indices = self._next_cached_row_indices(
+            len(first_dataset),
+            batch_size,
+            raise_on_epoch_end,
+        )
+
+        acts_by_hook: dict[str, torch.Tensor] = {}
+        token_ids_buffer: torch.Tensor | None = None
+        for hook_name in self.hook_names:
+            hook_dataset = self.cached_activation_datasets_by_hook[hook_name]
+            ds_slice = hook_dataset[indices]
+            acts_buffer = ds_slice[hook_name]
+            if acts_buffer.shape != (batch_size, context_size, d_in):
+                raise ValueError(
+                    f"acts_buffer for {hook_name} has shape {acts_buffer.shape}, "
+                    f"but expected ({batch_size}, {context_size}, {d_in})."
+                )
+            acts_by_hook[hook_name] = acts_buffer.reshape(batch_size * context_size, d_in)
+            if hook_name == self.hook_names[0] and "token_ids" in hook_dataset.column_names:
+                token_ids_buffer = ds_slice["token_ids"]
+                if token_ids_buffer.shape != (batch_size, context_size):
+                    raise ValueError(
+                        f"token_ids_buffer has shape {token_ids_buffer.shape}, "
+                        f"but expected ({batch_size}, {context_size})."
+                    )
+                token_ids_buffer = token_ids_buffer.reshape(batch_size * context_size)
+
+        if self.is_multi_hook:
+            return acts_by_hook, token_ids_buffer
+        return acts_by_hook[self.hook_name], token_ids_buffer
+
+    def _next_cached_row_indices(
+        self,
+        dataset_len: int,
+        batch_size: int,
+        raise_on_epoch_end: bool,
+    ) -> list[int]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        shard_count = max(1, int(self._cached_shard_count))
+        shard_index = int(self._cached_shard_index)
+        last_idx = self.current_row_idx + (batch_size - 1) * shard_count
+        if last_idx >= dataset_len:
+            self.current_row_idx = shard_index
+            if raise_on_epoch_end:
+                raise StopIteration
+            last_idx = self.current_row_idx + (batch_size - 1) * shard_count
+            if last_idx >= dataset_len:
+                raise ValueError(
+                    "Cached activation dataset is too small for one sharded batch: "
+                    f"len={dataset_len}, batch_size={batch_size}, "
+                    f"shard_index={shard_index}, shard_count={shard_count}."
+                )
+        indices = [
+            self.current_row_idx + i * shard_count
+            for i in range(batch_size)
+        ]
+        self.current_row_idx += batch_size * shard_count
+        return indices
 
     @torch.no_grad()
     def get_raw_llm_batch(
@@ -1308,6 +1512,7 @@ class ActivationsStore:
         i_am_consumer = v2.is_consumer()
         i_am_consumer_root = i_am_consumer and v2.get_sae_tp_rank() == 0
         c = v2.get_consumer_idx() if i_am_consumer else -1
+        endpoint_idx = v2.get_sae_endpoint_idx() if i_am_consumer else -1
 
         local_slices: dict[int, Any] = {}
         outgoing: dict[int, Any] = {}
@@ -1324,20 +1529,26 @@ class ActivationsStore:
         if i_am_consumer_root:
             buf_map: dict[int, Any] = {}
             c_routes = routes_for_consumer(routing, c)
+            endpoint_root = v2.get_consumer_tp_root(endpoint_idx)
             for route in c_routes:
                 p = route.producer_idx
-                if v2.get_producer_tp_root(p) == v2.get_consumer_tp_root(c):
+                if v2.get_producer_tp_root(p) == endpoint_root:
                     buf_map[p] = local_slices[p]
                 else:
                     buf_map[p] = remote_slices[p]
 
             first_buf = next(iter(buf_map.values()))
             if isinstance(first_buf, dict):
-                assembled = {
+                payload_hook_names = self._v2_payload_hook_names()
+                assembled_payload = {
                     hook_name: torch.cat(
                         [buf_map[r.producer_idx][hook_name] for r in c_routes],
                         dim=0,
                     )
+                    for hook_name in payload_hook_names
+                }
+                assembled = {
+                    hook_name: assembled_payload[hook_name]
                     for hook_name in self.hook_names
                 }
             else:
@@ -1353,18 +1564,20 @@ class ActivationsStore:
                         for hook_acts in assembled.values():
                             dist.broadcast(
                                 hook_acts,
-                                src=v2.get_consumer_tp_root(c),
+                                src=endpoint_root,
                                 group=sae_tp_group,
                             )
                     else:
                         dist.broadcast(
                             assembled,
-                            src=v2.get_consumer_tp_root(c),
+                            src=endpoint_root,
                             group=sae_tp_group,
                         )
         elif i_am_consumer and v2.get_sae_tp_size() > 1:
             sae_tp_group = v2.get_sae_tp_group()
             routing_c = v2.get_consumer_idx()
+            endpoint_idx = v2.get_sae_endpoint_idx()
+            endpoint_root = v2.get_consumer_tp_root(endpoint_idx)
             n_rows = sum(
                 r.row_end - r.row_start for r in routes_for_consumer(routing, routing_c)
             )
@@ -1385,19 +1598,48 @@ class ActivationsStore:
                     for hook_acts in assembled.values():
                         dist.broadcast(
                             hook_acts,
-                            src=v2.get_consumer_tp_root(routing_c),
+                            src=endpoint_root,
                             group=sae_tp_group,
                         )
                 else:
                     dist.broadcast(
                         assembled,
-                        src=v2.get_consumer_tp_root(routing_c),
+                        src=endpoint_root,
                         group=sae_tp_group,
                     )
 
         if assembled is not None:
             self._add_data_timing(transfer_time_s=time.perf_counter() - transfer_t0)
         return assembled
+
+    def _v2_payload_hook_names(self) -> list[str]:
+        """Hooks carried across v2 producer/consumer P2P payloads."""
+        return list(getattr(self, "_all_hook_names", None) or self.hook_names)
+
+    def _pack_v2_payload(
+        self,
+        payload: torch.Tensor | dict[str, torch.Tensor],
+        hook_names: list[str],
+    ) -> torch.Tensor:
+        if isinstance(payload, dict):
+            return torch.cat([payload[hook_name] for hook_name in hook_names], dim=0)
+        return payload
+
+    @staticmethod
+    def _unpack_v2_payload(
+        payload: torch.Tensor,
+        *,
+        n_rows: int,
+        hook_names: list[str],
+        is_multi_hook: bool,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        if not is_multi_hook:
+            return payload
+        chunks = payload.split(n_rows, dim=0)
+        return {
+            hook_name: chunks[idx]
+            for idx, hook_name in enumerate(hook_names)
+        }
 
     def _iterate_filtered_activations_v2(
         self,
@@ -1459,20 +1701,27 @@ class ActivationsStore:
         p = v2.get_producer_idx()
         raw_acts, _ = self._get_raw_llm_batch_with_epoch_restart()
         p_routes = routes_for_producer(v2.get_routing_table(), p)
+        payload_hook_names = self._v2_payload_hook_names()
+        local_consumer_idx = v2.get_consumer_idx() if v2.is_consumer() else -1
+        local_endpoint_root = (
+            v2.get_consumer_tp_root(v2.get_sae_endpoint_idx())
+            if v2.is_consumer()
+            else -1
+        )
 
         for route in p_routes:
             cc = route.consumer_idx
             if isinstance(raw_acts, dict):
-                # Keep hook payload order explicitly aligned with self.hook_names.
-                # P2P exchange serializes multiple tensors without metadata, so
-                # sender/receiver must enqueue ops in the exact same order.
                 sl = {
                     hook_name: raw_acts[hook_name][route.row_start:route.row_end].contiguous()
-                    for hook_name in self.hook_names
+                    for hook_name in payload_hook_names
                 }
             else:
                 sl = raw_acts[route.row_start:route.row_end].contiguous()
-            if v2.get_producer_tp_root(p) == v2.get_consumer_tp_root(cc):
+            if (
+                cc == local_consumer_idx
+                and v2.get_producer_tp_root(p) == local_endpoint_root
+            ):
                 # Local route: slice stays on the original device.
                 local_slices[route.producer_idx] = sl
             outgoing[cc] = sl
@@ -1496,6 +1745,7 @@ class ActivationsStore:
 
         recv_slices: dict[int, Any] = {}
         rank = dist.get_rank() if dist.is_initialized() else -1
+        payload_hook_names = self._v2_payload_hook_names()
 
         producer_routes = (
             routes_for_producer(v2.get_routing_table(), v2.get_producer_idx())
@@ -1506,8 +1756,9 @@ class ActivationsStore:
             route.consumer_idx: route for route in producer_routes
         }
 
-        for c in range(v2.get_sae_dp_size()):
-            consumer_root = v2.get_consumer_tp_root(c)
+        for endpoint_idx in range(v2.get_num_sae_stage_endpoints()):
+            c = endpoint_idx // v2.get_sae_pp_size()
+            consumer_root = v2.get_consumer_tp_root(endpoint_idx)
             consumer_routes = routes_for_consumer(v2.get_routing_table(), c)
             remote_routes = [
                 route
@@ -1526,7 +1777,7 @@ class ActivationsStore:
             if not should_send and not should_recv:
                 continue
 
-            p2p_group = v2.get_p2p_group(c)
+            p2p_group = v2.get_p2p_group(endpoint_idx)
             barrier_kwargs: dict[str, Any] = {"group": p2p_group}
             if torch.cuda.is_available():
                 barrier_kwargs["device_ids"] = [torch.cuda.current_device()]
@@ -1538,15 +1789,12 @@ class ActivationsStore:
                 for route in remote_routes:
                     n_rows = route.row_end - route.row_start
                     if self.is_multi_hook:
-                        recv_buf = {
-                            hook_name: torch.empty(
-                                n_rows,
-                                self.d_in,
-                                dtype=self.dtype,
-                                device=self.device,
-                            )
-                            for hook_name in self.hook_names
-                        }
+                        recv_buf = torch.empty(
+                            n_rows * len(payload_hook_names),
+                            self.d_in,
+                            dtype=self.dtype,
+                            device=self.device,
+                        )
                     else:
                         recv_buf = torch.empty(
                             n_rows,
@@ -1554,56 +1802,40 @@ class ActivationsStore:
                             dtype=self.dtype,
                             device=self.device,
                         )
-                    recv_slices[route.producer_idx] = recv_buf
-                    if isinstance(recv_buf, dict):
-                        for hook_name in self.hook_names:
-                            hook_buf = recv_buf[hook_name]
-                            ops.append(
-                                dist.P2POp(
-                                    dist.irecv,
-                                    hook_buf,
-                                    v2.get_producer_tp_root(route.producer_idx),
-                                    group=p2p_group,
-                                )
-                            )
-                    else:
-                        ops.append(
-                            dist.P2POp(
-                                dist.irecv,
-                                recv_buf,
-                                v2.get_producer_tp_root(route.producer_idx),
-                                group=p2p_group,
-                            )
-                        )
-
-            if should_send:
-                send_buf = outgoing[c]
-                if isinstance(send_buf, dict):
-                    for hook_name in self.hook_names:
-                        hook_buf = send_buf[hook_name]
-                        ops.append(
-                            dist.P2POp(
-                                dist.isend,
-                                hook_buf,
-                                consumer_root,
-                                group=p2p_group,
-                            )
-                        )
-                else:
+                    recv_slices[route.producer_idx] = (recv_buf, n_rows)
                     ops.append(
                         dist.P2POp(
-                            dist.isend,
-                            send_buf,
-                            consumer_root,
+                            dist.irecv,
+                            recv_buf,
+                            v2.get_producer_tp_root(route.producer_idx),
                             group=p2p_group,
                         )
                     )
+
+            if should_send:
+                send_buf = self._pack_v2_payload(outgoing[c], payload_hook_names)
+                ops.append(
+                    dist.P2POp(
+                        dist.isend,
+                        send_buf,
+                        consumer_root,
+                        group=p2p_group,
+                    )
+                )
 
             with nccl_nvtx_range("nccl:shard_routing_p2p_exchange", p2p_group):
                 for work in dist.batch_isend_irecv(ops):
                     work.wait()
 
-        return recv_slices
+        return {
+            producer_idx: self._unpack_v2_payload(
+                recv_buf,
+                n_rows=n_rows,
+                hook_names=payload_hook_names,
+                is_multi_hook=self.is_multi_hook,
+            )
+            for producer_idx, (recv_buf, n_rows) in recv_slices.items()
+        }
 
     def get_data_loader(
         self,
@@ -1612,6 +1844,17 @@ class ActivationsStore:
         Return an auto-refilling stream of filtered and mixed activations.
         """
         import sae_lens.distributed_v2 as v2_mod
+
+        # Cached-mode has no producer ranks. Even if distributed_v2 is initialized
+        # for SAE TP/DP/PP, the v2 P2P iterator cannot make progress.
+        if self.cached_activation_dataset is not None:
+            return mixing_buffer(
+                buffer_size=self.n_batches_in_buffer * self.training_context_size,
+                batch_size=self.train_batch_size_tokens,
+                activations_loader=self._iterate_filtered_activations(),
+                mix_fraction=self.activations_mixing_fraction,
+                generator=self._mixing_generator,
+            )
 
         if v2_mod._initialized:
             return mixing_buffer(

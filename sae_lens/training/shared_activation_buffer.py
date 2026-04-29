@@ -4,7 +4,10 @@ Shared-memory activation buffer for streaming_mode v1.
 Layout (5 files in base_dir, default /dev/shm):
   {name}_state.bin   — int8 memmap  (num_chunks,)
   {name}_meta.bin    — int32 memmap (num_chunks, 4)
-                         [0] valid_tokens  [1] producer_id  [2] seq_no  [3] reserved
+                         [0] valid_tokens  [1] producer_id  [2] seq_no  [3] refcount
+                         refcount is the number of consumer-side ranks that still
+                         need to release this chunk before it returns to FREE.
+                         Defaults to 0 (FREE/READY) and is set to N by acquire.
   {name}_header.bin  — int32 memmap (8,)
                          [0] num_producers
                          [1] done_count       (each producer increments on finish)
@@ -76,12 +79,14 @@ class SharedActivationBuffer:
         self._chunk_size_tokens = chunk_size_tokens
         self._d_model = d_model
         self._base = Path(base_dir)
+        self._closed = False
 
         state_path = self._base / f"{name}_state.bin"
         meta_path = self._base / f"{name}_meta.bin"
         header_path = self._base / f"{name}_header.bin"
         data_path = self._base / f"{name}_data.bin"
         lock_path = self._base / f"{name}.lock"
+        self._paths = (state_path, meta_path, header_path, data_path, lock_path)
 
         _DTYPE_TO_CODE = {torch.bfloat16: 0, torch.float32: 1}
         _CODE_TO_NP = {0: np.uint16, 1: np.float32}
@@ -92,33 +97,38 @@ class SharedActivationBuffer:
                 raise ValueError(f"SharedActivationBuffer only supports bfloat16 or float32, got {dtype}")
             dtype_code = _DTYPE_TO_CODE[dtype]
             np_dtype = _CODE_TO_NP[dtype_code]
-            elem_bytes = 2 if dtype_code == 0 else 4
 
-            if state_path.exists():
+            if any(path.exists() for path in self._paths):
                 import logging
                 logging.getLogger("saelens.streaming").warning(
                     "SharedActivationBuffer: stale files found for %s, overwriting.", name
                 )
-            # Check disk space
-            data_bytes = num_chunks * chunk_size_tokens * d_model * elem_bytes
-            free = shutil.disk_usage(str(self._base)).free
-            if free < data_bytes + 1024 * 1024:  # 1 MB headroom
-                raise RuntimeError(
-                    f"Insufficient space in {base_dir}: need {data_bytes} bytes, "
-                    f"have {free} bytes free."
-                )
-            # Create and zero-initialise all files
-            self._create_file(state_path, num_chunks, dtype=np.int8)
-            self._create_file(meta_path, num_chunks * 4, dtype=np.int32)
-            hdr = self._create_file(header_path, 8, dtype=np.int32)
-            hdr[0] = num_producers
-            hdr[1] = 0
-            hdr[2] = target_chunks
-            hdr[3] = 0
-            hdr[4] = dtype_code
-            hdr.flush()
-            self._create_file(data_path, num_chunks * chunk_size_tokens * d_model, dtype=np_dtype)
-            lock_path.touch(exist_ok=True)
+                self.cleanup_files(name, base_dir=str(self._base))
+
+            self.assert_has_space(
+                num_chunks=num_chunks,
+                chunk_size_tokens=chunk_size_tokens,
+                d_model=d_model,
+                dtype=dtype,
+                base_dir=base_dir,
+            )
+
+            try:
+                # Create and zero-initialise all files.
+                self._create_file(state_path, num_chunks, dtype=np.int8)
+                self._create_file(meta_path, num_chunks * 4, dtype=np.int32)
+                hdr = self._create_file(header_path, 8, dtype=np.int32)
+                hdr[0] = num_producers
+                hdr[1] = 0
+                hdr[2] = target_chunks
+                hdr[3] = 0
+                hdr[4] = dtype_code
+                hdr.flush()
+                self._create_file(data_path, num_chunks * chunk_size_tokens * d_model, dtype=np_dtype)
+                lock_path.touch(exist_ok=True)
+            except Exception:
+                self.cleanup_files(name, base_dir=str(self._base))
+                raise
 
         # Open memmaps — read dtype_code from header to support attach (create=False)
         mode = "r+"
@@ -143,6 +153,57 @@ class SharedActivationBuffer:
         )
         self._lock_fd = open(str(lock_path), "rb")
         self._backoff_count = 0
+
+    @staticmethod
+    def estimate_required_bytes(
+        *,
+        num_chunks: int,
+        chunk_size_tokens: int,
+        d_model: int,
+        dtype: torch.dtype,
+        headroom_bytes: int = 1024 * 1024,
+    ) -> dict[str, int]:
+        if dtype == torch.bfloat16:
+            elem_bytes = 2
+        elif dtype == torch.float32:
+            elem_bytes = 4
+        else:
+            raise ValueError(f"SharedActivationBuffer only supports bfloat16 or float32, got {dtype}")
+        data_bytes = num_chunks * chunk_size_tokens * d_model * elem_bytes
+        metadata_bytes = (
+            num_chunks * np.dtype(np.int8).itemsize
+            + num_chunks * 4 * np.dtype(np.int32).itemsize
+            + 8 * np.dtype(np.int32).itemsize
+        )
+        return {
+            "required": data_bytes + metadata_bytes + headroom_bytes,
+            "data": data_bytes,
+            "metadata": metadata_bytes,
+            "headroom": headroom_bytes,
+        }
+
+    @staticmethod
+    def assert_has_space(
+        *,
+        num_chunks: int,
+        chunk_size_tokens: int,
+        d_model: int,
+        dtype: torch.dtype,
+        base_dir: str = "/dev/shm",
+    ) -> None:
+        estimate = SharedActivationBuffer.estimate_required_bytes(
+            num_chunks=num_chunks,
+            chunk_size_tokens=chunk_size_tokens,
+            d_model=d_model,
+            dtype=dtype,
+        )
+        free = shutil.disk_usage(base_dir).free
+        if free < estimate["required"]:
+            raise RuntimeError(
+                f"Insufficient space in {base_dir}: need {estimate['required']} bytes "
+                f"(data={estimate['data']}, metadata={estimate['metadata']}, "
+                f"headroom={estimate['headroom']}), have {free} bytes free."
+            )
 
     # ------------------------------------------------------------------
     # Producer API
@@ -241,7 +302,13 @@ class SharedActivationBuffer:
     # Consumer API
     # ------------------------------------------------------------------
 
-    def acquire_up_to(self, n: int, random: bool = True) -> tuple[list[int], float]:
+    def acquire_up_to(
+        self,
+        n: int,
+        random: bool = True,
+        refcount: int = 1,
+        stop_check: Callable[[], bool] | None = None,
+    ) -> tuple[list[int], float]:
         """Claim up to n READY slots as CONSUMING.
 
         Returns (indices, wait_s) where wait_s is the total time spent sleeping
@@ -253,9 +320,17 @@ class SharedActivationBuffer:
         Args:
             n: Maximum number of slots to claim.
             random: If True, shuffle the ready list before claiming (default True).
+            refcount: Number of release_chunk() calls required before each claimed
+                slot returns to FREE. Default 1. Used by multi-PP consumers where
+                the same chunk is read by multiple sibling ranks.
+            stop_check: Optional callable returning True when the caller should
+                stop waiting/acquiring and treat the stream as exhausted.
         """
+        assert refcount >= 1, "refcount must be >= 1"
         total_sleep: float = 0.0
         while True:
+            if stop_check is not None and stop_check():
+                raise StopIteration
             with self._locked():
                 ready = [
                     int(i)
@@ -268,7 +343,9 @@ class SharedActivationBuffer:
                     claim = ready[:n]
                     for i in claim:
                         self._state[i] = ChunkState.CONSUMING
+                        self._meta[i, 3] = refcount
                     self._state.flush()
+                    self._meta.flush()
                     self._backoff_count = 0
                     return claim, total_sleep
                 if int(self._header[1]) >= int(self._header[0]):  # done_count >= num_producers
@@ -294,11 +371,23 @@ class SharedActivationBuffer:
         return tensor, valid_tokens
 
     def release_chunk(self, chunk_idx: int) -> None:
-        """Transition CONSUMING → FREE under lock."""
+        """Release a CONSUMING slot. Decrements refcount; transitions to FREE on zero.
+
+        Single-consumer path (refcount=1) takes the slot directly to FREE.
+        Multi-consumer path (multiple PP stages reading the same chunk) decrements
+        until the last sibling brings refcount to 0.
+        """
         with self._locked():
             assert int(self._state[chunk_idx]) == ChunkState.CONSUMING
-            self._state[chunk_idx] = ChunkState.FREE
-            self._state.flush()
+            rc = int(self._meta[chunk_idx, 3]) - 1
+            assert rc >= 0, (
+                f"release_chunk: refcount underflow on chunk {chunk_idx}"
+            )
+            self._meta[chunk_idx, 3] = rc
+            if rc == 0:
+                self._state[chunk_idx] = ChunkState.FREE
+                self._state.flush()
+            self._meta.flush()
 
     # ------------------------------------------------------------------
     # Monitoring
@@ -328,31 +417,53 @@ class SharedActivationBuffer:
 
     def close(self) -> None:
         """Flush all memmaps and close the lock file descriptor."""
+        if self._closed:
+            return
         for arr in (self._state, self._meta, self._header, self._data):
             arr.flush()
         self._lock_fd.close()
+        self._closed = True
+
+    def destroy(self) -> None:
+        """Close and remove this buffer's backing files."""
+        self.close()
+        self.cleanup_files(self._name, base_dir=str(self._base))
+
+    @staticmethod
+    def cleanup_files(name: str, base_dir: str = "/dev/shm") -> None:
+        """Remove stale backing files for a shared activation buffer."""
+        base = Path(base_dir)
+        for path in (
+            base / f"{name}_state.bin",
+            base / f"{name}_meta.bin",
+            base / f"{name}_header.bin",
+            base / f"{name}_data.bin",
+            base / f"{name}.lock",
+        ):
+            path.unlink(missing_ok=True)
 
     def reset_for_restart(self, new_num_producers: int) -> None:
         """Reset buffer state for a new producer group after quiesce.
 
         Resets any WRITING chunks to FREE (abandoned mid-write), updates
         num_producers to the new vllm_dp value, and zeroes done_count so the
-        new producer group can signal completion independently.
+        new producer group can signal completion independently. CONSUMING slots
+        are left untouched; topology switching should quiesce/drain before reset.
 
         Called by the supervisor before relaunching workers. No workers should
         be alive when this is called.
         """
         with self._locked():
             for i in range(self._num_chunks):
-                if int(self._state[i]) == ChunkState.WRITING:
+                state = int(self._state[i])
+                if state == ChunkState.WRITING:
                     self._state[i] = ChunkState.FREE
+                    self._meta[i, 3] = 0
             self._state.flush()
+            self._meta.flush()
             self._header[0] = new_num_producers
             self._header[1] = 0
             self._header.flush()
-
-    # NOTE: No destroy() method in v1. Producers only call close().
-    # Stale /dev/shm files are detected on the next create (logged + overwritten).
 
     # ------------------------------------------------------------------
     # Internal helpers

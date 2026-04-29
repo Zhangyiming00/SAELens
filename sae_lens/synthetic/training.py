@@ -66,10 +66,12 @@ def train_toy_sae(
     trainer_cfg = SAETrainerConfig(
         n_checkpoints=n_snapshots,
         checkpoint_path=None,
+        quiesce_checkpoint_path=None,
         save_final_checkpoint=False,
         output_path=None,
         save_mse_every_n_steps=0,
         save_timing_every_n_steps=0,
+        save_memory_every_n_steps=0,
         synchronize_timing=False,
         multi_sae_backward_order="forward",
         multi_sae_stats_sync_mode="immediate",

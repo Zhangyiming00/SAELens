@@ -179,10 +179,12 @@ class SyntheticSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         return SAETrainerConfig(
             n_checkpoints=self.n_checkpoints,
             checkpoint_path=self.checkpoint_path,
+            quiesce_checkpoint_path=None,
             save_final_checkpoint=self.save_final_checkpoint,
             output_path=None,
             save_mse_every_n_steps=0,
             save_timing_every_n_steps=0,
+            save_memory_every_n_steps=0,
             synchronize_timing=False,
             multi_sae_backward_order="forward",
             multi_sae_stats_sync_mode="immediate",

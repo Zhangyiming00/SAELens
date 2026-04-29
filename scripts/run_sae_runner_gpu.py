@@ -50,10 +50,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", default="/data/models/Llama-3.1-8B")
     parser.add_argument("--dataset-path", default="../datasets/fineweb-edu-10BT_tokenized_llama31_ctx2048")
     parser.add_argument("--hook-name", default="blocks.21.hook_resid_post")
-    parser.add_argument(
-        "--hook-names",
-        default=None,
-        # default="blocks.16.hook_resid_post,blocks.21.hook_resid_post,blocks.26.hook_resid_post,blocks.31.hook_resid_post",        
+    parser.add_argument("--hook-names",
+        # default=None,
+        default="blocks.21.hook_resid_post,blocks.31.hook_resid_post",        
         help="Comma-separated hook names for multi-layer independent SAE training.",
     )
     parser.add_argument("--d-sae", type=int, default=32768)
@@ -63,10 +62,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sae-tp-size", type=int, default=None)
     parser.add_argument("--vllm-dp-size", type=int, default=1)
     parser.add_argument("--sae-dp-size", type=int, default=1)
-    parser.add_argument("--training-tokens", type=int, default=2048*48)
+    parser.add_argument("--sae-pp-size", type=int, default=1)
+    parser.add_argument("--training-tokens", type=int, default=2048*4096)
     parser.add_argument("--train-batch-size-tokens", type=int, default=2048)
     parser.add_argument("--context-size", type=int, default=2048)
-    parser.add_argument("--store-batch-size-prompts", type=int, default=4)
+    parser.add_argument("--store-batch-size-prompts", type=int, default=16)
     parser.add_argument("--n-batches-in-buffer", type=int, default=None)
     parser.add_argument("--max-model-len", type=int, default=2049)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
@@ -88,11 +88,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/results_1.45_hook31/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_1.55/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
     parser.add_argument("--save-mse-every-n-steps", type=int, default=1)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=1)
     parser.add_argument("--save-memory-every-n-steps", type=int, default=1)
+    parser.add_argument(
+        "--append-history-logs",
+        action="store_true",
+        default=False,
+        help=(
+            "Append mse/timing history logs instead of truncating them at trainer "
+            "startup. Topology-supervisor phases use this to preserve each phase."
+        ),
+    )
     parser.add_argument(
         "--synchronize-timing",
         action="store_true",
@@ -102,7 +111,21 @@ def parse_args() -> argparse.Namespace:
             "This can perturb runtime; keep disabled for throughput/overlap runs."
         ),
     )
-    parser.add_argument("--checkpoint-path", default="checkpoints/")
+    parser.add_argument("--checkpoint-path", default="checkpoints/1.55/")
+    parser.add_argument(
+        "--checkpoint-storage",
+        choices=["memory", "disk"],
+        default="memory",
+        help="Storage backend for quiesce checkpoints in topology-supervisor mode.",
+    )
+    parser.add_argument(
+        "--quiesce-checkpoint-path",
+        default=None,
+        help=(
+            "Checkpoint base path used for quiesce checkpoints when "
+            "--checkpoint-storage=memory. The supervisor supplies this."
+        ),
+    )
     parser.add_argument("--n-checkpoints", type=int, default=0)
     parser.add_argument("--save-final-checkpoint", action="store_true", default=True)
     parser.add_argument(
@@ -259,6 +282,21 @@ def parse_args() -> argparse.Namespace:
         help="Max chunks to acquire per consumer refill in streaming_mode.",
     )
     parser.add_argument(
+        "--streaming-mix-chunks",
+        type=int,
+        default=8,
+        help=(
+            "Consumer-local rolling mixing window in shared-memory chunks. "
+            "Set 0 to disable and serve each prefetch pool directly."
+        ),
+    )
+    parser.add_argument(
+        "--streaming-mix-fraction",
+        type=float,
+        default=0.5,
+        help="Fraction of the local rolling mix window kept for the next refill.",
+    )
+    parser.add_argument(
         "--streaming-buffer-name",
         type=str,
         default="",
@@ -288,6 +326,25 @@ def parse_args() -> argparse.Namespace:
             "and checkpoint_path are read from this file and override CLI args."
         ),
     )
+    parser.add_argument(
+        "--use-cached-activations",
+        action="store_true",
+        default=False,
+        help=(
+            "Train SAE(s) from a pre-computed activations cache produced by "
+            "CacheActivationsRunner. vLLM is not loaded. Mutually exclusive with "
+            "--streaming-mode and --control-state-path."
+        ),
+    )
+    parser.add_argument(
+        "--cached-activations-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to the cached activations directory (split-by-hook or monolithic "
+            "HuggingFace Dataset). Required when --use-cached-activations is set."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -305,6 +362,36 @@ def _resolve_hidden_size(model_name: str) -> int:
     if not hasattr(hf_cfg, "hidden_size"):
         raise ValueError(f"Could not infer hidden_size from model config: {model_name}")
     return int(hf_cfg.hidden_size)
+
+
+def _resolve_d_in_for_cached(args: argparse.Namespace) -> int:
+    """Resolve d_in for cached mode: model config first, fall back to dataset_info.json."""
+    try:
+        return _resolve_hidden_size(args.model_name)
+    except Exception as model_err:
+        cache_dir = Path(args.cached_activations_path)
+        manifest_path = cache_dir / "cache_activations_manifest.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text())
+            hook_to_dir = manifest.get("hook_to_dir", {})
+            hook_dirs = list(hook_to_dir.values())
+            if not hook_dirs:
+                raise ValueError(
+                    f"manifest at {manifest_path} has empty hook_to_dir"
+                ) from model_err
+            first_hook_dir = cache_dir / hook_dirs[0]
+            first_hook_name = manifest["hook_names"][0]
+        else:
+            first_hook_dir = cache_dir
+            first_hook_name = args.hook_name
+        info_path = first_hook_dir / "dataset_info.json"
+        if not info_path.exists():
+            raise ValueError(
+                f"Could not infer d_in: model load failed and {info_path} missing"
+            ) from model_err
+        info = json.loads(info_path.read_text())
+        feat = info["features"][first_hook_name]
+        return int(feat["shape"][-1])
 
 
 def _validate_checkpoint_args(args: argparse.Namespace) -> None:
@@ -340,6 +427,21 @@ def _validate_checkpoint_args(args: argparse.Namespace) -> None:
             "--resume-from-checkpoint is missing required file(s): "
             + ", ".join(missing)
         )
+
+
+def _normalize_checkpoint_storage_args(args: argparse.Namespace) -> None:
+    """Apply topology-supervisor memory checkpoint semantics to parsed args.
+
+    ``checkpoint_storage=memory`` is only actionable when the supervisor provides
+    a quiesce checkpoint path.  Plain standalone runs should keep the normal
+    checkpoint path and final checkpoint behavior.
+    """
+    if args.checkpoint_storage != "memory":
+        return
+    if args.quiesce_checkpoint_path is None:
+        return
+    args.checkpoint_path = args.quiesce_checkpoint_path
+    args.save_final_checkpoint = False
 
 
 def _is_writer_rank() -> bool:
@@ -390,6 +492,57 @@ def _append_total_runtime_record(
 def main() -> None:
     args = parse_args()
 
+    # Cached-mode validation must run before control-state processing so the
+    # mutual-exclusion errors fire even if the user passes both.
+    if args.use_cached_activations:
+        if args.streaming_mode:
+            raise ValueError(
+                "--use-cached-activations is incompatible with --streaming-mode"
+            )
+        if args.control_state_path is not None:
+            raise ValueError(
+                "--use-cached-activations is incompatible with --control-state-path "
+                "(topology supervisor mode)"
+            )
+        if not args.cached_activations_path:
+            raise ValueError(
+                "--use-cached-activations requires --cached-activations-path"
+            )
+        cache_dir = Path(args.cached_activations_path)
+        if not cache_dir.exists():
+            raise ValueError(
+                f"--cached-activations-path does not exist: {cache_dir}"
+            )
+        if args.sae_dp_size < 1:
+            raise ValueError(
+                "--use-cached-activations requires --sae-dp-size >= 1"
+            )
+        if args.sae_pp_size > 1:
+            if args.hook_names is None:
+                raise ValueError(
+                    "--sae-pp-size > 1 with cached activations requires "
+                    "--hook-names (multi-hook)"
+                )
+            n_hooks = len(
+                [h.strip() for h in args.hook_names.split(",") if h.strip()]
+            )
+            if n_hooks < args.sae_pp_size:
+                raise ValueError(
+                    f"--sae-pp-size={args.sae_pp_size} > number of hooks ({n_hooks})"
+                )
+        # Force topology shape: no producers, all ranks are SAE.
+        if args.vllm_dp_size != 0:
+            print(
+                f"[INFO] cached mode: forcing --vllm-dp-size 0 (was {args.vllm_dp_size})"
+            )
+            args.vllm_dp_size = 0
+        if args.vllm_tp_size not in (None, 1):
+            print(
+                f"[INFO] cached mode: forcing --vllm-tp-size 1 (was {args.vllm_tp_size})"
+            )
+        args.vllm_tp_size = 1
+        args.use_shard_routing = True
+
     # If a control state file is provided, override topology and checkpoint args.
     if args.control_state_path is not None:
         ctrl = read_control_state(args.control_state_path)
@@ -397,14 +550,15 @@ def main() -> None:
         args.vllm_dp_size = ctrl.topology.vllm_dp
         args.sae_tp_size = ctrl.topology.sae_tp
         args.sae_dp_size = ctrl.topology.sae_dp
+        args.sae_pp_size = ctrl.topology.sae_pp_size
         args.streaming_buffer_name = ctrl.buffer_name
         if args.resume_from_checkpoint is None and ctrl.checkpoint_path is not None:
             args.resume_from_checkpoint = ctrl.checkpoint_path
         print(
             f"[INFO] control_state_path={args.control_state_path}: "
             f"topology=vllm_tp={ctrl.topology.vllm_tp} vllm_dp={ctrl.topology.vllm_dp} "
-            f"sae_tp={ctrl.topology.sae_tp} buffer={ctrl.buffer_name} "
-            f"checkpoint={ctrl.checkpoint_path}"
+            f"sae_tp={ctrl.topology.sae_tp} sae_pp={ctrl.topology.sae_pp_size} "
+            f"buffer={ctrl.buffer_name} checkpoint={ctrl.checkpoint_path}"
         )
 
     # Derive quiesce_dir from control_state_path so workers look for quiesce
@@ -414,6 +568,7 @@ def main() -> None:
         if args.control_state_path is not None
         else None
     )
+    _normalize_checkpoint_storage_args(args)
 
     _validate_checkpoint_args(args)
     vllm_tp_size = (
@@ -449,19 +604,38 @@ def main() -> None:
             )
             args.use_shard_routing = True
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    # Hook names are needed early to validate sae_pp_size in streaming_mode.
+    hook_names = (
+        [hook.strip() for hook in args.hook_names.split(",") if hook.strip()]
+        if args.hook_names is not None
+        else None
+    )
+    if hook_names is not None and len(hook_names) == 0:
+        hook_names = None
+    if hook_names is not None and len(hook_names) == 1 and args.sae_pp_size <= 1:
+        hook_names = None
     if args.streaming_mode:
         if args.sae_dp_size not in (0, 1):
             raise ValueError("--streaming-mode requires --sae-dp-size 0 or 1")
         args.use_shard_routing = False
-        expected_world_size = vllm_tp_size * args.vllm_dp_size + sae_tp_size * args.sae_dp_size
+        expected_world_size = (
+            vllm_tp_size * args.vllm_dp_size
+            + sae_tp_size * args.sae_dp_size * args.sae_pp_size
+        )
         if world_size not in (1, expected_world_size):
             raise ValueError(
                 f"streaming_mode: WORLD_SIZE={world_size} does not match "
-                f"vllm_tp*vllm_dp + sae_tp*sae_dp = {expected_world_size}."
+                f"vllm_tp*vllm_dp + sae_tp*sae_dp*sae_pp_size = {expected_world_size}."
             )
+        if args.sae_pp_size > 1:
+            if hook_names is None or len(hook_names) < args.sae_pp_size:
+                raise ValueError(
+                    f"streaming_mode with --sae-pp-size={args.sae_pp_size} requires "
+                    "--hook-names with at least sae_pp_size hooks."
+                )
     else:
         expected_world_size = max(
-            vllm_tp_size * args.vllm_dp_size, sae_tp_size * args.sae_dp_size
+            vllm_tp_size * args.vllm_dp_size, sae_tp_size * args.sae_dp_size * args.sae_pp_size
         )
         if expected_world_size > 1 and world_size == 1:
             raise ValueError(
@@ -515,14 +689,11 @@ def main() -> None:
     output_path = None if args.no_save_final_sae else args.output_path
 
     device = _resolve_device()
-    d_in = _resolve_hidden_size(args.model_name)
-    hook_names = (
-        [hook.strip() for hook in args.hook_names.split(",") if hook.strip()]
-        if args.hook_names is not None
-        else None
+    d_in = (
+        _resolve_d_in_for_cached(args)
+        if args.use_cached_activations
+        else _resolve_hidden_size(args.model_name)
     )
-    if hook_names is not None and len(hook_names) <= 1:
-        hook_names = None
     cfg = LanguageModelSAERunnerConfig(
         sae=TopKTrainingSAEConfig(
             d_in=d_in,
@@ -561,15 +732,18 @@ def main() -> None:
         logger=LoggingConfig(log_to_wandb=False),
         n_checkpoints=args.n_checkpoints,
         checkpoint_path=args.checkpoint_path,
+        quiesce_checkpoint_path=args.quiesce_checkpoint_path,
         save_final_checkpoint=args.save_final_checkpoint,
         output_path=output_path,
         save_mse_every_n_steps=args.save_mse_every_n_steps,
         save_timing_every_n_steps=args.save_timing_every_n_steps,
         save_memory_every_n_steps=args.save_memory_every_n_steps,
+        append_history_logs=args.append_history_logs,
         synchronize_timing=args.synchronize_timing,
         seed=args.seed,
         verbose=True,
         sae_dp_mode=args.sae_dp_mode,
+        sae_pp_size=args.sae_pp_size,
         multi_sae_backward_mode=args.multi_sae_backward_mode,
         multi_sae_backward_order=args.multi_sae_backward_order,
         multi_sae_stats_sync_mode=args.multi_sae_stats_sync_mode,
@@ -585,9 +759,13 @@ def main() -> None:
         streaming_chunk_size_tokens=args.streaming_chunk_size_tokens,
         streaming_num_chunks=args.streaming_num_chunks,
         streaming_prefetch_chunks=args.streaming_prefetch_chunks,
+        streaming_mix_chunks=args.streaming_mix_chunks,
+        streaming_mix_fraction=args.streaming_mix_fraction,
         streaming_buffer_name=args.streaming_buffer_name,
         streaming_shuffle=args.streaming_shuffle,
         streaming_random_chunks=args.streaming_random_chunks,
+        use_cached_activations=args.use_cached_activations,
+        cached_activations_path=args.cached_activations_path,
     )
 
     print("Starting runner with:")
@@ -635,6 +813,12 @@ def main() -> None:
         print("  synchronize_timing=True")
     if args.checkpoint_path is not None:
         print(f"  checkpoint_path={args.checkpoint_path}")
+    print(f"  checkpoint_storage={args.checkpoint_storage}")
+    if args.quiesce_checkpoint_path is not None:
+        print(f"  quiesce_checkpoint_path={args.quiesce_checkpoint_path}")
+    if args.streaming_mode:
+        print(f"  streaming_mix_chunks={args.streaming_mix_chunks}")
+        print(f"  streaming_mix_fraction={args.streaming_mix_fraction}")
     if args.n_checkpoints > 0:
         print(f"  n_checkpoints={args.n_checkpoints}")
     if args.save_final_checkpoint:
@@ -652,6 +836,7 @@ def main() -> None:
         use_shard_routing=args.use_shard_routing,
         streaming_mode=args.streaming_mode,
         quiesce_dir=quiesce_dir,
+        sae_pp_size=args.sae_pp_size,
     )
 
     # Write buffer name and params to control state on first run (rank 0 only).

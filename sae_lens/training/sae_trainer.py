@@ -76,6 +76,10 @@ def _update_sae_lens_training_version(sae: TrainingSAE[Any]) -> None:
     sae.cfg.sae_lens_training_version = str(__version__)
 
 
+def _write_checkpoint_complete_marker(checkpoint_path: Path) -> None:
+    (checkpoint_path / "COMPLETED").write_text("ok\n")
+
+
 class SaveCheckpointFn(Protocol):
     def __call__(
         self,
@@ -139,14 +143,14 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             output_path = Path(self.cfg.output_path)
             output_path.mkdir(exist_ok=True, parents=True)
             self.mse_history_path = output_path / MSE_HISTORY_FILENAME
-            if not append_logs:
+            if not (append_logs or getattr(cfg, "append_history_logs", False)):
                 self.mse_history_path.write_text("")
         if self._should_write_timing_metrics():
             assert self.cfg.output_path is not None
             output_path = Path(self.cfg.output_path)
             output_path.mkdir(exist_ok=True, parents=True)
             self.timing_history_path = output_path / TIMING_HISTORY_FILENAME
-            if not append_logs:
+            if not (append_logs or getattr(cfg, "append_history_logs", False)):
                 self.timing_history_path.write_text("")
 
         # Memory profiling: each rank writes its own file (global_rank for multi-node safety).
@@ -257,6 +261,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self,
         quiesce_request_path: Path | str | None = None,
         quiesce_ack_path: Path | str | None = None,
+        quiesce_drain_ack_path: Path | str | None = None,
+        quiesce_finished_ack_path: Path | str | None = None,
     ) -> T_TRAINING_SAE:
         self.sae.to(self.cfg.device)
         pbar = tqdm(total=self.cfg.total_training_samples, desc="Training SAE")
@@ -268,8 +274,55 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 n_batches_for_norm_estimate=int(1e3),
             )
 
+        quiesce_draining = False
+        quiesce_checkpoint_now = False
+        quiesce_checkpoint_saved = False
+        quiesce_drain_acked = False
+
+        def _touch_if_metric_writer(path: Path | str | None) -> None:
+            if path is not None and self._is_metric_writer_rank():
+                Path(path).touch()
+
+        def _maybe_start_quiesce_drain() -> None:
+            nonlocal quiesce_draining, quiesce_checkpoint_now
+            if (
+                quiesce_request_path is None
+                or not Path(quiesce_request_path).exists()
+                or quiesce_draining
+            ):
+                return
+            drain_local_pool = getattr(self.data_provider, "request_drain_local_pool", None)
+            if callable(drain_local_pool):
+                drain_local_pool()
+            else:
+                quiesce_checkpoint_now = True
+            quiesce_draining = True
+
+        def _ack_drain_done() -> None:
+            nonlocal quiesce_drain_acked
+            if quiesce_drain_acked:
+                return
+            _touch_if_metric_writer(quiesce_drain_ack_path)
+            quiesce_drain_acked = True
+
+        def _save_quiesce_checkpoint() -> None:
+            nonlocal quiesce_checkpoint_saved
+            if quiesce_checkpoint_saved:
+                return
+            self.save_checkpoint(checkpoint_name=f"quiesce_{self.n_training_samples}")
+            _touch_if_metric_writer(quiesce_finished_ack_path or quiesce_ack_path)
+            quiesce_checkpoint_saved = True
+
         # Train loop
-        while self.n_training_samples < self.cfg.total_training_samples:
+        while (
+            self.n_training_samples < self.cfg.total_training_samples
+            or quiesce_draining
+        ):
+            _maybe_start_quiesce_drain()
+            if quiesce_checkpoint_now:
+                _ack_drain_done()
+                _save_quiesce_checkpoint()
+                break
             step_wall_t0 = time.perf_counter()
             # Do a training step.
             if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
@@ -314,11 +367,15 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             self.n_training_steps += 1
             self._update_pbar(step_output, pbar)
 
-            if quiesce_request_path is not None and Path(quiesce_request_path).exists():
-                self.save_checkpoint(checkpoint_name=f"quiesce_{self.n_training_samples}")
-                if quiesce_ack_path is not None and self._is_metric_writer_rank():
-                    Path(quiesce_ack_path).touch()
+            _maybe_start_quiesce_drain()
+            if quiesce_checkpoint_now:
+                _ack_drain_done()
+                _save_quiesce_checkpoint()
                 break
+
+        if quiesce_draining:
+            _ack_drain_done()
+            _save_quiesce_checkpoint()
 
         # fold the estimated norm scaling factor into the sae weights
         if self.activation_scaler.scaling_factor is not None:
@@ -327,7 +384,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             )
             self.activation_scaler.scaling_factor = None
 
-        if self.cfg.save_final_checkpoint:
+        if self.cfg.save_final_checkpoint and not quiesce_checkpoint_saved:
             self.save_checkpoint(checkpoint_name=f"final_{self.n_training_samples}")
 
         pbar.close()
@@ -347,8 +404,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         if dp_rank != 0 and not self._is_fsdp:
             return
         checkpoint_path = None
-        if self.cfg.checkpoint_path is not None or self.cfg.logger.log_to_wandb:
-            with path_or_tmp_dir(self.cfg.checkpoint_path) as base_checkpoint_path:
+        checkpoint_base_path = self._checkpoint_base_path(checkpoint_name)
+        if checkpoint_base_path is not None or self.cfg.logger.log_to_wandb:
+            with path_or_tmp_dir(checkpoint_base_path) as base_checkpoint_path:
                 checkpoint_path = base_checkpoint_path / checkpoint_name
                 checkpoint_path.mkdir(exist_ok=True, parents=True)
 
@@ -359,6 +417,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                     save_file({"sparsity": self.log_feature_sparsity}, sparsity_path)
 
                 self.save_trainer_state(checkpoint_path)
+                if dp_rank == 0 and tp_rank == 0:
+                    _write_checkpoint_complete_marker(checkpoint_path)
 
                 if self.cfg.logger.log_to_wandb and dp_rank == 0 and tp_rank == 0:
                     self.cfg.logger.log(
@@ -371,6 +431,14 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
         if self.save_checkpoint_fn is not None and tp_rank == 0:
             self.save_checkpoint_fn(checkpoint_path=checkpoint_path)
+
+    def _checkpoint_base_path(self, checkpoint_name: str) -> str | None:
+        if (
+            checkpoint_name.startswith("quiesce_")
+            and self.cfg.quiesce_checkpoint_path is not None
+        ):
+            return self.cfg.quiesce_checkpoint_path
+        return self.cfg.checkpoint_path
 
     def _save_model(self, checkpoint_path: Path) -> tuple[Path, Path]:
         """Save SAE weights, handling FSDP gather before the existing TP-aware export."""

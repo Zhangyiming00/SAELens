@@ -7,26 +7,40 @@ requiring integer multiples.
 Two world layouts are supported via the ``disjoint`` parameter:
 
 Overlapping (default, ``disjoint=False``):
-    world_size = max(P * vllm_tp, Q * sae_tp)
+    world_size = max(P * vllm_tp, Q * sae_pp * sae_tp)
     Producer ranks:  [0, P * vllm_tp)
-    Consumer ranks:  [0, Q * sae_tp)
-    Dual-role ranks: [0, min(P * vllm_tp, Q * sae_tp))
+    SAE endpoint ranks:  [0, Q * sae_pp * sae_tp)
+    Dual-role ranks: [0, min(P * vllm_tp, Q * sae_pp * sae_tp))
     Producer group p: ranks [p * vllm_tp, (p+1) * vllm_tp).
-    Consumer group c: ranks [c * sae_tp,  (c+1) * sae_tp).
+    SAE endpoint e: ranks [e * sae_tp,  (e+1) * sae_tp).
 
 Disjoint (``disjoint=True``, used by streaming_mode v1):
-    world_size = P * vllm_tp + Q * sae_tp
+    world_size = P * vllm_tp + Q * sae_pp * sae_tp
     Producer ranks:  [0, P * vllm_tp)
-    Consumer ranks:  [P * vllm_tp, P * vllm_tp + Q * sae_tp)
+    SAE endpoint ranks:  [P * vllm_tp, P * vllm_tp + Q * sae_pp * sae_tp)
     Producer group p: ranks [p * vllm_tp, (p+1) * vllm_tp).
-    Consumer group c: ranks [P*vllm_tp + c*sae_tp, P*vllm_tp + (c+1)*sae_tp).
+    SAE endpoint e: ranks [P*vllm_tp + e*sae_tp, P*vllm_tp + (e+1)*sae_tp).
 """
 
 from __future__ import annotations
 
 import torch.distributed as dist
 
-from sae_lens.shard_routing import ShardRoute, compute_routing_table, routes_for_consumer
+from sae_lens.shard_routing import ShardRoute, compute_routing_table
+
+
+def hooks_for_pp_rank(pp_rank: int, pp_size: int, all_hooks: list[str]) -> list[str]:
+    """Return the subset of hooks assigned to a given PP stage.
+
+    Distributes hooks as evenly as possible; the first ``len(all_hooks) % pp_size``
+    stages each get one extra hook.
+    """
+    n = len(all_hooks)
+    base = n // pp_size
+    extra = n % pp_size
+    start = pp_rank * base + min(pp_rank, extra)
+    count = base + (1 if pp_rank < extra else 0)
+    return all_hooks[start : start + count]
 
 # ---------------------------------------------------------------------------
 # Module-level state (isolated from distributed.py)
@@ -34,57 +48,76 @@ from sae_lens.shard_routing import ShardRoute, compute_routing_table, routes_for
 
 _initialized: bool = False
 _P: int = 0  # number of producers (vllm_dp_size)
-_Q: int = 0  # number of consumers (sae_dp_size)
+_Q: int = 0  # number of routing consumers / SAE DP replicas (sae_dp_size)
 _vllm_tp_size: int = 1
 _sae_tp_size: int = 1
+_sae_pp_size: int = 1
+_num_sae_stage_endpoints: int = 0  # sae_dp_size * sae_pp_size
 
 _is_producer: bool = False
 _is_consumer: bool = False
 _producer_idx: int = -1  # logical producer index; -1 if not a producer
-_consumer_idx: int = -1  # logical consumer index; -1 if not a consumer
+_consumer_idx: int = -1  # routing consumer / SAE DP index; -1 if not a consumer
+_sae_endpoint_idx: int = -1  # physical SAE endpoint index d * sae_pp + pp_rank
 _vllm_tp_rank: int = -1  # rank within this rank's vLLM TP group; -1 if not a producer
 _sae_tp_rank: int = -1   # rank within this rank's SAE TP group; -1 if not a consumer
+_sae_pp_rank: int = -1   # PP stage index; -1 if not a consumer
+_sae_dp_idx: int = -1    # DP replica index; -1 if not a consumer
 
 # Explicit world-rank maps
 _producer_world_ranks: dict[int, list[int]] = {}  # p -> [world ranks in TP group]
-_consumer_world_ranks: dict[int, list[int]] = {}  # c -> [world ranks in TP group]
+_sae_endpoint_world_ranks: dict[int, list[int]] = {}  # e -> [world ranks in TP group]
 _producer_tp_root: dict[int, int] = {}            # p -> world rank of TP root (vllm_tp_rank=0)
-_consumer_tp_root: dict[int, int] = {}            # c -> world rank of TP root (sae_tp_rank=0)
+_sae_endpoint_tp_root: dict[int, int] = {}        # e -> world rank of TP root (sae_tp_rank=0)
 
 # Process groups
 _vllm_tp_group: dist.ProcessGroup | None = None
 _sae_tp_group: dist.ProcessGroup | None = None
 _sae_dp_group: dist.ProcessGroup | None = None
-_consumer_p2p_groups: dict[int, dist.ProcessGroup] = {}  # consumer_idx -> NCCL P2P group
+_sae_endpoint_p2p_groups: dict[int, dist.ProcessGroup] = {}  # endpoint_idx -> NCCL P2P group
+_sae_dp_replica_group: dist.ProcessGroup | None = None  # all PP*TP ranks of this DP replica
+_sae_dp_replica_root: int = -1  # world rank of the DP replica's PP-0 + TP-0
+
+# Backwards-compatible aliases for code/tests that inspect module state directly.
+_consumer_world_ranks: dict[int, list[int]] = _sae_endpoint_world_ranks
+_consumer_tp_root: dict[int, int] = _sae_endpoint_tp_root
+_consumer_p2p_groups: dict[int, dist.ProcessGroup] = _sae_endpoint_p2p_groups
 
 _routing_table: list[ShardRoute] = []
 
 
 def _reset() -> None:
     """Reset all module state.  Used in tests."""
-    global _initialized, _P, _Q, _vllm_tp_size, _sae_tp_size
-    global _is_producer, _is_consumer, _producer_idx, _consumer_idx
-    global _vllm_tp_rank, _sae_tp_rank
-    global _producer_world_ranks, _consumer_world_ranks
-    global _producer_tp_root, _consumer_tp_root
+    global _initialized, _P, _Q, _vllm_tp_size, _sae_tp_size, _sae_pp_size
+    global _num_sae_stage_endpoints
+    global _is_producer, _is_consumer, _producer_idx, _consumer_idx, _sae_endpoint_idx
+    global _vllm_tp_rank, _sae_tp_rank, _sae_pp_rank, _sae_dp_idx
+    global _producer_world_ranks, _sae_endpoint_world_ranks, _consumer_world_ranks
+    global _producer_tp_root, _sae_endpoint_tp_root, _consumer_tp_root
     global _vllm_tp_group, _sae_tp_group, _sae_dp_group
-    global _consumer_p2p_groups, _routing_table
+    global _sae_endpoint_p2p_groups, _consumer_p2p_groups, _routing_table
+    global _sae_dp_replica_group, _sae_dp_replica_root
 
     _initialized = False
-    _P = _Q = 0
-    _vllm_tp_size = _sae_tp_size = 1
+    _P = _Q = _num_sae_stage_endpoints = 0
+    _vllm_tp_size = _sae_tp_size = _sae_pp_size = 1
     _is_producer = _is_consumer = False
-    _producer_idx = _consumer_idx = -1
-    _vllm_tp_rank = _sae_tp_rank = -1
+    _producer_idx = _consumer_idx = _sae_endpoint_idx = -1
+    _vllm_tp_rank = _sae_tp_rank = _sae_pp_rank = _sae_dp_idx = -1
     _producer_world_ranks = {}
-    _consumer_world_ranks = {}
+    _sae_endpoint_world_ranks = {}
+    _consumer_world_ranks = _sae_endpoint_world_ranks
     _producer_tp_root = {}
-    _consumer_tp_root = {}
+    _sae_endpoint_tp_root = {}
+    _consumer_tp_root = _sae_endpoint_tp_root
     _vllm_tp_group = None
     _sae_tp_group = None
     _sae_dp_group = None
-    _consumer_p2p_groups = {}
+    _sae_endpoint_p2p_groups = {}
+    _consumer_p2p_groups = _sae_endpoint_p2p_groups
     _routing_table = []
+    _sae_dp_replica_group = None
+    _sae_dp_replica_root = -1
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +131,7 @@ def init_distributed_v2(
     sae_tp_size: int,
     batch_size: int,
     disjoint: bool = False,
+    sae_pp_size: int = 1,
 ) -> None:
     """Initialize all process groups for the unified shard-routing path.
 
@@ -114,39 +148,46 @@ def init_distributed_v2(
         Tensor-parallel size for each vLLM replica.
     sae_tp_size:
         Tensor-parallel size for each SAE replica.
+    sae_pp_size:
+        Number of SAE pipeline stages.  PP stages are physical training endpoints
+        for different hook subsets; they are not extra routing consumers.
     batch_size:
         Rows per producer per step (``store_batch_size_prompts * training_context_size``).
         Used to build the routing table.  Must be large enough that every connected
         producer→consumer edge receives at least 1 row.
     disjoint:
         When True, use a disjoint topology where producer and consumer ranks do not
-        overlap.  Producer ranks are ``[0, P*vllm_tp_size)`` and consumer ranks are
-        ``[P*vllm_tp_size, P*vllm_tp_size + Q*sae_tp_size)``, so
-        ``world_size = P*vllm_tp_size + Q*sae_tp_size``.  When False (default), use
-        the overlapping topology where ``world_size = max(P*vllm_tp, Q*sae_tp)``.
+        overlap.  Producer ranks are ``[0, P*vllm_tp_size)`` and SAE endpoint ranks are
+        ``[P*vllm_tp_size, P*vllm_tp_size + Q*sae_pp_size*sae_tp_size)``, so
+        ``world_size = P*vllm_tp_size + Q*sae_pp_size*sae_tp_size``.  When False
+        (default), use the overlapping topology where
+        ``world_size = max(P*vllm_tp, Q*sae_pp*sae_tp)``.
     """
-    global _initialized, _P, _Q, _vllm_tp_size, _sae_tp_size
-    global _is_producer, _is_consumer, _producer_idx, _consumer_idx
-    global _vllm_tp_rank, _sae_tp_rank
-    global _producer_world_ranks, _consumer_world_ranks
-    global _producer_tp_root, _consumer_tp_root
+    global _initialized, _P, _Q, _vllm_tp_size, _sae_tp_size, _sae_pp_size
+    global _num_sae_stage_endpoints
+    global _is_producer, _is_consumer, _producer_idx, _consumer_idx, _sae_endpoint_idx
+    global _vllm_tp_rank, _sae_tp_rank, _sae_pp_rank, _sae_dp_idx
+    global _producer_world_ranks, _sae_endpoint_world_ranks, _consumer_world_ranks
+    global _producer_tp_root, _sae_endpoint_tp_root, _consumer_tp_root
     global _vllm_tp_group, _sae_tp_group, _sae_dp_group
-    global _consumer_p2p_groups, _routing_table
+    global _sae_endpoint_p2p_groups, _consumer_p2p_groups, _routing_table
+    global _sae_dp_replica_group, _sae_dp_replica_root
 
     assert dist.is_initialized(), "Call dist.init_process_group() before init_distributed_v2()"
 
+    num_sae_stage_endpoints = Q * sae_pp_size
     world_size = dist.get_world_size()
     if disjoint:
-        expected = P * vllm_tp_size + Q * sae_tp_size
+        expected = P * vllm_tp_size + num_sae_stage_endpoints * sae_tp_size
         assert world_size == expected, (
-            f"world_size={world_size} != P*vllm_tp + Q*sae_tp={expected} "
-            f"(P={P}, vllm_tp={vllm_tp_size}, Q={Q}, sae_tp={sae_tp_size})"
+            f"world_size={world_size} != P*vllm_tp + sae_endpoints*sae_tp={expected} "
+            f"(P={P}, vllm_tp={vllm_tp_size}, Q={Q}, sae_pp={sae_pp_size}, sae_tp={sae_tp_size})"
         )
     else:
-        expected = max(P * vllm_tp_size, Q * sae_tp_size)
+        expected = max(P * vllm_tp_size, num_sae_stage_endpoints * sae_tp_size)
         assert world_size == expected, (
-            f"world_size={world_size} != max(P*vllm_tp, Q*sae_tp)={expected} "
-            f"(P={P}, vllm_tp={vllm_tp_size}, Q={Q}, sae_tp={sae_tp_size})"
+            f"world_size={world_size} != max(P*vllm_tp, sae_endpoints*sae_tp)={expected} "
+            f"(P={P}, vllm_tp={vllm_tp_size}, Q={Q}, sae_pp={sae_pp_size}, sae_tp={sae_tp_size})"
         )
 
     rank = dist.get_rank()
@@ -154,6 +195,8 @@ def init_distributed_v2(
     _Q = Q
     _vllm_tp_size = vllm_tp_size
     _sae_tp_size = sae_tp_size
+    _sae_pp_size = sae_pp_size
+    _num_sae_stage_endpoints = num_sae_stage_endpoints
 
     # --- Build explicit rank maps ---
     for p in range(P):
@@ -161,20 +204,24 @@ def init_distributed_v2(
         _producer_world_ranks[p] = ranks
         _producer_tp_root[p] = ranks[0]
 
+    # Endpoint layout: e = d * sae_pp + s, where d=DP consumer, s=PP stage.
     consumer_offset = P * vllm_tp_size if disjoint else 0
-    for c in range(Q):
-        base = consumer_offset + c * sae_tp_size
+    for endpoint_idx in range(num_sae_stage_endpoints):
+        base = consumer_offset + endpoint_idx * sae_tp_size
         ranks = list(range(base, base + sae_tp_size))
-        _consumer_world_ranks[c] = ranks
-        _consumer_tp_root[c] = ranks[0]
+        _sae_endpoint_world_ranks[endpoint_idx] = ranks
+        _sae_endpoint_tp_root[endpoint_idx] = ranks[0]
 
     # --- Determine this rank's role by membership ---
     _is_producer = False
     _is_consumer = False
     _producer_idx = -1
     _consumer_idx = -1
+    _sae_endpoint_idx = -1
     _vllm_tp_rank = -1
     _sae_tp_rank = -1
+    _sae_pp_rank = -1
+    _sae_dp_idx = -1
 
     for p, ranks in _producer_world_ranks.items():
         if rank in ranks:
@@ -182,11 +229,14 @@ def init_distributed_v2(
             _producer_idx = p
             _vllm_tp_rank = ranks.index(rank)
 
-    for c, ranks in _consumer_world_ranks.items():
+    for endpoint_idx, ranks in _sae_endpoint_world_ranks.items():
         if rank in ranks:
             _is_consumer = True
-            _consumer_idx = c
+            _consumer_idx = endpoint_idx // sae_pp_size
+            _sae_endpoint_idx = endpoint_idx
             _sae_tp_rank = ranks.index(rank)
+            _sae_dp_idx = _consumer_idx
+            _sae_pp_rank = endpoint_idx % sae_pp_size
 
     # --- Create P vLLM TP groups (NCCL) ---
     for p in range(P):
@@ -195,36 +245,62 @@ def init_distributed_v2(
         if _is_producer and _producer_idx == p:
             _vllm_tp_group = grp
 
-    # --- Create Q SAE TP groups (NCCL) ---
-    for c in range(Q):
-        ranks = _consumer_world_ranks[c]
+    # --- Create one SAE TP group per physical endpoint (DP replica x PP stage) ---
+    for endpoint_idx in range(num_sae_stage_endpoints):
+        ranks = _sae_endpoint_world_ranks[endpoint_idx]
         grp = dist.new_group(ranks, backend="nccl")
-        if _is_consumer and _consumer_idx == c:
+        if _is_consumer and _sae_endpoint_idx == endpoint_idx:
             _sae_tp_group = grp
 
-    # --- Create SAE DP groups (NCCL): one per sae_tp_rank position ---
-    for tp_r in range(sae_tp_size):
-        dp_ranks = [_consumer_world_ranks[c][tp_r] for c in range(Q)]
-        grp = dist.new_group(dp_ranks, backend="nccl")
-        if _is_consumer and _sae_tp_rank == tp_r:
-            _sae_dp_group = grp
+    # --- Create SAE DP groups (NCCL): one per (pp_stage, tp_rank) position ---
+    # Ranks at the same PP stage and TP position across DP replicas.
+    if Q > 0:
+        for s in range(sae_pp_size):
+            for tp_r in range(sae_tp_size):
+                dp_ranks = [
+                    _sae_endpoint_world_ranks[d * sae_pp_size + s][tp_r]
+                    for d in range(Q)
+                ]
+                grp = dist.new_group(dp_ranks, backend="nccl")
+                if _is_consumer and _sae_pp_rank == s and _sae_tp_rank == tp_r:
+                    _sae_dp_group = grp
 
-    # --- Compute routing table (empty when P=0 — no producers) ---
-    _routing_table = compute_routing_table(P, Q, batch_size) if P > 0 else []
+    # --- Create per-DP-replica groups: all PP*TP ranks of one DP replica ---
+    # PP-0 + TP-0 of each replica is the root that claims chunks and broadcasts
+    # the chunk-index list to its sibling PP stages (which read the same chunks
+    # from the shared mmap).  Created even when sae_pp_size == 1 so call sites
+    # can use it uniformly.
+    if Q > 0:
+        for d in range(Q):
+            members = [
+                _sae_endpoint_world_ranks[d * sae_pp_size + s][tp_r]
+                for s in range(sae_pp_size)
+                for tp_r in range(sae_tp_size)
+            ]
+            grp = dist.new_group(members, backend="nccl")
+            if _is_consumer and _sae_dp_idx == d:
+                _sae_dp_replica_group = grp
+                _sae_dp_replica_root = members[0]
 
-    # --- Create Q per-consumer NCCL P2P groups ---
-    # Uses NCCL for efficient GPU-to-GPU activation transfers.
-    # Requires vLLM parallel state to be pre-initialized via preinit_vllm_distributed()
-    # to avoid NCCL communicator conflicts.
-    for c in range(Q):
-        sources = {r.producer_idx for r in _routing_table if r.consumer_idx == c}
-        # Deduplicate: producer TP root and consumer TP root may coincide.
+    # --- Compute routing table: partition rows across DP replicas only ---
+    _routing_table = compute_routing_table(P, Q, batch_size) if P > 0 and Q > 0 else []
+
+    # --- Create one P2P group per physical SAE endpoint ---
+    # Each endpoint (d*sae_pp+s) gets its TP root and all producer TP roots
+    # connected to its DP consumer. PP stages in the same DP replica share routes.
+    for endpoint_idx in range(num_sae_stage_endpoints):
+        d = endpoint_idx // sae_pp_size
+        sources = {r.producer_idx for r in _routing_table if r.consumer_idx == d}
         p2p_members = sorted(
-            {_consumer_tp_root[c]} | {_producer_tp_root[p] for p in sources}
+            {_sae_endpoint_tp_root[endpoint_idx]} | {_producer_tp_root[p] for p in sources}
         )
         grp = dist.new_group(p2p_members, backend="nccl")
         if rank in p2p_members:
-            _consumer_p2p_groups[c] = grp
+            _sae_endpoint_p2p_groups[endpoint_idx] = grp
+
+    _consumer_world_ranks = _sae_endpoint_world_ranks
+    _consumer_tp_root = _sae_endpoint_tp_root
+    _consumer_p2p_groups = _sae_endpoint_p2p_groups
 
     _initialized = True
 
@@ -246,6 +322,7 @@ def get_producer_idx() -> int:
 
 
 def get_consumer_idx() -> int:
+    """Return this rank's SAE DP consumer index used by shard routing."""
     return _consumer_idx
 
 
@@ -269,6 +346,38 @@ def get_sae_dp_size() -> int:
     return _Q
 
 
+def get_sae_pp_rank() -> int:
+    return _sae_pp_rank
+
+
+def get_sae_pp_size() -> int:
+    return _sae_pp_size
+
+
+def get_sae_dp_idx() -> int:
+    """Return this rank's SAE DP replica index used by shard routing."""
+    return _sae_dp_idx
+
+
+def get_sae_endpoint_idx() -> int:
+    """Return this rank's physical SAE endpoint index ``dp_idx * pp_size + pp_rank``."""
+    return _sae_endpoint_idx
+
+
+def get_num_sae_stage_endpoints() -> int:
+    """Return the number of physical SAE training endpoints (DP replicas x PP stages)."""
+    return _num_sae_stage_endpoints
+
+
+def get_q_total() -> int:
+    """Deprecated alias for ``get_num_sae_stage_endpoints()``.
+
+    This is not the routing consumer count.  Routing consumers are SAE DP replicas
+    and are returned by ``get_sae_dp_size()``.
+    """
+    return _num_sae_stage_endpoints
+
+
 def get_routing_table() -> list[ShardRoute]:
     return _routing_table
 
@@ -285,17 +394,40 @@ def get_sae_dp_group() -> dist.ProcessGroup | None:
     return _sae_dp_group
 
 
-def get_p2p_group(consumer_idx: int) -> dist.ProcessGroup:
-    """Return the NCCL P2P group for the given consumer.
+def get_sae_dp_replica_group() -> dist.ProcessGroup | None:
+    """Process group spanning all PP*TP ranks of this rank's DP replica.
 
-    Raises ``KeyError`` if this rank is not a member of that consumer's P2P group.
+    Returns None if this rank is not a consumer or the run is not initialized.
+    The group is created even when ``sae_pp_size == 1`` (members = the TP group
+    of the single endpoint), which lets callers use it unconditionally.
     """
-    return _consumer_p2p_groups[consumer_idx]
+    return _sae_dp_replica_group
+
+
+def get_sae_dp_replica_root_global_rank() -> int:
+    """World rank of the DP replica's root (PP-0 + TP-0).
+
+    Returns -1 if this rank is not a consumer.
+    """
+    return _sae_dp_replica_root
+
+
+def get_p2p_group(endpoint_idx: int) -> dist.ProcessGroup:
+    """Return the NCCL P2P group for the given SAE endpoint.
+
+    Raises ``KeyError`` if this rank is not a member of that endpoint's P2P group.
+    """
+    return _sae_endpoint_p2p_groups[endpoint_idx]
 
 
 def get_producer_tp_root(p: int) -> int:
     return _producer_tp_root[p]
 
 
-def get_consumer_tp_root(c: int) -> int:
-    return _consumer_tp_root[c]
+def get_consumer_tp_root(endpoint_idx: int) -> int:
+    """Return the SAE TP root for a physical endpoint.
+
+    The function name is kept for compatibility.  When ``sae_pp_size > 1``, pass
+    an endpoint index, not a routing consumer index.
+    """
+    return _sae_endpoint_tp_root[endpoint_idx]

@@ -17,6 +17,7 @@ class TopologySpec:
     vllm_dp: int
     sae_tp: int
     sae_dp: int = 1  # 0 = no SAE (vLLM-only), 1 = has SAE
+    sae_pp_size: int = 1
 
 
 @dataclass
@@ -64,6 +65,7 @@ def read_control_state(path: Path | str) -> ControlState:
     data = json.loads(Path(path).read_text())
     topo_data = data["topology"]
     topo_data.setdefault("sae_dp", 1)
+    topo_data.setdefault("sae_pp_size", 1)
     return ControlState(
         phase=data["phase"],
         topology=TopologySpec(**topo_data),

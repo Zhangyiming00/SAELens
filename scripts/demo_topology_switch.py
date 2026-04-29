@@ -29,11 +29,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-RUN_DIR = Path("/tmp/demo_topo_switch")
+RUN_DIR = Path("results/topology_runs/demo_topo_switch")
 MODEL = "/data/models/Llama-3.1-8B"
 DATASET = "/data/fineweb-edu/sample/10BT/000_00000.parquet"
-HOOK = "blocks.21.hook_resid_post"
-NUM_CHUNKS = 128  # must match --streaming-num-chunks
+HOOK = "blocks.16.hook_resid_post"
+NUM_CHUNKS = 80  # must match --streaming-num-chunks
 
 WORKER_ARGS = [
     "--model-name", MODEL,
@@ -41,17 +41,17 @@ WORKER_ARGS = [
     "--hook-name", HOOK,
     "--d-sae", "65536",
     "--k", "128",
-    "--training-tokens", "2048000",
+    "--training-tokens", "6553600",
     "--train-batch-size-tokens", "2048",
     "--context-size", "2048",
     "--max-model-len", "2049",
     "--gpu-memory-utilization", "0.45",
-    "--streaming-chunk-size-tokens", "131072",
+    "--streaming-chunk-size-tokens", "16384",
     "--streaming-num-chunks", str(NUM_CHUNKS),
     "--output-path", str(RUN_DIR / "output"),
     "--checkpoint-path", str(RUN_DIR / "checkpoints"),
     "--save-timing-every-n-steps", "1",
-    "--save-mse-every-n-steps", "1",
+    "--save-mse-every-n-steps", "0",
     "--save-memory-every-n-steps", "0",
     "--no-is-dataset-tokenized",
 ]
@@ -155,14 +155,14 @@ DEFAULT_RULES: list[BufferReadyPct | TokensConsumed] = [
         direction="above",
         target_topology=TOPO_0VLLM_SAE2,
         label="buffer_full",
-        check_after_s=[6, 12,18],
+        check_after_s=[6, 12],
     ),
     BufferReadyPct(
         threshold=0.18,
         direction="below",
         target_topology=TOPO_1VLLM_1SAE,
         label="buffer_low",
-        check_after_s=[6, 12,18],
+        check_after_s=[6, 12],
     ),
 ]
 

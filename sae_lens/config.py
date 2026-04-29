@@ -294,11 +294,13 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     # Outputs/Checkpoints
     n_checkpoints: int = 0
     checkpoint_path: str | None = "checkpoints"
+    quiesce_checkpoint_path: str | None = None
     save_final_checkpoint: bool = False
     output_path: str | None = "output"
     save_mse_every_n_steps: int = 0
     save_timing_every_n_steps: int = 0
     save_memory_every_n_steps: int = 0
+    append_history_logs: bool = False
     synchronize_timing: bool = False
     resume_from_checkpoint: str | None = None
 
@@ -325,6 +327,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     ddp_static_graph: bool | None = None
     ddp_bucket_cap_mb: int | None = None
     ddp_config_strict: bool = False
+    sae_pp_size: int = 1
 
     # Streaming mode (v1): vLLM and SAE on separate GPU sets, communicate via /dev/shm.
     # sae_dp > 1 is NOT supported in v1 (independent acquire_up_to() calls diverge
@@ -333,6 +336,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     streaming_chunk_size_tokens: int = 4096
     streaming_num_chunks: int = 32
     streaming_prefetch_chunks: int = 2
+    streaming_mix_chunks: int = 8
+    streaming_mix_fraction: float = 0.5
     streaming_buffer_name: str = ""  # auto-generated unique name if empty
     streaming_shuffle: bool = True
     streaming_random_chunks: bool = True
@@ -352,6 +357,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             raise ValueError("multi_sae_stats_sync_interval must be >= 1")
         if self.ddp_bucket_cap_mb is not None and self.ddp_bucket_cap_mb <= 0:
             raise ValueError("ddp_bucket_cap_mb must be > 0 when set")
+        if self.sae_pp_size < 1:
+            raise ValueError("sae_pp_size must be >= 1")
         if self.streaming_mode:
             if self.streaming_prefetch_chunks < 1:
                 raise ValueError("streaming_prefetch_chunks must be >= 1.")
@@ -359,20 +366,30 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
                 raise ValueError(
                     "streaming_num_chunks must be > streaming_prefetch_chunks."
                 )
+            if self.streaming_mix_chunks < 0:
+                raise ValueError("streaming_mix_chunks must be >= 0.")
+            if not 0 <= self.streaming_mix_fraction <= 1:
+                raise ValueError("streaming_mix_fraction must be in [0, 1].")
+        effective_num_hooks = 1
         if self.hook_names is not None:
             self.hook_names = list(dict.fromkeys(self.hook_names))
             if len(self.hook_names) == 0:
                 raise ValueError("hook_names must not be empty when provided")
-            if len(self.hook_names) > 1 and self.sae_dp_mode == "manual":
-                warnings.warn(
-                    "Multi-layer SAE training does not use manual DP sync; "
-                    "defaulting sae_dp_mode to 'ddp'. With sae_dp_size=1 this "
-                    "runs without data-parallel communication.",
-                    stacklevel=2,
-                )
-                self.sae_dp_mode = "ddp"
+            effective_num_hooks = len(self.hook_names)
             if len(self.hook_names) == 1:
                 self.hook_name = self.hook_names[0]
+
+        if (
+            (effective_num_hooks > 1 or self.sae_pp_size > 1)
+            and self.sae_dp_mode == "manual"
+        ):
+            warnings.warn(
+                "Multi-layer/PP SAE training does not use manual DP sync; "
+                "defaulting sae_dp_mode to 'ddp'. With sae_dp_size=1 this "
+                "runs without data-parallel communication.",
+                stacklevel=2,
+            )
+            self.sae_dp_mode = "ddp"
 
         if self.sae_dp_mode == "ddp" and self.compile_sae:
             raise ValueError(
@@ -387,11 +404,6 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             )
 
         if self.use_cached_activations and self.cached_activations_path is None:
-            if self.hook_names is not None and len(self.hook_names) > 1:
-                raise ValueError(
-                    "use_cached_activations is not supported with multi-layer "
-                    "hook_names in this implementation."
-                )
             self.cached_activations_path = _default_cached_activations_path(
                 self.dataset_path,
                 self.model_name,
@@ -443,6 +455,10 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
                 unique_id = _unique_run_id(Path(self.checkpoint_path), unique_id)
         if self.checkpoint_path is not None:
             self.checkpoint_path = str(Path(self.checkpoint_path) / unique_id)
+        if self.quiesce_checkpoint_path is not None:
+            self.quiesce_checkpoint_path = str(
+                Path(self.quiesce_checkpoint_path) / unique_id
+            )
 
         if self.verbose:
             logger.info(
@@ -560,17 +576,21 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         # the post_init always appends to checkpoint path, so we need to set it explicitly here.
         if "checkpoint_path" in cfg_dict:
             output.checkpoint_path = cfg_dict["checkpoint_path"]
+        if "quiesce_checkpoint_path" in cfg_dict:
+            output.quiesce_checkpoint_path = cfg_dict["quiesce_checkpoint_path"]
         return output
 
     def to_sae_trainer_config(self) -> "SAETrainerConfig":
         return SAETrainerConfig(
             n_checkpoints=self.n_checkpoints,
             checkpoint_path=self.checkpoint_path,
+            quiesce_checkpoint_path=self.quiesce_checkpoint_path,
             save_final_checkpoint=self.save_final_checkpoint,
             output_path=self.output_path,
             save_mse_every_n_steps=self.save_mse_every_n_steps,
             save_timing_every_n_steps=self.save_timing_every_n_steps,
             save_memory_every_n_steps=self.save_memory_every_n_steps,
+            append_history_logs=self.append_history_logs,
             synchronize_timing=self.synchronize_timing,
             multi_sae_backward_order=self.multi_sae_backward_order,
             multi_sae_stats_sync_mode=self.multi_sae_stats_sync_mode,
@@ -806,6 +826,7 @@ class PretokenizeRunnerConfig:
 class SAETrainerConfig:
     n_checkpoints: int
     checkpoint_path: str | None
+    quiesce_checkpoint_path: str | None
     save_final_checkpoint: bool
     output_path: str | None
     save_mse_every_n_steps: int
@@ -830,6 +851,7 @@ class SAETrainerConfig:
     dead_feature_window: int
     feature_sampling_window: int
     logger: LoggingConfig
+    append_history_logs: bool = False
 
     @property
     def total_training_steps(self) -> int:

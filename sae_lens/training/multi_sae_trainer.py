@@ -34,6 +34,7 @@ from sae_lens.training.sae_trainer import (
     SaveCheckpointFn,
     _log_feature_sparsity,
     _unwrap_item,
+    _write_checkpoint_complete_marker,
 )
 from sae_lens.training.types import DataProvider
 
@@ -41,7 +42,17 @@ MULTI_SAE_MANIFEST_FILENAME = "multi_sae_manifest.json"
 MULTI_SAE_FSDP_OPTIMIZER_STATE_FILENAME_TEMPLATE = (
     "multi_fsdp_optimizer_state_rank{rank}.pt"
 )
+MULTI_SAE_FSDP_OPTIMIZER_STATE_PP_FILENAME_TEMPLATE = (
+    "multi_fsdp_optimizer_state_pp{pp_rank}_rank{rank}.pt"
+)
 MULTI_SAE_FSDP_OPTIMIZER_STATE_FORMAT = "multi_fsdp_raw_rank_sharded_v1"
+MULTI_SAE_OPTIMIZER_STATE_FORMAT = "multi_per_hook_safetensors_v1"
+PP_TRAINER_STATE_FILENAME_TEMPLATE = "trainer_state_pp{pp_rank}.pt"
+# v2 layout: per-hook state file inside each hook's directory (PP-symmetric).
+HOOK_STATE_FILENAME = "hook_state.pt"
+HOOK_OPTIMIZER_STATE_FILENAME = "optimizer_state.safetensors"
+HOOK_OPTIMIZER_META_FILENAME = "optimizer_state_meta.json"
+_OPTIMIZER_STATE_KEY_SEP = "::"
 
 
 def sanitize_hook_name_for_path(hook_name: str) -> str:
@@ -63,6 +74,7 @@ class MultiSAETrainer:
         sae_dp_mode: str,
         backward_mode: str = "combined",
         seed_mode: str = "same",
+        append_logs: bool = False,
     ) -> None:
         self.hook_names = hook_names
         self.sae_by_hook = sae_by_hook
@@ -178,6 +190,7 @@ class MultiSAETrainer:
         self.n_training_samples = 0
         self._t_ready: float = time.time()
         self.mse_history_path: Path | None = None
+        self.debug_mse_history_path: Path | None = None
         self.timing_history_path: Path | None = None
         self.memory_history_path: Path | None = None
         self.checkpoint_thresholds: list[int] = []
@@ -201,7 +214,20 @@ class MultiSAETrainer:
             output_path = Path(cfg.output_path)
             output_path.mkdir(exist_ok=True, parents=True)
             self.mse_history_path = output_path / MSE_HISTORY_FILENAME
-            self.mse_history_path.write_text("")
+            if not (append_logs or getattr(cfg, "append_history_logs", False)):
+                self.mse_history_path.write_text("")
+        if (
+            os.environ.get("SAELENS_DEBUG_ALL_RANK_MSE") == "1"
+            and cfg.output_path is not None
+            and cfg.save_mse_every_n_steps > 0
+        ):
+            output_path = Path(cfg.output_path)
+            output_path.mkdir(exist_ok=True, parents=True)
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            self.debug_mse_history_path = (
+                output_path / f"debug_mse_rank{rank}_pid{os.getpid()}.jsonl"
+            )
+            self.debug_mse_history_path.write_text("")
         if (
             should_write_logs
             and cfg.output_path is not None
@@ -210,7 +236,8 @@ class MultiSAETrainer:
             output_path = Path(cfg.output_path)
             output_path.mkdir(exist_ok=True, parents=True)
             self.timing_history_path = output_path / TIMING_HISTORY_FILENAME
-            self.timing_history_path.write_text("")
+            if not (append_logs or getattr(cfg, "append_history_logs", False)):
+                self.timing_history_path.write_text("")
 
         # Memory profiling: each rank writes its own file (global_rank for multi-node safety).
         if dist.is_available() and dist.is_initialized():
@@ -283,7 +310,18 @@ class MultiSAETrainer:
         return 0
 
     def _is_metric_writer_rank(self) -> bool:
-        return self._dp_rank() == 0 and self._tp_rank() == 0
+        pp_rank = self._pp_rank()
+        return self._dp_rank() == 0 and self._tp_rank() == 0 and pp_rank == 0
+
+    def _pp_rank(self) -> int:
+        if dist.is_available() and dist.is_initialized():
+            try:
+                import sae_lens.distributed_v2 as v2_mod
+                if getattr(v2_mod, "_initialized", False) and v2_mod.is_consumer():
+                    return v2_mod.get_sae_pp_rank()
+            except ImportError:
+                pass
+        return 0
 
     def _tp_barrier(self) -> None:
         tp_group = self._tp_group()
@@ -314,9 +352,58 @@ class MultiSAETrainer:
         self,
         quiesce_request_path: Path | str | None = None,
         quiesce_ack_path: Path | str | None = None,
+        quiesce_drain_ack_path: Path | str | None = None,
+        quiesce_finished_ack_path: Path | str | None = None,
     ) -> dict[str, TrainingSAE[Any]]:
         pbar = tqdm(total=self.cfg.total_training_samples, desc="Training Multi SAE")
-        while self.n_training_samples < self.cfg.total_training_samples:
+        quiesce_draining = False
+        quiesce_checkpoint_now = False
+        quiesce_checkpoint_saved = False
+        quiesce_drain_acked = False
+
+        def _touch_if_metric_writer(path: Path | str | None) -> None:
+            if path is not None and self._is_metric_writer_rank():
+                Path(path).touch()
+
+        def _maybe_start_quiesce_drain() -> None:
+            nonlocal quiesce_draining, quiesce_checkpoint_now
+            if (
+                quiesce_request_path is None
+                or not Path(quiesce_request_path).exists()
+                or quiesce_draining
+            ):
+                return
+            drain_local_pool = getattr(self.data_provider, "request_drain_local_pool", None)
+            if callable(drain_local_pool):
+                drain_local_pool()
+            else:
+                quiesce_checkpoint_now = True
+            quiesce_draining = True
+
+        def _ack_drain_done() -> None:
+            nonlocal quiesce_drain_acked
+            if quiesce_drain_acked:
+                return
+            _touch_if_metric_writer(quiesce_drain_ack_path)
+            quiesce_drain_acked = True
+
+        def _save_quiesce_checkpoint() -> None:
+            nonlocal quiesce_checkpoint_saved
+            if quiesce_checkpoint_saved:
+                return
+            self.save_checkpoint(checkpoint_name=f"quiesce_{self.n_training_samples}")
+            _touch_if_metric_writer(quiesce_finished_ack_path or quiesce_ack_path)
+            quiesce_checkpoint_saved = True
+
+        while (
+            self.n_training_samples < self.cfg.total_training_samples
+            or quiesce_draining
+        ):
+            _maybe_start_quiesce_drain()
+            if quiesce_checkpoint_now:
+                _ack_drain_done()
+                _save_quiesce_checkpoint()
+                break
             step_wall_t0 = time.perf_counter()
             self._maybe_synchronize_timing()
             with cuda_nvtx_range("multi_sae:data_fetch"):
@@ -386,16 +473,19 @@ class MultiSAETrainer:
                     f"{self.n_training_steps}| avg_loss: {avg_loss:.5f}"
                 )
 
-            if quiesce_request_path is not None and Path(quiesce_request_path).exists():
-                self.save_checkpoint(checkpoint_name=f"quiesce_{self.n_training_samples}")
-                if quiesce_ack_path is not None and self._is_metric_writer_rank():
-                    Path(quiesce_ack_path).touch()
+            _maybe_start_quiesce_drain()
+            if quiesce_checkpoint_now:
+                _ack_drain_done()
+                _save_quiesce_checkpoint()
                 break
 
         pbar.close()
         # Ensure periodic/deferred stats are flushed before final save/logging.
         self._sync_deferred_stats_if_needed(force=True)
-        if self.cfg.save_final_checkpoint:
+        if quiesce_draining:
+            _ack_drain_done()
+            _save_quiesce_checkpoint()
+        if self.cfg.save_final_checkpoint and not quiesce_checkpoint_saved:
             self.save_checkpoint(checkpoint_name=f"final_{self.n_training_samples}")
         return self.base_sae_by_hook
 
@@ -784,9 +874,10 @@ class MultiSAETrainer:
             self._tp_barrier()
 
     def save_checkpoint(self, checkpoint_name: str) -> None:
-        if self.cfg.checkpoint_path is None:
+        checkpoint_base_path = self._checkpoint_base_path(checkpoint_name)
+        if checkpoint_base_path is None:
             return
-        checkpoint_path = Path(self.cfg.checkpoint_path) / checkpoint_name
+        checkpoint_path = Path(checkpoint_base_path) / checkpoint_name
         checkpoint_path.mkdir(exist_ok=True, parents=True)
 
         if self._is_metric_writer_rank():
@@ -797,9 +888,19 @@ class MultiSAETrainer:
             self._save_one_checkpoint_model(checkpoint_path, hook_name)
 
         self.save_trainer_state(checkpoint_path)
+        if self._is_metric_writer_rank():
+            _write_checkpoint_complete_marker(checkpoint_path)
 
         if self.save_checkpoint_fn is not None and self._is_metric_writer_rank():
             self.save_checkpoint_fn(checkpoint_path=checkpoint_path)
+
+    def _checkpoint_base_path(self, checkpoint_name: str) -> str | None:
+        if (
+            checkpoint_name.startswith("quiesce_")
+            and self.cfg.quiesce_checkpoint_path is not None
+        ):
+            return self.cfg.quiesce_checkpoint_path
+        return self.cfg.checkpoint_path
 
     def _save_one_checkpoint_model(self, checkpoint_path: Path, hook_name: str) -> None:
         sae = self.sae_by_hook[hook_name]
@@ -853,37 +954,72 @@ class MultiSAETrainer:
         else:
             if dp_rank != 0:
                 return
+            optimizer_by_hook_by_name = self._build_named_optimizer_state_for_save()
             optimizer_state = {
-                "optimizer_by_hook_by_name": self._build_named_optimizer_state_for_save()
+                "optimizer_state_format": MULTI_SAE_OPTIMIZER_STATE_FORMAT,
             }
             if tp_rank != 0:
                 return
-        torch.save(
-            {
-                **optimizer_state,
-                "format": "multi_independent_sae_v1",
-                "hook_names": self.hook_names,
-                "n_training_samples": self.n_training_samples,
-                "n_training_steps": self.n_training_steps,
-                "act_freq_scores_by_hook": self.act_freq_scores_by_hook,
-                "n_forward_passes_since_fired_by_hook": self.n_forward_passes_since_fired_by_hook,
-                "n_frac_active_samples_by_hook": self.n_frac_active_samples_by_hook,
-                "lr_scheduler": self.lr_scheduler.state_dict(),
-                "sae_dp_mode": self.sae_dp_mode,
-                "backward_mode": self.backward_mode,
-                "backward_order": self.backward_order,
-                "stats_sync_mode": self.stats_sync_mode,
-                "stats_sync_interval": self.stats_sync_interval,
-                "seed_mode": self.seed_mode,
-            },
-            checkpoint_path / TRAINER_STATE_FILENAME,
-        )
+        state = {
+            **optimizer_state,
+            "format": "multi_independent_sae_v1",
+            "hook_names": self.hook_names,
+            "n_training_samples": self.n_training_samples,
+            "n_training_steps": self.n_training_steps,
+            "act_freq_scores_by_hook": self.act_freq_scores_by_hook,
+            "n_forward_passes_since_fired_by_hook": self.n_forward_passes_since_fired_by_hook,
+            "n_frac_active_samples_by_hook": self.n_frac_active_samples_by_hook,
+            "lr_scheduler": self.lr_scheduler.state_dict(),
+            "sae_dp_mode": self.sae_dp_mode,
+            "backward_mode": self.backward_mode,
+            "backward_order": self.backward_order,
+            "stats_sync_mode": self.stats_sync_mode,
+            "stats_sync_interval": self.stats_sync_interval,
+            "seed_mode": self.seed_mode,
+        }
+        if not self._is_fsdp:
+            for hook_name in self.hook_names:
+                hook_dir = checkpoint_path / sanitize_hook_name_for_path(hook_name)
+                hook_dir.mkdir(exist_ok=True, parents=True)
+                _save_hook_optimizer_state_safetensors(
+                    hook_dir,
+                    optimizer_by_hook_by_name[hook_name],
+                )
+                torch.save(
+                    {
+                        "hook_name": hook_name,
+                        "optimizer_state_format": MULTI_SAE_OPTIMIZER_STATE_FORMAT,
+                        "act_freq_scores": self.act_freq_scores_by_hook[hook_name],
+                        "n_forward_passes_since_fired": self.n_forward_passes_since_fired_by_hook[hook_name],
+                        "n_frac_active_samples": self.n_frac_active_samples_by_hook[hook_name],
+                    },
+                    hook_dir / HOOK_STATE_FILENAME,
+                )
+        if self._pp_rank() != 0:
+            return
+        torch.save(state, checkpoint_path / TRAINER_STATE_FILENAME)
 
     def load_trainer_state(self, checkpoint_path: Path | str) -> None:
         checkpoint_path = Path(checkpoint_path)
         self._load_checkpoint_models(checkpoint_path)
         state = torch.load(checkpoint_path / TRAINER_STATE_FILENAME, map_location="cpu")
-        if state["hook_names"] != self.hook_names:
+        hook_state_paths = {
+            hook_name: checkpoint_path
+            / sanitize_hook_name_for_path(hook_name)
+            / HOOK_STATE_FILENAME
+            for hook_name in self.hook_names
+        }
+        has_local_hook_states = all(path.exists() for path in hook_state_paths.values())
+        hook_optimizer_paths = {
+            hook_name: checkpoint_path
+            / sanitize_hook_name_for_path(hook_name)
+            / HOOK_OPTIMIZER_STATE_FILENAME
+            for hook_name in self.hook_names
+        }
+        has_hook_optimizer_safetensors = all(
+            path.exists() for path in hook_optimizer_paths.values()
+        )
+        if state["hook_names"] != self.hook_names and not has_local_hook_states:
             raise ValueError(
                 "Cannot resume multi-SAE checkpoint with different hook_names"
             )
@@ -912,21 +1048,52 @@ class MultiSAETrainer:
                     f"has {self._dp_world_size()}."
                 )
             self._load_fsdp_raw_optimizer_state(checkpoint_path)
+        elif has_hook_optimizer_safetensors:
+            optimizer_by_hook_by_name = {
+                hook_name: _load_hook_optimizer_state_safetensors(
+                    checkpoint_path / sanitize_hook_name_for_path(hook_name),
+                    self.base_sae_by_hook[hook_name],
+                    getattr(self.base_sae_by_hook[hook_name], "_tp_group", None),
+                )
+                for hook_name in self.hook_names
+            }
+            self._load_named_optimizer_state(
+                optimizer_by_hook_by_name,
+                already_processed=True,
+            )
+        elif has_local_hook_states:
+            optimizer_by_hook_by_name = {}
+            for hook_name, path in hook_state_paths.items():
+                hook_state = torch.load(path, map_location="cpu")
+                optimizer_by_hook_by_name[hook_name] = hook_state["optimizer_state"]
+            self._load_named_optimizer_state(optimizer_by_hook_by_name)
         elif "optimizer_by_hook_by_name" in state:
             self._load_named_optimizer_state(state["optimizer_by_hook_by_name"])
         else:
             self.optimizer.load_state_dict(state["optimizer"])
         self.lr_scheduler.load_state_dict(state["lr_scheduler"])
         for hook_name in self.hook_names:
-            self.act_freq_scores_by_hook[hook_name] = state["act_freq_scores_by_hook"][
-                hook_name
-            ].to(self.cfg.device)
-            self.n_forward_passes_since_fired_by_hook[hook_name] = state[
-                "n_forward_passes_since_fired_by_hook"
-            ][hook_name].to(self.cfg.device)
-            self.n_frac_active_samples_by_hook[hook_name] = state[
-                "n_frac_active_samples_by_hook"
-            ][hook_name]
+            if has_local_hook_states:
+                hook_state = torch.load(hook_state_paths[hook_name], map_location="cpu")
+                self.act_freq_scores_by_hook[hook_name] = hook_state[
+                    "act_freq_scores"
+                ].to(self.cfg.device)
+                self.n_forward_passes_since_fired_by_hook[hook_name] = hook_state[
+                    "n_forward_passes_since_fired"
+                ].to(self.cfg.device)
+                self.n_frac_active_samples_by_hook[hook_name] = hook_state[
+                    "n_frac_active_samples"
+                ]
+            else:
+                self.act_freq_scores_by_hook[hook_name] = state["act_freq_scores_by_hook"][
+                    hook_name
+                ].to(self.cfg.device)
+                self.n_forward_passes_since_fired_by_hook[hook_name] = state[
+                    "n_forward_passes_since_fired_by_hook"
+                ][hook_name].to(self.cfg.device)
+                self.n_frac_active_samples_by_hook[hook_name] = state[
+                    "n_frac_active_samples_by_hook"
+                ][hook_name]
 
     def _checkpoint_if_needed(self) -> None:
         if (
@@ -979,13 +1146,17 @@ class MultiSAETrainer:
         return optimizer_state_by_hook
 
     def _load_named_optimizer_state(
-        self, optimizer_state_by_hook: dict[str, dict[str, dict[str, Any]]]
+        self,
+        optimizer_state_by_hook: dict[str, dict[str, dict[str, Any]]],
+        *,
+        already_processed: bool = False,
     ) -> None:
         self.optimizer.state.clear()
         for hook_name in self.hook_names:
             base_sae = self.base_sae_by_hook[hook_name]
             hook_state = deepcopy(optimizer_state_by_hook.get(hook_name, {}))
-            base_sae.process_named_optimizer_state_for_loading(hook_state)
+            if not already_processed:
+                base_sae.process_named_optimizer_state_for_loading(hook_state)
             named_params = dict(base_sae.named_parameters())
             for name, state in hook_state.items():
                 if name not in named_params:
@@ -1032,6 +1203,46 @@ class MultiSAETrainer:
         else:
             base_sae.load_state_dict(state_dict)
         del state_dict
+        self._debug_log_loaded_model_state(checkpoint_path, hook_name, base_sae)
+
+    def _debug_log_loaded_model_state(
+        self,
+        checkpoint_path: Path,
+        hook_name: str,
+        base_sae: TrainingSAE[Any],
+    ) -> None:
+        if (
+            os.environ.get("SAELENS_DEBUG_CHECKPOINT_LOAD") != "1"
+            or self.cfg.output_path is None
+        ):
+            return
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        path = (
+            Path(self.cfg.output_path)
+            / f"debug_checkpoint_load_rank{rank}_pid{os.getpid()}.jsonl"
+        )
+        tensors = {}
+        for name, value in base_sae.state_dict().items():
+            if torch.is_tensor(value):
+                value_f = value.detach().float()
+                tensors[name] = {
+                    "shape": list(value.shape),
+                    "norm": float(value_f.norm().cpu().item()),
+                    "mean": float(value_f.mean().cpu().item()),
+                    "std": float(value_f.std(unbiased=False).cpu().item()),
+                }
+        record = {
+            "event": "checkpoint_model_loaded",
+            "checkpoint_path": str(checkpoint_path),
+            "hook_name": hook_name,
+            "rank": rank,
+            "tp_rank": self._tp_rank(),
+            "pp_rank": self._pp_rank(),
+            "tensors": tensors,
+        }
+        with open(path, "a") as f:
+            json.dump(record, f)
+            f.write("\n")
 
     def _maybe_synchronize_timing(self) -> None:
         if not self.cfg.synchronize_timing:
@@ -1135,10 +1346,25 @@ class MultiSAETrainer:
                 hook_record[loss_name] = _unwrap_item(loss_value)
             record["hooks"][hook_name] = hook_record
         if self.mse_history_path is None:
-            return
-        with open(self.mse_history_path, "a") as f:
-            json.dump(record, f)
-            f.write("\n")
+            if self.debug_mse_history_path is None:
+                return
+        if self.mse_history_path is not None:
+            with open(self.mse_history_path, "a") as f:
+                json.dump(record, f)
+                f.write("\n")
+        if self.debug_mse_history_path is not None:
+            debug_record = {
+                **record,
+                "rank": dist.get_rank()
+                if dist.is_available() and dist.is_initialized()
+                else 0,
+                "tp_rank": self._tp_rank(),
+                "pp_rank": self._pp_rank(),
+                "dp_rank": self._dp_rank(),
+            }
+            with open(self.debug_mse_history_path, "a") as f:
+                json.dump(debug_record, f)
+                f.write("\n")
 
     @torch.no_grad()
     def _record_timing_if_needed(
@@ -1204,24 +1430,17 @@ def _load_tp_sharded_state_dict(
     base_sae: Any,
     tp_group: dist.ProcessGroup,
 ) -> dict[str, torch.Tensor]:
-    """Load a checkpoint such that only tp_rank=0 reads the full file.
+    """Load only this TP rank's checkpoint tensor slices from safetensors.
 
-    tp_rank=0 loads the full state_dict, then scatters each parameter's shard
-    to the corresponding rank. Non-sharded parameters (shard_dim=None) are
-    broadcast from tp_rank=0. Returns a state_dict containing only this rank's
-    shard — callers must NOT call process_state_dict_for_loading afterwards.
+    Returns a state_dict containing only this rank's shard. Callers must NOT call
+    process_state_dict_for_loading afterwards.
     """
     from safetensors import safe_open
     from sae_lens.util import str_to_dtype
 
     tp_rank = dist.get_rank(tp_group)
     tp_size = dist.get_world_size(tp_group)
-    shard_dims: dict[str, int | None] = base_sae._tp_param_shard_dims()
-
-    # tp_rank=0 loads full tensors; others only need metadata for pre-allocation
-    full_state: dict[str, torch.Tensor] | None = None
-    if tp_rank == 0:
-        full_state = load_file(str(filepath))
+    shard_dims: dict[str, int | None] = _tp_param_shard_dims(base_sae)
 
     _safetensors_dtype_map = {
         "F32": "float32", "BF16": "bfloat16", "F16": "float16",
@@ -1238,38 +1457,124 @@ def _load_tp_sharded_state_dict(
             shard_dim = shard_dims.get(k)
 
             if shard_dim is None:
-                # Non-sharded parameter (e.g. b_dec): broadcast from rank 0
-                if tp_rank == 0:
-                    tensor = full_state[k]  # type: ignore[index]
-                else:
-                    tensor = torch.empty(shape, dtype=dtype)
-                dist.broadcast(tensor, src=dist.get_global_rank(tp_group, 0), group=tp_group)
-                state_dict[k] = tensor
+                state_dict[k] = f.get_tensor(k)
             else:
-                # Sharded parameter: scatter shard_dim slices to each rank
                 full_size = shape[shard_dim]
                 assert full_size % tp_size == 0, (
                     f"Checkpoint tensor '{k}' size {full_size} on dim {shard_dim} "
                     f"not divisible by tp_size={tp_size}"
                 )
                 shard_size = full_size // tp_size
-                shard_shape = shape[:]
-                shard_shape[shard_dim] = shard_size
-                recv_buf = torch.empty(shard_shape, dtype=dtype)
-                if tp_rank == 0:
-                    chunks = full_state[k].split(shard_size, dim=shard_dim)  # type: ignore[index]
-                    scatter_list = [c.contiguous() for c in chunks]
-                else:
-                    scatter_list = None
-                dist.scatter(
-                    recv_buf,
-                    scatter_list,
-                    src=dist.get_global_rank(tp_group, 0),
-                    group=tp_group,
+                slices: list[slice] = [slice(None)] * len(shape)
+                slices[shard_dim] = slice(
+                    tp_rank * shard_size,
+                    (tp_rank + 1) * shard_size,
                 )
-                state_dict[k] = recv_buf
-
-    if tp_rank == 0:
-        del full_state
+                state_dict[k] = sl[tuple(slices)].to(dtype=dtype)
 
     return state_dict
+
+
+def _tp_param_shard_dims(base_sae: Any) -> dict[str, int | None]:
+    if hasattr(base_sae, "_tp_param_shard_dims"):
+        return base_sae._tp_param_shard_dims()
+    return {}
+
+
+def _optimizer_state_shard_dim(
+    param_name: str,
+    state_value: torch.Tensor,
+    base_sae: Any,
+) -> int | None:
+    if state_value.ndim == 0:
+        return None
+    return _tp_param_shard_dims(base_sae).get(param_name)
+
+
+def _flatten_optimizer_tensor_state(
+    optimizer_state_by_name: dict[str, dict[str, Any]]
+) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, Any]]]:
+    tensors: dict[str, torch.Tensor] = {}
+    meta: dict[str, dict[str, Any]] = {}
+    for param_name, param_state in optimizer_state_by_name.items():
+        for state_name, value in param_state.items():
+            flat_key = f"{param_name}{_OPTIMIZER_STATE_KEY_SEP}{state_name}"
+            if torch.is_tensor(value):
+                tensors[flat_key] = value.detach().cpu().contiguous()
+            else:
+                meta[flat_key] = {
+                    "param_name": param_name,
+                    "state_name": state_name,
+                    "value": value,
+                }
+    return tensors, meta
+
+
+def _save_hook_optimizer_state_safetensors(
+    hook_dir: Path,
+    optimizer_state_by_name: dict[str, dict[str, Any]],
+) -> None:
+    tensors, meta = _flatten_optimizer_tensor_state(optimizer_state_by_name)
+    if tensors:
+        save_file(tensors, hook_dir / HOOK_OPTIMIZER_STATE_FILENAME)
+    else:
+        (hook_dir / HOOK_OPTIMIZER_STATE_FILENAME).unlink(missing_ok=True)
+    with open(hook_dir / HOOK_OPTIMIZER_META_FILENAME, "w") as f:
+        json.dump(meta, f)
+
+
+def _load_hook_optimizer_state_safetensors(
+    hook_dir: Path,
+    base_sae: Any,
+    tp_group: dist.ProcessGroup | None,
+) -> dict[str, dict[str, Any]]:
+    from safetensors import safe_open
+    from sae_lens.util import str_to_dtype
+
+    tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+    tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
+    path = hook_dir / HOOK_OPTIMIZER_STATE_FILENAME
+    meta_path = hook_dir / HOOK_OPTIMIZER_META_FILENAME
+    optimizer_state: dict[str, dict[str, Any]] = {}
+    dtype_map = {
+        "F32": "float32", "BF16": "bfloat16", "F16": "float16",
+        "F64": "float64", "I32": "int32", "I64": "int64",
+    }
+
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        for flat_key in f.keys():
+            param_name, state_name = flat_key.split(_OPTIMIZER_STATE_KEY_SEP, 1)
+            sl = f.get_slice(flat_key)
+            shape = list(sl.get_shape())
+            dtype_str = str(sl.get_dtype())
+            dtype = str_to_dtype(dtype_map.get(dtype_str, dtype_str.lower()))
+            shard_dim = (
+                _optimizer_state_shard_dim(param_name, torch.empty(shape), base_sae)
+                if tp_size > 1
+                else None
+            )
+            if shard_dim is None:
+                value = f.get_tensor(flat_key)
+            else:
+                full_size = shape[shard_dim]
+                assert full_size % tp_size == 0, (
+                    f"Optimizer tensor '{flat_key}' size {full_size} on dim {shard_dim} "
+                    f"not divisible by tp_size={tp_size}"
+                )
+                shard_size = full_size // tp_size
+                slices: list[slice] = [slice(None)] * len(shape)
+                slices[shard_dim] = slice(
+                    tp_rank * shard_size,
+                    (tp_rank + 1) * shard_size,
+                )
+                value = sl[tuple(slices)].to(dtype=dtype)
+            optimizer_state.setdefault(param_name, {})[state_name] = value
+
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+        for item in meta.values():
+            optimizer_state.setdefault(item["param_name"], {})[
+                item["state_name"]
+            ] = item["value"]
+
+    return optimizer_state

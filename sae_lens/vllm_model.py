@@ -454,6 +454,32 @@ def _collect_and_cleanup(model: nn.Module) -> dict[str, torch.Tensor]:
     return captures
 
 
+def _reshape_captured_activation(
+    raw: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+    total_tokens: int,
+    hook_name: str,
+) -> torch.Tensor:
+    """Validate and reshape vLLM hook captures to (B, S, d_model)."""
+    if raw.ndim < 2:
+        raise RuntimeError(
+            f"vLLM hook {hook_name!r} returned activation with invalid shape "
+            f"{tuple(raw.shape)}"
+        )
+    flat = raw.reshape(-1, raw.shape[-1])
+    if flat.shape[0] < total_tokens:
+        raise RuntimeError(
+            f"vLLM hook {hook_name!r} captured fewer activation rows than "
+            f"requested tokens: captured={flat.shape[0]}, expected={total_tokens}. "
+            "This usually means prefix caching reused tokens, so forward hooks "
+            "did not fire for the full prompt. Disable vLLM prefix caching for "
+            "activation capture."
+        )
+    return flat[:total_tokens].view(batch_size, seq_len, -1)
+
+
 # ---------------------------------------------------------------------------
 # CUDA IPC helpers for TP>1
 #
@@ -582,6 +608,10 @@ class HookedVLLMModel:
         # VLLM_ACTIVATION_CAPTURE_MODE=1 (set at module load above) ensures
         # vLLM allocates only the minimal KV cache needed for one batch.
         llm_kwargs.setdefault("enforce_eager", True)
+        # Prefix caching skips forward execution for cached prompt tokens, so
+        # activation hooks only see the uncached suffix. That silently corrupts
+        # captured activation order/shape unless disabled.
+        llm_kwargs.setdefault("enable_prefix_caching", False)
         dtype_str = _DTYPE_TO_STR.get(dtype, "bfloat16")
         llm_kwargs.setdefault("dtype", dtype_str)
         explicit_device = llm_kwargs.get("device")
@@ -695,7 +725,13 @@ class HookedVLLMModel:
                     with nccl_nvtx_range("nccl:vllm_hook_shard_all_gather", tp_group):
                         dist.all_gather(shards, raw.contiguous(), group=tp_group)
                     raw = gather_fn(shards)
-                activations[hook_name] = raw[:total_tokens].view(B, S, -1)
+                activations[hook_name] = _reshape_captured_activation(
+                    raw,
+                    batch_size=B,
+                    seq_len=S,
+                    total_tokens=total_tokens,
+                    hook_name=hook_name,
+                )
         else:
             # TP>1: MultiprocExecutor uses ZMQ to transfer apply_model returns.
             # Serialising large CUDA tensors as CPU bytes is ~800 ms for 128 MB.
@@ -736,7 +772,13 @@ class HookedVLLMModel:
                         assert all_caps is not None
                         shards = [c[hook_name] for c in all_caps if hook_name in c]
                         raw = gather_fn(shards)
-                    activations[hook_name] = raw[:total_tokens].view(B, S, -1)
+                    activations[hook_name] = _reshape_captured_activation(
+                        raw,
+                        batch_size=B,
+                        seq_len=S,
+                        total_tokens=total_tokens,
+                        hook_name=hook_name,
+                    )
             finally:
                 self.llm.apply_model(_release_pinned)
 

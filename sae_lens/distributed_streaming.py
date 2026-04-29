@@ -21,6 +21,7 @@ def init_distributed_streaming(
     vllm_dp: int,
     sae_tp: int,
     sae_dp: int = 1,
+    sae_pp_size: int = 1,
 ) -> None:
     """Initialize process groups for streaming_mode v1.
 
@@ -40,6 +41,7 @@ def init_distributed_streaming(
         Q=sae_dp,
         vllm_tp_size=vllm_tp,
         sae_tp_size=sae_tp,
+        sae_pp_size=sae_pp_size,
         batch_size=1,
         disjoint=True,
     )
