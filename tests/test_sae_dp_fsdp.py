@@ -69,6 +69,7 @@ def _make_trainer_cfg(
         output_path=None,
         save_mse_every_n_steps=0,
         save_timing_every_n_steps=0,
+        save_memory_every_n_steps=0,
         synchronize_timing=False,
         multi_sae_backward_order="forward",
         multi_sae_stats_sync_mode="immediate",
@@ -85,6 +86,7 @@ def _make_trainer_cfg(
         feature_sampling_window=100,
         autocast=False,
         checkpoint_path=None,
+        quiesce_checkpoint_path=None,
         save_final_checkpoint=False,
         logger=LoggingConfig(log_to_wandb=False),
     )
@@ -761,6 +763,24 @@ def test_sae_dp_mode_fsdp_does_not_reject_save_final_checkpoint() -> None:
         save_final_checkpoint=True,
     )
     assert cfg.save_final_checkpoint is True
+
+
+def test_sae_dp_mode_fsdp_accepts_backward_prefetch_none() -> None:
+    cfg = LanguageModelSAERunnerConfig(
+        sae=build_topk_sae_training_cfg(),
+        sae_dp_mode="fsdp",
+        fsdp_backward_prefetch="none",
+    )
+    assert cfg.fsdp_backward_prefetch == "none"
+
+
+def test_sae_dp_mode_fsdp_rejects_invalid_backward_prefetch() -> None:
+    with pytest.raises(ValueError, match="fsdp_backward_prefetch"):
+        LanguageModelSAERunnerConfig(
+            sae=build_topk_sae_training_cfg(),
+            sae_dp_mode="fsdp",
+            fsdp_backward_prefetch="invalid",  # type: ignore[arg-type]
+        )
 
 
 def test_sae_dp_mode_manual_is_default_and_valid() -> None:

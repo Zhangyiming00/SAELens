@@ -1,4 +1,5 @@
 import json
+import pickle
 from pathlib import Path
 from typing import Any, Callable
 from unittest.mock import MagicMock, patch
@@ -302,7 +303,153 @@ def test_unwrap_item_handles_all_types() -> None:
     assert _unwrap_item(3.14) == pytest.approx(3.14)
     assert _unwrap_item(torch.tensor(2.5)) == pytest.approx(2.5)
     assert _unwrap_item(lambda: torch.tensor(1.5)) == pytest.approx(1.5)
+
+
+def test_phase_memory_stats_returns_empty_when_profiling_disabled(
+    trainer: SAETrainer[StandardTrainingSAE, StandardTrainingSAEConfig],
+) -> None:
+    # cfg fixture has save_memory_every_n_steps == 0 -> profiling off, so the
+    # data-fetch / scaling phase capture must be a no-op (no torch.cuda calls,
+    # nothing merged into memory_stats) and thus safe on CPU during normal runs.
+    assert trainer._profile_memory is False
+    assert trainer._phase_memory_stats("after_data_fetch", peak=True) == {}
+    assert trainer._phase_memory_stats("after_scale_to_device") == {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="memory profiling needs CUDA")
+def test_fit_records_data_fetch_and_scaling_memory_phases(
+    ts_model: HookedTransformer,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    cfg = build_runner_cfg(
+        training_tokens=40,
+        context_size=8,
+        device="cuda",
+        act_store_device="cuda",
+    )
+    cfg.output_path = str(output_dir)
+    cfg.save_memory_every_n_steps = 1
+    cfg.device = "cuda"
+
+    dataset = Dataset.from_list([{"text": "hello world"}] * 200)
+    activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=dataset
+    )
+    sae_cfg_dict = cfg.get_training_sae_cfg_dict()
+    sae_cfg_dict["device"] = "cuda"
+    sae = StandardTrainingSAE.from_dict(sae_cfg_dict).to("cuda")
+    trainer = SAETrainer(
+        cfg=cfg.to_sae_trainer_config(),
+        sae=sae,
+        data_provider=activation_store,
+    )
+    assert trainer._profile_memory is True
+    trainer.fit()
+
+    records = [
+        json.loads(line)
+        for line in trainer.memory_history_path.read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(records) > 0
+    row = records[0]
+    # the two newly-added pre-train-step phases must be present alongside the
+    # existing forward/backward/optimizer peak stats
+    for key in (
+        "after_data_fetch_allocated_mb",
+        "after_data_fetch_reserved_mb",
+        "after_data_fetch_peak_allocated_mb",
+        "after_scale_to_device_allocated_mb",
+        "after_scale_to_device_reserved_mb",
+        "peak_forward_allocated_mb",
+    ):
+        assert key in row
+    # scaling holds the batch plus its scaled copy, so its live allocation is at
+    # least as large as right after the fetch.
+    assert (
+        row["after_scale_to_device_allocated_mb"]
+        >= row["after_data_fetch_allocated_mb"]
+    )
     assert _unwrap_item(lambda: 0.75) == pytest.approx(0.75)
+
+
+def test_memory_timeline_is_inactive_when_disabled(
+    trainer: SAETrainer[StandardTrainingSAE, StandardTrainingSAEConfig],
+) -> None:
+    # cfg fixture leaves record_memory_timeline_step at its -1 default, so no
+    # recorder path is set up and start/stop are pure no-ops (safe on CPU during
+    # normal training).
+    assert trainer.memory_timeline_path is None
+    assert trainer._memory_timeline_active is False
+    trainer._maybe_start_memory_timeline()
+    assert trainer._memory_timeline_active is False
+    # stopping when never started must not raise or write anything
+    trainer._maybe_stop_memory_timeline()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="memory timeline capture needs CUDA"
+)
+def test_fit_dumps_memory_timeline_for_target_step(
+    ts_model: HookedTransformer,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    cfg = build_runner_cfg(
+        training_tokens=40,
+        context_size=8,
+        device="cuda",
+        act_store_device="cuda",
+    )
+    cfg.output_path = str(output_dir)
+    cfg.record_memory_timeline_step = 1
+    cfg.device = "cuda"
+
+    dataset = Dataset.from_list([{"text": "hello world"}] * 200)
+    activation_store = ActivationsStore.from_config(
+        ts_model, cfg, override_dataset=dataset
+    )
+    sae_cfg_dict = cfg.get_training_sae_cfg_dict()
+    sae_cfg_dict["device"] = "cuda"
+    sae = StandardTrainingSAE.from_dict(sae_cfg_dict).to("cuda")
+    trainer = SAETrainer(
+        cfg=cfg.to_sae_trainer_config(),
+        sae=sae,
+        data_provider=activation_store,
+    )
+    assert trainer.memory_timeline_path is not None
+    trainer.fit()
+
+    # recorder must be turned off again after the single target step
+    assert trainer._memory_timeline_active is False
+    assert trainer.memory_timeline_path.exists()
+
+    snapshot = pickle.loads(trainer.memory_timeline_path.read_bytes())
+    # a valid memory_viz snapshot has device traces (the alloc/free timeline)
+    # and segment info (resident blocks for the peak-moment view)
+    assert "device_traces" in snapshot
+    assert "segments" in snapshot
+    actions = {
+        event["action"]
+        for trace in snapshot["device_traces"]
+        for event in trace
+    }
+    # the captured step must contain real allocation activity, not an empty trace
+    assert "alloc" in actions
+
+    # stacks="all" must capture Python frames so memory_viz can attribute each
+    # allocation to a phase; the train step runs through _train_step, so its
+    # frame should appear somewhere in the recorded stacks.
+    frame_names = {
+        frame.get("name", "")
+        for trace in snapshot["device_traces"]
+        for event in trace
+        for frame in event.get("frames", [])
+    }
+    assert any("_train_step" in name for name in frame_names)
 
 
 def test_train_sae_group_on_language_model__runs(

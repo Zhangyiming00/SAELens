@@ -80,6 +80,12 @@ def _write_checkpoint_complete_marker(checkpoint_path: Path) -> None:
     (checkpoint_path / "COMPLETED").write_text("ok\n")
 
 
+def _adam_optimizer_kwargs_from_env() -> dict[str, bool]:
+    if os.environ.get("SAE_FUSED_ADAM") == "1":
+        return {"fused": True}
+    return {}
+
+
 class SaveCheckpointFn(Protocol):
     def __call__(
         self,
@@ -135,6 +141,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self.mse_history_path: Path | None = None
         self.timing_history_path: Path | None = None
         self.memory_history_path: Path | None = None
+        self.memory_timeline_path: Path | None = None
 
         _update_sae_lens_training_version(self._base_sae)
 
@@ -170,6 +177,21 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             )
             self.memory_history_path.write_text("")
 
+        # Full alloc/free timeline + peak-moment snapshot for a single step. The
+        # recorder logs every allocation/free with its Python stack; the dumped
+        # pickle opens at https://pytorch.org/memory_viz. Scoped to one step
+        # because the recorder grows unboundedly and adds noticeable overhead.
+        self._memory_timeline_step: int = getattr(
+            cfg, "record_memory_timeline_step", -1
+        )
+        self._memory_timeline_active: bool = False
+        if self._memory_timeline_step >= 0 and cfg.output_path is not None:
+            output_path = Path(cfg.output_path)
+            output_path.mkdir(exist_ok=True, parents=True)
+            self.memory_timeline_path = (
+                output_path / f"memory_timeline_rank{_global_rank}.pickle"
+            )
+
         self.checkpoint_thresholds = []
         if self.cfg.n_checkpoints > 0:
             self.checkpoint_thresholds = list(
@@ -197,6 +219,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 cfg.adam_beta1,
                 cfg.adam_beta2,
             ),
+            **_adam_optimizer_kwargs_from_env(),
         )
         assert cfg.lr_end is not None  # this is set in config post-init
         self.lr_scheduler = get_lr_scheduler(
@@ -281,7 +304,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
         def _touch_if_metric_writer(path: Path | str | None) -> None:
             if path is not None and self._is_metric_writer_rank():
-                Path(path).touch()
+                ack_path = Path(path)
+                ack_path.parent.mkdir(parents=True, exist_ok=True)
+                ack_path.touch()
 
         def _maybe_start_quiesce_drain() -> None:
             nonlocal quiesce_draining, quiesce_checkpoint_now
@@ -324,12 +349,15 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 _save_quiesce_checkpoint()
                 break
             step_wall_t0 = time.perf_counter()
+            self._maybe_start_memory_timeline()
             # Do a training step.
             if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
                 _debug_prefix_tp(
                     f"trainer next() start samples={self.n_training_samples}"
                 )
             self._maybe_synchronize_timing()
+            if self._profile_memory:
+                torch.cuda.reset_peak_memory_stats(self._base_sae.device)
             try:
                 batch = next(self.data_provider).to(self._base_sae.device)
             except StopIteration:
@@ -341,13 +369,20 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
                 _debug_prefix_tp(f"trainer next() done batch={tuple(batch.shape)}")
             self.n_training_samples += batch.shape[0]
+            after_data_fetch_mem = self._phase_memory_stats(
+                "after_data_fetch", peak=True
+            )
             scaled_batch = self.activation_scaler(batch)
+            after_scale_mem = self._phase_memory_stats(
+                "after_scale_to_device", peak=True
+            )
 
             self._maybe_synchronize_timing()
             sae_t0 = time.perf_counter()
             step_output, _dp_allreduce_time_s, memory_stats = self._train_step(
                 sae=self.sae, sae_in=scaled_batch
             )
+            memory_stats = {**after_data_fetch_mem, **after_scale_mem, **memory_stats}
             self._maybe_synchronize_timing()
             sae_time_s = time.perf_counter() - sae_t0
 
@@ -363,6 +398,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 wall_time_s=time.perf_counter() - step_wall_t0,
             )
             self._record_memory_if_needed(memory_stats)
+            self._maybe_stop_memory_timeline()
             self._checkpoint_if_needed()
             self.n_training_steps += 1
             self._update_pbar(step_output, pbar)
@@ -698,6 +734,14 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         # In manual mode self.sae == self._base_sae and the dispatch in
         # TrainingSAE.forward() calls training_forward_pass identically.
         if self._profile_memory:
+            # Optionally drop empty allocator blocks first so the per-phase peak
+            # windows start from a clean pool (see cfg.record_memory_empty_cache).
+            if (
+                getattr(self.cfg, "record_memory_empty_cache", False)
+                or os.environ.get("SAE_RECORD_EMPTY_CACHE") == "1"
+            ):
+                torch.cuda.synchronize(self._base_sae.device)
+                torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(self._base_sae.device)
         with self.autocast_if_enabled:
             fsdp_forward_context = (
@@ -982,6 +1026,75 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         with open(self.memory_history_path, "a") as f:
             json.dump(record, f)
             f.write("\n")
+
+    def _phase_memory_stats(self, phase: str, peak: bool = False) -> dict[str, float]:
+        """Resident (+ optional peak) allocator stats for a pre-train-step phase.
+
+        Used for the data-fetch and activation-scaling phases, which happen in
+        ``fit`` before ``_train_step``. Returns ``{}`` when profiling is off so
+        callers add nothing in the normal path. When ``peak`` is True the peak
+        is read since the last ``reset_peak_memory_stats`` and the counter is
+        then reset so the next phase's peak window starts clean.
+        """
+        if not self._profile_memory:
+            return {}
+        device = self._base_sae.device
+        if (
+            getattr(self.cfg, "record_memory_empty_cache", False)
+            or os.environ.get("SAE_RECORD_EMPTY_CACHE") == "1"
+        ):
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+        torch.cuda.synchronize(device)
+        stats = {
+            f"{phase}_allocated_mb": torch.cuda.memory_allocated(device) / 1024**2,
+            f"{phase}_reserved_mb": torch.cuda.memory_reserved(device) / 1024**2,
+        }
+        if peak:
+            stats[f"{phase}_peak_allocated_mb"] = (
+                torch.cuda.max_memory_allocated(device) / 1024**2
+            )
+            stats[f"{phase}_peak_reserved_mb"] = (
+                torch.cuda.max_memory_reserved(device) / 1024**2
+            )
+            torch.cuda.reset_peak_memory_stats(device)
+        return stats
+
+    def _maybe_start_memory_timeline(self) -> None:
+        """Begin recording the full alloc/free history for the target step.
+
+        Captures every allocation/free event together with the Python call
+        stack (``stacks="all"``, ``context="all"``) and the peak-moment block
+        layout. In memory_viz the forward/backward/optimizer phases are
+        separable both along the time axis (they run in sequence) and by the
+        captured stack (each allocation shows whether it came from the SAE
+        forward, autograd, or ``optimizer.step``).
+        """
+        if (
+            self.memory_timeline_path is None
+            or self.n_training_steps != self._memory_timeline_step
+            or self._memory_timeline_active
+        ):
+            return
+        if not self._base_sae.device.type.startswith("cuda"):
+            return
+        torch.cuda.synchronize(self._base_sae.device)
+        torch.cuda.memory._record_memory_history(
+            max_entries=1_000_000,
+            stacks="all",
+            context="all",
+        )
+        self._memory_timeline_active = True
+
+    def _maybe_stop_memory_timeline(self) -> None:
+        """Dump the recorded history for the target step and stop recording."""
+        if not self._memory_timeline_active:
+            return
+        assert self.memory_timeline_path is not None
+        torch.cuda.synchronize(self._base_sae.device)
+        torch.cuda.memory._dump_snapshot(str(self.memory_timeline_path))
+        torch.cuda.memory._record_memory_history(enabled=None)
+        self._memory_timeline_active = False
 
     @torch.no_grad()
     def _log_train_step(self, step_output: TrainStepOutput):

@@ -1015,6 +1015,7 @@ def test_run_producer_phase2_v2_root_prepares_local_and_remote_gpu_slices(
     monkeypatch: pytest.MonkeyPatch,
 ):
     store = ActivationsStore.__new__(ActivationsStore)
+    store.hook_names = ["h0"]
     raw_acts = torch.arange(12, dtype=torch.float32).view(6, 2)
 
     def fake_get_raw_llm_batch(*, raise_on_epoch_end: bool = False):
@@ -1033,10 +1034,13 @@ def test_run_producer_phase2_v2_root_prepares_local_and_remote_gpu_slices(
     barrier_calls: list[object] = []
 
     monkeypatch.setattr(v2, "is_producer", lambda: True)
+    monkeypatch.setattr(v2, "is_consumer", lambda: True)
     monkeypatch.setattr(v2, "get_vllm_tp_rank", lambda: 0)
     monkeypatch.setattr(v2, "get_vllm_tp_group", lambda: "tp")
     monkeypatch.setattr(v2, "get_vllm_tp_size", lambda: 2)
     monkeypatch.setattr(v2, "get_producer_idx", lambda: 0)
+    monkeypatch.setattr(v2, "get_consumer_idx", lambda: 0)
+    monkeypatch.setattr(v2, "get_sae_endpoint_idx", lambda: 0)
     monkeypatch.setattr(v2, "get_routing_table", lambda: routes)
     monkeypatch.setattr(v2, "get_producer_tp_root", lambda p: 0)
     monkeypatch.setattr(v2, "get_consumer_tp_root", lambda c: 0 if c == 0 else 3)
@@ -1054,6 +1058,127 @@ def test_run_producer_phase2_v2_root_prepares_local_and_remote_gpu_slices(
     assert torch.equal(outgoing[0], raw_acts[:2].contiguous())
     assert torch.equal(outgoing[1], raw_acts[2:6].contiguous())
     assert barrier_calls == ["tp"]
+
+
+def test_run_producer_phase2_v2_pp_endpoint_uses_all_hooks_for_payload(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = ActivationsStore.__new__(ActivationsStore)
+    store.hook_names = ["h1"]
+    store._all_hook_names = ["h0", "h1"]
+    raw_acts = {
+        "h0": torch.arange(12, dtype=torch.float32).view(6, 2),
+        "h1": torch.arange(100, 112, dtype=torch.float32).view(6, 2),
+    }
+
+    def fake_get_raw_llm_batch(*, raise_on_epoch_end: bool = False):
+        assert raise_on_epoch_end is True
+        return raw_acts, None
+
+    monkeypatch.setattr(store, "get_raw_llm_batch", fake_get_raw_llm_batch)
+
+    import sae_lens.distributed_v2 as v2
+
+    routes = [ShardRoute(producer_idx=1, consumer_idx=0, row_start=2, row_end=6)]
+
+    monkeypatch.setattr(v2, "is_producer", lambda: True)
+    monkeypatch.setattr(v2, "is_consumer", lambda: True)
+    monkeypatch.setattr(v2, "get_vllm_tp_rank", lambda: 0)
+    monkeypatch.setattr(v2, "get_vllm_tp_group", lambda: None)
+    monkeypatch.setattr(v2, "get_vllm_tp_size", lambda: 1)
+    monkeypatch.setattr(v2, "get_producer_idx", lambda: 1)
+    monkeypatch.setattr(v2, "get_consumer_idx", lambda: 0)
+    monkeypatch.setattr(v2, "get_sae_endpoint_idx", lambda: 1)
+    monkeypatch.setattr(v2, "get_routing_table", lambda: routes)
+    monkeypatch.setattr(v2, "get_producer_tp_root", lambda p: 1)
+    monkeypatch.setattr(v2, "get_consumer_tp_root", lambda endpoint: endpoint)
+
+    local_slices, outgoing = store._run_producer_phase2_v2()
+
+    assert set(local_slices[1]) == {"h0", "h1"}
+    assert set(outgoing[0]) == {"h0", "h1"}
+    assert torch.equal(local_slices[1]["h0"], raw_acts["h0"][2:6].contiguous())
+    assert torch.equal(local_slices[1]["h1"], raw_acts["h1"][2:6].contiguous())
+
+
+def test_run_nccl_p2p_exchange_v2_uses_endpoint_groups_and_packs_hook_payload(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = ActivationsStore.__new__(ActivationsStore)
+    store.hook_names = ["h0", "h1"]
+    store._all_hook_names = ["h0", "h1"]
+    store.is_multi_hook = True
+    store.d_in = 2
+    store.dtype = torch.float32
+    store.device = torch.device("cpu")
+
+    import sae_lens.distributed_v2 as v2
+    import sae_lens.training.activations_store as activations_store_mod
+
+    routes = [
+        ShardRoute(producer_idx=0, consumer_idx=0, row_start=0, row_end=2),
+        ShardRoute(producer_idx=1, consumer_idx=0, row_start=0, row_end=2),
+    ]
+    groups: list[int] = []
+    op_shapes: list[tuple[str, tuple[int, ...], int]] = []
+
+    class FakeWork:
+        def wait(self) -> None:
+            return None
+
+    class FakeP2POp:
+        def __init__(self, op, tensor, peer, group=None):
+            self.op = op
+            self.tensor = tensor
+            self.peer = peer
+            self.group = group
+            name = "irecv" if op is fake_irecv else "isend"
+            op_shapes.append((name, tuple(tensor.shape), peer))
+
+    def fake_batch_isend_irecv(ops):
+        return [FakeWork() for _ in ops]
+
+    def fake_barrier(*args, **kwargs):
+        groups.append(kwargs["group"])
+
+    def fake_isend(*_args, **_kwargs):
+        return None
+
+    def fake_irecv(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(v2, "get_routing_table", lambda: routes)
+    monkeypatch.setattr(v2, "is_producer", lambda: True)
+    monkeypatch.setattr(v2, "get_vllm_tp_rank", lambda: 0)
+    monkeypatch.setattr(v2, "get_producer_idx", lambda: 1)
+    monkeypatch.setattr(v2, "get_sae_dp_size", lambda: 1)
+    monkeypatch.setattr(v2, "get_sae_pp_size", lambda: 2)
+    monkeypatch.setattr(v2, "get_num_sae_stage_endpoints", lambda: 2)
+    monkeypatch.setattr(v2, "get_producer_tp_root", lambda p: p)
+    monkeypatch.setattr(v2, "get_consumer_tp_root", lambda endpoint: endpoint)
+    monkeypatch.setattr(v2, "get_p2p_group", lambda endpoint: endpoint)
+    monkeypatch.setattr(activations_store_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(activations_store_mod.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(activations_store_mod.dist, "barrier", fake_barrier)
+    monkeypatch.setattr(activations_store_mod.dist, "P2POp", FakeP2POp)
+    monkeypatch.setattr(activations_store_mod.dist, "batch_isend_irecv", fake_batch_isend_irecv)
+    monkeypatch.setattr(activations_store_mod.dist, "isend", fake_isend)
+    monkeypatch.setattr(activations_store_mod.dist, "irecv", fake_irecv)
+
+    outgoing = {
+        0: {
+            "h0": torch.ones(2, 2),
+            "h1": torch.full((2, 2), 2.0),
+        }
+    }
+
+    store._run_nccl_p2p_exchange_v2(outgoing)
+
+    assert groups == [0, 1]
+    assert op_shapes == [
+        ("isend", (4, 2), 0),
+        ("irecv", (4, 2), 0),
+    ]
 
 
 def test_activations_store_consumer_only_is_recv_only():
@@ -1093,6 +1218,7 @@ def test_activations_store_v2_loader_respects_train_batch_size_tokens(
     store.training_context_size = 4
     store.train_batch_size_tokens = 4
     store.activations_mixing_fraction = 0.0
+    store._mixing_generator = None
 
     def fake_iterate_filtered_activations_v2():
         yield torch.arange(12, dtype=torch.float32).view(12, 1)
@@ -1107,3 +1233,73 @@ def test_activations_store_v2_loader_respects_train_batch_size_tokens(
 
     assert [tuple(batch.shape) for batch in batches] == [(4, 1), (4, 1), (4, 1)]
     assert torch.equal(torch.cat(batches, dim=0).squeeze(-1), torch.arange(12, dtype=torch.float32))
+
+
+def test_next_vllm_memory_kwargs_includes_timeline_on_target_step() -> None:
+    store = ActivationsStore.__new__(ActivationsStore)
+    store._vllm_memory_every_n_steps = 0
+    store._vllm_memory_probe_layer = None
+    store._vllm_memory_history_path = None
+    store._vllm_memory_capture_step = 0
+    store._vllm_memory_timeline_step = 1
+    store._vllm_memory_timeline_path = "/tmp/vllm_timeline.pickle"
+    store.store_batch_size_prompts = 4
+    store.training_context_size = 8
+
+    assert store._next_vllm_memory_kwargs() == {}
+    assert store._next_vllm_memory_kwargs() == {
+        "vllm_memory_step": 2,
+        "vllm_memory_n_training_samples": 64,
+        "vllm_memory_timeline_step": 1,
+        "vllm_memory_timeline_current_step": 1,
+        "vllm_memory_timeline_path": "/tmp/vllm_timeline.pickle",
+    }
+
+
+def test_next_vllm_memory_kwargs_preserves_zero_timeline_step() -> None:
+    store = ActivationsStore.__new__(ActivationsStore)
+    store._vllm_memory_every_n_steps = 0
+    store._vllm_memory_probe_layer = None
+    store._vllm_memory_history_path = None
+    store._vllm_memory_capture_step = 0
+    store._vllm_memory_timeline_step = 0
+    store._vllm_memory_timeline_path = "/tmp/vllm_timeline.pickle"
+    store.store_batch_size_prompts = 4
+    store.training_context_size = 8
+
+    assert store._next_vllm_memory_kwargs() == {
+        "vllm_memory_step": 1,
+        "vllm_memory_n_training_samples": 32,
+        "vllm_memory_timeline_step": 0,
+        "vllm_memory_timeline_current_step": 0,
+        "vllm_memory_timeline_path": "/tmp/vllm_timeline.pickle",
+    }
+    assert store._next_vllm_memory_kwargs() == {}
+
+
+def test_activations_store_init_preserves_zero_vllm_timeline_step() -> None:
+    store = ActivationsStore(
+        model=object(),  # type: ignore[arg-type]
+        dataset="unused",
+        streaming=False,
+        hook_name="blocks.0.hook_resid_post",
+        hook_head_index=None,
+        context_size=8,
+        d_in=4,
+        n_batches_in_buffer=1,
+        total_training_tokens=8,
+        store_batch_size_prompts=1,
+        train_batch_size_tokens=8,
+        prepend_bos=False,
+        normalize_activations="none",
+        device=torch.device("cpu"),
+        dtype="float32",
+        model_kwargs={
+            "vllm_memory_timeline_step": 0,
+            "vllm_memory_timeline_path": "/tmp/vllm_timeline.pickle",
+        },
+        skip_raw_dataset_load=True,
+    )
+
+    assert store._vllm_memory_timeline_step == 0
+    assert store._next_vllm_memory_kwargs()["vllm_memory_timeline_current_step"] == 0

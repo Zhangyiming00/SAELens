@@ -35,7 +35,7 @@ from typing import Any
 RUN_DIR = Path("results/topology_runs/demo_topo_switch1")
 LATEST_RUN_FILE = "latest_run.txt"
 MODEL = "/data/models/Llama-3.1-8B"
-DATASET = "/data/fineweb-edu/sample/10BT/000_00000.parquet"
+DATASET = "../datasets/fineweb-edu-10BT_tokenized_llama31_ctx2048"
 HOOK = "blocks.21.hook_resid_post"
 HOOKS_2 = "blocks.21.hook_resid_post,blocks.31.hook_resid_post"
 HOOKS_4 = "blocks.16.hook_resid_post,blocks.21.hook_resid_post,blocks.26.hook_resid_post,blocks.31.hook_resid_post"

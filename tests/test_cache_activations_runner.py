@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import math
 import os
 from pathlib import Path
@@ -12,7 +13,10 @@ from datasets import Dataset, load_dataset
 from tqdm import trange
 from transformer_lens import HookedTransformer
 
-from sae_lens.cache_activations_runner import CacheActivationsRunner
+from sae_lens.cache_activations_runner import (
+    CacheActivationsRunner,
+    _is_consolidation_artifact,
+)
 from sae_lens.config import (
     CacheActivationsRunnerConfig,
     LanguageModelSAERunnerConfig,
@@ -21,6 +25,7 @@ from sae_lens.constants import DTYPE_MAP
 from sae_lens.load_model import load_model
 from sae_lens.saes.standard_sae import StandardTrainingSAEConfig
 from sae_lens.training.activations_store import ActivationsStore
+from sae_lens.training.multi_sae_trainer import sanitize_hook_name_for_path
 from tests.helpers import assert_close
 
 
@@ -83,6 +88,28 @@ def _default_cfg(
     return cfg
 
 
+def test_vllm_memory_sidecars_are_consolidation_artifacts(tmp_path: Path) -> None:
+    artifact_names = [
+        ".tmp_shards",
+        "vllm_memory_history_rank0.jsonl",
+        "vllm_static_memory_rank0.jsonl",
+        "vllm_cache_memory_timeline_rank0.pickle",
+        "vllm_cache_memory_timeline_rank0_vllm_tp1.pickle",
+    ]
+
+    for name in artifact_names:
+        path = tmp_path / name
+        if name == ".tmp_shards":
+            path.mkdir()
+        else:
+            path.write_text("")
+        assert _is_consolidation_artifact(path)
+
+    non_artifact = tmp_path / "data-00000-of-00001.arrow"
+    non_artifact.write_text("")
+    assert not _is_consolidation_artifact(non_artifact)
+
+
 # The way to run this with this command:
 # poetry run py.test tests/test_cache_activations_runner.py --profile-svg -s
 def test_cache_activations_runner(tmp_path: Path):
@@ -90,7 +117,6 @@ def test_cache_activations_runner(tmp_path: Path):
     runner = CacheActivationsRunner(cfg)
     dataset = runner.run()
 
-    assert len(dataset) == cfg.n_buffers * (cfg.n_tokens_in_buffer // cfg.context_size)
     assert cfg.n_seq_in_dataset == len(dataset)
     assert dataset.column_names == [cfg.hook_name, "token_ids"]
 
@@ -383,6 +409,406 @@ def test_cache_activations_runner_stores_token_ids(tmp_path: Path):
     mlp_out_array = np.array(dataset["blocks.0.hook_mlp_out"])
     assert token_ids_array.shape[1] == cfg.context_size
     assert mlp_out_array.shape[:2] == token_ids_array.shape
+
+
+def test_cache_activations_runner_multi_hook_writes_split_cache(tmp_path: Path):
+    hook_names = ["blocks.0.hook_resid_pre", "blocks.0.hook_mlp_out"]
+    cfg = _default_cfg(
+        tmp_path,
+        batch_size=2,
+        context_size=8,
+        dataset_num_rows=16,
+        n_buffers=2,
+        shuffle=True,
+    )
+    cfg.hook_name = hook_names[0]
+    cfg.hook_names = hook_names
+
+    result = CacheActivationsRunner(cfg).run()
+
+    assert isinstance(result, dict)
+    assert set(result) == set(hook_names)
+    manifest_path = tmp_path / "cache_activations_manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["format"] == "split_hook_cached_activations_v1"
+    assert manifest["hook_names"] == hook_names
+    for hook_name in hook_names:
+        hook_dir = tmp_path / sanitize_hook_name_for_path(hook_name)
+        assert hook_dir.exists()
+        ds = datasets.load_from_disk(str(hook_dir))
+        assert ds.column_names == [hook_name, "token_ids"]
+        assert len(ds) == cfg.n_seq_in_dataset
+
+
+def test_cache_activations_runner_does_not_pad_to_full_buffer(tmp_path: Path):
+    context_size = 8
+    dataset_num_rows = 21
+    batch_size = 16
+    d_in = 512
+    dtype = "float32"
+    buffer_size_gb = (
+        batch_size * context_size * d_in * DTYPE_MAP[dtype].itemsize
+    ) / 1_000_000_000
+    cfg = CacheActivationsRunnerConfig(
+        new_cached_activations_path=str(tmp_path / "partial"),
+        dataset_path="chanind/c4-10k-mini-tokenized-16-ctx-gelu-1l-tests",
+        model_name="gelu-1l",
+        hook_name="blocks.0.hook_mlp_out",
+        training_tokens=dataset_num_rows * context_size,
+        model_batch_size=batch_size,
+        buffer_size_gb=buffer_size_gb,
+        context_size=context_size,
+        d_in=d_in,
+        shuffle=False,
+        prepend_bos=False,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        seed=42,
+        dtype=dtype,
+    )
+    assert cfg.n_seq_in_buffer == 16
+    assert cfg.n_buffers == 2
+
+    dataset = CacheActivationsRunner(cfg).run()
+
+    assert len(dataset) == 21
+    state = json.loads((tmp_path / "partial" / "state.json").read_text())
+    assert len(state["_data_files"]) == 2
+    assert state["_data_files"][-1]["filename"] == "data-00001-of-00002.arrow"
+
+
+def test_cache_activations_runner_dp_does_not_pad_to_full_buffer(
+    tmp_path: Path,
+):
+    context_size = 8
+    dataset_num_rows = 22
+    batch_size = 8
+    d_in = 512
+    dtype = "float32"
+    buffer_size_gb = (
+        batch_size * 2 * context_size * d_in * DTYPE_MAP[dtype].itemsize
+    ) / 1_000_000_000
+    override_dataset = Dataset.from_dict(
+        {
+            "tokens": [
+                list(range(i * context_size, (i + 1) * context_size))
+                for i in range(dataset_num_rows)
+            ]
+        }
+    )
+    override_dataset.set_format("torch")
+
+    cfg = CacheActivationsRunnerConfig(
+        new_cached_activations_path=str(tmp_path / "base"),
+        dataset_path="unused",
+        model_name="gelu-1l",
+        hook_name="blocks.0.hook_mlp_out",
+        training_tokens=dataset_num_rows * context_size,
+        model_batch_size=batch_size,
+        buffer_size_gb=buffer_size_gb,
+        context_size=context_size,
+        d_in=d_in,
+        shuffle=False,
+        prepend_bos=False,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        seed=42,
+        dtype=dtype,
+    )
+    assert cfg.n_seq_in_buffer == 16
+
+    shard_dirs = []
+    for shard_idx in range(2):
+        shard_cfg = CacheActivationsRunnerConfig(**dataclasses.asdict(cfg))
+        shard_cfg.new_cached_activations_path = str(tmp_path / f"dp{shard_idx}")
+        shard_cfg.dataset_shard_index = shard_idx
+        shard_cfg.dataset_shard_count = 2
+        shard = CacheActivationsRunner(
+            shard_cfg,
+            override_dataset=override_dataset,
+        ).run()
+        assert len(shard) == 11
+        shard_dirs.append(Path(shard_cfg.new_cached_activations_path))
+
+    merged = CacheActivationsRunner.consolidate_dp_shards(
+        shard_dirs,
+        tmp_path / "merged",
+        shuffle=False,
+    )
+
+    assert len(merged) == dataset_num_rows
+    state = json.loads((tmp_path / "merged" / "state.json").read_text())
+    assert len(state["_data_files"]) == 2
+    assert state["_data_files"][-1]["filename"] == "data-00001-of-00002.arrow"
+
+
+def test_cache_activations_runner_dp_consolidates_split_multi_hook_cache(
+    tmp_path: Path,
+):
+    hook_names = ["blocks.0.hook_resid_pre", "blocks.0.hook_mlp_out"]
+    base_cfg = _default_cfg(
+        tmp_path / "base",
+        batch_size=2,
+        context_size=8,
+        dataset_num_rows=16,
+        n_buffers=2,
+        shuffle=False,
+    )
+    base_cfg.hook_name = hook_names[0]
+    base_cfg.hook_names = hook_names
+
+    shard_dirs = []
+    for shard_idx in range(2):
+        shard_cfg = CacheActivationsRunnerConfig(**dataclasses.asdict(base_cfg))
+        shard_cfg.new_cached_activations_path = str(tmp_path / f"dp{shard_idx}")
+        shard_cfg.dataset_shard_index = shard_idx
+        shard_cfg.dataset_shard_count = 2
+        CacheActivationsRunner(shard_cfg).run()
+        shard_dirs.append(Path(shard_cfg.new_cached_activations_path))
+
+    merged = CacheActivationsRunner.consolidate_dp_shards(
+        shard_dirs,
+        tmp_path / "merged",
+        shuffle=False,
+    )
+
+    assert isinstance(merged, dict)
+    assert set(merged) == set(hook_names)
+    manifest = json.loads((tmp_path / "merged" / "cache_activations_manifest.json").read_text())
+    assert manifest["hook_names"] == hook_names
+    for hook_name in hook_names:
+        hook_dir = tmp_path / "merged" / sanitize_hook_name_for_path(hook_name)
+        ds = datasets.load_from_disk(str(hook_dir))
+        assert ds.column_names == [hook_name, "token_ids"]
+        assert len(ds) == base_cfg.n_seq_in_dataset
+
+
+def test_cache_activations_runner_dp_no_shuffle_split_cache_consolidates_without_resaving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    hook_names = ["blocks.0.hook_resid_pre", "blocks.0.hook_mlp_out"]
+    base_cfg = _default_cfg(
+        tmp_path / "base",
+        batch_size=2,
+        context_size=8,
+        dataset_num_rows=16,
+        n_buffers=2,
+        shuffle=False,
+    )
+    base_cfg.hook_name = hook_names[0]
+    base_cfg.hook_names = hook_names
+
+    shard_dirs = []
+    for shard_idx in range(2):
+        shard_cfg = CacheActivationsRunnerConfig(**dataclasses.asdict(base_cfg))
+        shard_cfg.new_cached_activations_path = str(tmp_path / f"dp{shard_idx}")
+        shard_cfg.dataset_shard_index = shard_idx
+        shard_cfg.dataset_shard_count = 2
+        CacheActivationsRunner(shard_cfg).run()
+        shard_dirs.append(Path(shard_cfg.new_cached_activations_path))
+
+    def fail_save_to_disk(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("shuffle=False split DP consolidation must not rewrite")
+
+    monkeypatch.setattr(Dataset, "save_to_disk", fail_save_to_disk)
+
+    merged_dir = tmp_path / "merged"
+    merged = CacheActivationsRunner.consolidate_dp_shards(
+        shard_dirs,
+        merged_dir,
+        shuffle=False,
+    )
+
+    assert isinstance(merged, dict)
+    assert set(merged) == set(hook_names)
+    for hook_name in hook_names:
+        hook_dir = merged_dir / sanitize_hook_name_for_path(hook_name)
+        assert datasets.load_from_disk(str(hook_dir)).num_rows == base_cfg.n_seq_in_dataset
+
+
+def test_cache_activations_runner_dp_shards_are_disjoint_and_complete(tmp_path: Path):
+    context_size = 16
+    dataset_num_rows = 16
+    override_dataset = Dataset.from_dict(
+        {
+            "tokens": [
+                list(range(i * context_size, (i + 1) * context_size))
+                for i in range(dataset_num_rows)
+            ]
+        }
+    )
+    override_dataset.set_format("torch")
+
+    full_cfg = _default_cfg(
+        tmp_path / "full",
+        batch_size=2,
+        context_size=context_size,
+        dataset_num_rows=dataset_num_rows,
+        n_buffers=2,
+        shuffle=False,
+    )
+    full = CacheActivationsRunner(full_cfg, override_dataset=override_dataset).run()
+    full.set_format("torch")
+    full_tokens = np.array(full["token_ids"])
+
+    shard_dirs = []
+    shard_token_sets = []
+    for shard_idx in range(2):
+        shard_cfg = CacheActivationsRunnerConfig(
+            **dataclasses.asdict(full_cfg),
+        )
+        shard_cfg.new_cached_activations_path = str(tmp_path / f"dp{shard_idx}")
+        shard_cfg.dataset_shard_index = shard_idx
+        shard_cfg.dataset_shard_count = 2
+        shard_runner = CacheActivationsRunner(shard_cfg, override_dataset=override_dataset)
+        shard = shard_runner.run()
+        shard.set_format("torch")
+        shard_dirs.append(Path(shard_cfg.new_cached_activations_path))
+        shard_token_sets.append({tuple(row.tolist()) for row in shard["token_ids"]})
+
+    assert shard_token_sets[0].isdisjoint(shard_token_sets[1])
+
+    merged_dir = tmp_path / "merged"
+    merged = CacheActivationsRunner.consolidate_dp_shards(shard_dirs, merged_dir, shuffle=False)
+    merged.set_format("torch")
+    merged_tokens = np.array(merged["token_ids"])
+
+    assert {tuple(row.tolist()) for row in merged_tokens} == {
+        tuple(row.tolist()) for row in full_tokens
+    }
+    assert len(merged_tokens) == len(full_tokens)
+
+
+def test_cache_activations_runner_dp_no_shuffle_consolidates_without_resaving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    context_size = 16
+    dataset_num_rows = 16
+    override_dataset = Dataset.from_dict(
+        {
+            "tokens": [
+                list(range(i * context_size, (i + 1) * context_size))
+                for i in range(dataset_num_rows)
+            ]
+        }
+    )
+    override_dataset.set_format("torch")
+
+    cfg = _default_cfg(
+        tmp_path / "base",
+        batch_size=2,
+        context_size=context_size,
+        dataset_num_rows=dataset_num_rows,
+        n_buffers=2,
+        shuffle=False,
+    )
+
+    shard_dirs = []
+    for shard_idx in range(2):
+        shard_cfg = CacheActivationsRunnerConfig(**dataclasses.asdict(cfg))
+        shard_cfg.new_cached_activations_path = str(tmp_path / f"dp{shard_idx}")
+        shard_cfg.dataset_shard_index = shard_idx
+        shard_cfg.dataset_shard_count = 2
+        CacheActivationsRunner(shard_cfg, override_dataset=override_dataset).run()
+        shard_dirs.append(Path(shard_cfg.new_cached_activations_path))
+
+    def fail_save_to_disk(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("shuffle=False DP consolidation must not rewrite the dataset")
+
+    monkeypatch.setattr(Dataset, "save_to_disk", fail_save_to_disk)
+
+    merged_dir = tmp_path / "merged"
+    merged = CacheActivationsRunner.consolidate_dp_shards(
+        shard_dirs,
+        merged_dir,
+        shuffle=False,
+    )
+
+    merged.set_format("torch")
+    merged_tokens = np.array(merged["token_ids"])
+    assert len(merged_tokens) == dataset_num_rows
+    assert datasets.load_from_disk(str(merged_dir)).num_rows == dataset_num_rows
+
+
+def test_cache_activations_runner_dp_handles_partial_final_batch(tmp_path: Path):
+    context_size = 16
+    dataset_num_rows = 12
+    override_dataset = Dataset.from_dict(
+        {
+            "tokens": [
+                list(range(i * context_size, (i + 1) * context_size))
+                for i in range(dataset_num_rows)
+            ]
+        }
+    )
+    override_dataset.set_format("torch")
+    full_cfg = _default_cfg(
+        tmp_path / "full",
+        batch_size=4,
+        context_size=context_size,
+        dataset_num_rows=dataset_num_rows,
+        n_buffers=3,
+        shuffle=False,
+    )
+    full = CacheActivationsRunner(full_cfg, override_dataset=override_dataset).run()
+    expected_local_rows = len(full) // 2
+
+    shard_dirs = []
+    for shard_idx in range(2):
+        shard_cfg = CacheActivationsRunnerConfig(**dataclasses.asdict(full_cfg))
+        shard_cfg.new_cached_activations_path = str(tmp_path / f"partial_dp{shard_idx}")
+        shard_cfg.dataset_shard_index = shard_idx
+        shard_cfg.dataset_shard_count = 2
+        shard = CacheActivationsRunner(
+            shard_cfg,
+            override_dataset=override_dataset,
+        ).run()
+        assert len(shard) == expected_local_rows
+        shard_dirs.append(Path(shard_cfg.new_cached_activations_path))
+
+    merged = CacheActivationsRunner.consolidate_dp_shards(
+        shard_dirs,
+        tmp_path / "partial_merged",
+        shuffle=False,
+    )
+
+    assert len(merged) == len(full)
+
+
+def test_cache_activations_runner_dp_does_not_shuffle_rank_local_shards(
+    tmp_path: Path,
+):
+    context_size = 16
+    dataset_num_rows = 16
+    override_dataset = Dataset.from_dict(
+        {
+            "tokens": [
+                list(range(i * context_size, (i + 1) * context_size))
+                for i in range(dataset_num_rows)
+            ]
+        }
+    )
+    override_dataset.set_format("torch")
+
+    cfg = _default_cfg(
+        tmp_path / "dp0",
+        batch_size=2,
+        context_size=context_size,
+        dataset_num_rows=dataset_num_rows,
+        n_buffers=2,
+        shuffle=True,
+    )
+    cfg.dataset_shard_index = 0
+    cfg.dataset_shard_count = 2
+
+    shard = CacheActivationsRunner(cfg, override_dataset=override_dataset).run()
+    shard.set_format("torch")
+
+    assert [tuple(row.tolist()) for row in shard["token_ids"]] == [
+        tuple(range(i * context_size, (i + 1) * context_size))
+        for i in range(0, dataset_num_rows, 2)
+    ]
 
 
 def test_cache_activations_runner_shuffling(tmp_path: Path):

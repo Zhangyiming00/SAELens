@@ -22,6 +22,7 @@ def init_distributed_streaming(
     sae_tp: int,
     sae_dp: int = 1,
     sae_pp_size: int = 1,
+    use_gpu_direct: bool = False,
 ) -> None:
     """Initialize process groups for streaming_mode v1.
 
@@ -44,6 +45,7 @@ def init_distributed_streaming(
         sae_pp_size=sae_pp_size,
         batch_size=1,
         disjoint=True,
+        use_gpu_direct=use_gpu_direct,
     )
 
 
@@ -59,6 +61,9 @@ get_sae_tp_rank = _v2.get_sae_tp_rank
 get_sae_tp_size = _v2.get_sae_tp_size
 get_vllm_tp_size = _v2.get_vllm_tp_size
 get_vllm_tp_rank = _v2.get_vllm_tp_rank
+get_streaming_nccl_group = _v2.get_streaming_nccl_group
+get_gloo_ctrl_group = _v2.get_gloo_ctrl_group
+get_pp_coord_group = _v2.get_pp_coord_group
 
 
 # ---------------------------------------------------------------------------

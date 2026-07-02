@@ -210,9 +210,14 @@ scripts/tests/
 scripts/integration_tests/
 scripts/run_sae_runner_gpu.py
 *.tar.gz
-scripts/scripts/
+scripts/scripts/*
+scripts/analyze/*
 
 scripts/run_sae_runner_*.sh
 scripts/profile_vllm_*
 *.nsys-rep
 profile*.sqlite
+bash*.txt
+docs/foreach_bench/*
+docs/memory_model*.md
+

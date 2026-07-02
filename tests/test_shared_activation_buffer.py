@@ -6,6 +6,7 @@ Tests verify functional correctness of the state machine, quota, and data round-
 
 import numpy as np
 import pytest
+import shutil
 import torch
 
 from sae_lens.training.shared_activation_buffer import ChunkState, SharedActivationBuffer
@@ -202,3 +203,97 @@ def test_bf16_bit_pattern_preserved(tmp_path):
     )
     buf.release_chunk(indices[0])
     buf.close()
+
+
+def test_destroy_removes_all_backing_files(tmp_path):
+    buf = _make_buffer(tmp_path)
+    expected = [
+        tmp_path / "test_buf_state.bin",
+        tmp_path / "test_buf_meta.bin",
+        tmp_path / "test_buf_header.bin",
+        tmp_path / "test_buf_data.bin",
+        tmp_path / "test_buf.lock",
+    ]
+    assert all(path.exists() for path in expected)
+
+    buf.destroy()
+
+    assert not any(path.exists() for path in expected)
+
+
+def test_cleanup_files_removes_stale_buffer_without_open_handle(tmp_path):
+    buf = _make_buffer(tmp_path)
+    buf.close()
+    expected = [
+        tmp_path / "test_buf_state.bin",
+        tmp_path / "test_buf_meta.bin",
+        tmp_path / "test_buf_header.bin",
+        tmp_path / "test_buf_data.bin",
+        tmp_path / "test_buf.lock",
+    ]
+    assert all(path.exists() for path in expected)
+
+    SharedActivationBuffer.cleanup_files("test_buf", base_dir=str(tmp_path))
+
+    assert not any(path.exists() for path in expected)
+
+
+def test_create_failure_removes_partial_backing_files(tmp_path, monkeypatch):
+    original_create_file = SharedActivationBuffer._create_file
+    created: list[str] = []
+
+    def fail_on_data(path, n_elements, dtype):
+        created.append(path.name)
+        if path.name.endswith("_data.bin"):
+            raise RuntimeError("simulated data allocation failure")
+        return original_create_file(path, n_elements, dtype)
+
+    monkeypatch.setattr(SharedActivationBuffer, "_create_file", staticmethod(fail_on_data))
+
+    with pytest.raises(RuntimeError, match="simulated data allocation failure"):
+        SharedActivationBuffer(
+            name="test_buf",
+            num_chunks=2,
+            chunk_size_tokens=4,
+            d_model=4,
+            num_producers=1,
+            create=True,
+            base_dir=str(tmp_path),
+        )
+
+    assert any(name.endswith("_data.bin") for name in created)
+    assert not any(tmp_path.iterdir())
+
+
+def test_space_check_includes_metadata_before_creating_files(tmp_path, monkeypatch):
+    data_bytes = 1 * 1 * 1 * 2
+    enough_for_data_only = data_bytes + 1024 * 1024
+    usage = shutil._ntuple_diskusage(10 * 1024 * 1024, 0, enough_for_data_only)
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: usage)
+
+    with pytest.raises(RuntimeError, match="Insufficient space"):
+        SharedActivationBuffer(
+            name="test_buf",
+            num_chunks=1,
+            chunk_size_tokens=1,
+            d_model=1,
+            num_producers=1,
+            create=True,
+            base_dir=str(tmp_path),
+        )
+
+    assert not any(tmp_path.iterdir())
+
+
+def test_preflight_estimate_matches_backing_file_sizes():
+    estimate = SharedActivationBuffer.estimate_required_bytes(
+        num_chunks=3,
+        chunk_size_tokens=5,
+        d_model=7,
+        dtype=torch.bfloat16,
+    )
+
+    assert estimate["data"] == 3 * 5 * 7 * 2
+    assert estimate["metadata"] == 3 * np.dtype(np.int8).itemsize + 3 * 4 * np.dtype(np.int32).itemsize + 8 * np.dtype(np.int32).itemsize
+    assert estimate["headroom"] == 1024 * 1024
+    assert estimate["required"] == estimate["data"] + estimate["metadata"] + estimate["headroom"]

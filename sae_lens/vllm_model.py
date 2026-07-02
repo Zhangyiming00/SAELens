@@ -41,12 +41,16 @@ Not supported (inside FlashAttention kernel, unreachable by forward hooks):
 from __future__ import annotations
 
 import io
+import json
+import logging
 import os
 import pickle
 import re
+from contextlib import contextmanager
 from functools import partial
 from multiprocessing.reduction import ForkingPickler
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Callable, Iterator
 
 import torch
 import torch.distributed as dist
@@ -55,6 +59,8 @@ from transformer_lens.utils import USE_DEFAULT_VALUE, get_tokens_with_bos_remove
 from transformers import PreTrainedTokenizerBase
 
 from sae_lens.profiling import nccl_nvtx_range
+
+logger = logging.getLogger(__name__)
 
 # Force in-process vLLM scheduler.  Must be set before vllm is imported.
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -380,6 +386,312 @@ def _get_arch_name(model: nn.Module) -> str:
     return type(model).__name__
 
 
+# (substage label, submodule path relative to the decoder layer). A clean
+# NON-OVERLAPPING leaf sequence covering the whole decoder layer: attention and
+# MLP each split into their projection / kernel steps instead of one opaque box.
+# Non-overlapping matters because each pre-hook resets the peak-memory counter,
+# so a parent box wrapping its children would only ever see the last child's
+# peak. The whole-attn / whole-mlp peak is recoverable in analysis as the max
+# over the relevant leaves. Paths not present on a given architecture are
+# skipped at install time, so the probe degrades to whatever submodules exist
+# rather than crashing.
+_VLLM_MEMORY_SUBSTAGES: tuple[tuple[str, str], ...] = (
+    ("ln1", "input_layernorm"),
+    ("attn_qkv", "self_attn.qkv_proj"),
+    ("attn_core", "self_attn.attn"),
+    ("attn_o", "self_attn.o_proj"),
+    ("ln2", "post_attention_layernorm"),
+    ("mlp_gate_up", "mlp.gate_up_proj"),
+    ("mlp_act", "mlp.act_fn"),
+    ("mlp_down", "mlp.down_proj"),
+)
+
+
+def _tensor_shape(value: Any) -> list[int] | None:
+    if isinstance(value, torch.Tensor):
+        return list(value.shape)
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            shape = _tensor_shape(item)
+            if shape is not None:
+                return shape
+    return None
+
+
+def _install_vllm_memory_probe(model: nn.Module, layer_idx: int) -> int:
+    """Install per-submodule CUDA memory probes on one vLLM decoder layer."""
+    model._sae_vllm_memory_records = []  # type: ignore[attr-defined]
+    model._sae_vllm_memory_handles = []  # type: ignore[attr-defined]
+
+    if not torch.cuda.is_available():
+        return 0
+
+    layer_path = f"model.layers.{layer_idx}"
+
+    def make_pre_hook() -> Callable[[nn.Module, tuple], None]:
+        def pre_hook(_module: nn.Module, _args: tuple) -> None:
+            device = torch.cuda.current_device()
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+
+        return pre_hook
+
+    def make_post_hook(
+        substage: str,
+    ) -> Callable[[nn.Module, Any, Any], None]:
+        def post_hook(_module: nn.Module, _args: Any, output: Any) -> None:
+            device = torch.cuda.current_device()
+            torch.cuda.synchronize(device)
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            model._sae_vllm_memory_records.append(  # type: ignore[attr-defined]
+                {
+                    "layer": layer_idx,
+                    "substage": substage,
+                    "allocated_mb": torch.cuda.memory_allocated(device) / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved(device) / 1024**2,
+                    "peak_allocated_mb": torch.cuda.max_memory_allocated(device)
+                    / 1024**2,
+                    "peak_reserved_mb": torch.cuda.max_memory_reserved(device)
+                    / 1024**2,
+                    "device_mb": (total_bytes - free_bytes) / 1024**2,
+                    "out_shape": _tensor_shape(output),
+                }
+            )
+
+        return post_hook
+
+    installed = 0
+    for substage, module_name in _VLLM_MEMORY_SUBSTAGES:
+        try:
+            module = model.get_submodule(f"{layer_path}.{module_name}")
+        except AttributeError:
+            # Architecture does not expose this submodule (e.g. fused qkv with a
+            # different name). Skip it rather than failing the whole probe.
+            continue
+        model._sae_vllm_memory_handles.append(  # type: ignore[attr-defined]
+            module.register_forward_pre_hook(make_pre_hook())
+        )
+        model._sae_vllm_memory_handles.append(  # type: ignore[attr-defined]
+            module.register_forward_hook(make_post_hook(substage))
+        )
+        installed += 1
+    return installed
+
+
+def _collect_and_clear_vllm_memory_probe(model: nn.Module) -> list[dict[str, Any]]:
+    records = list(getattr(model, "_sae_vllm_memory_records", []))
+    if hasattr(model, "_sae_vllm_memory_records"):
+        model._sae_vllm_memory_records.clear()  # type: ignore[attr-defined]
+    return records
+
+
+def _remove_vllm_memory_probe(model: nn.Module) -> bool:
+    for handle in getattr(model, "_sae_vllm_memory_handles", []):
+        handle.remove()
+    for attr in ("_sae_vllm_memory_records", "_sae_vllm_memory_handles"):
+        if hasattr(model, attr):
+            delattr(model, attr)
+    return True
+
+
+def _collect_vllm_static_memory(worker: Any) -> dict[str, Any]:
+    """Static (resting) memory breakdown for a vLLM worker.
+
+    Runs inside the worker process via ``LLM.collective_rpc`` (so ``self`` is
+    the worker, which owns ``model_runner``). Decomposes the resting GPU
+    footprint into the big static blocks that do NOT move during capture:
+
+      * ``weights_mb``      — model parameters (``model_runner.model_memory_usage``,
+                              the value vLLM itself measured at load).
+      * ``kv_cache_mb``     — sum of the pre-allocated KV cache tensors
+                              (``model_runner.kv_caches``); the pool vLLM sized
+                              from leftover VRAM at profile_run.
+      * ``non_torch_mb``    — CUDA/NCCL context + any non-torch allocations vLLM
+                              accounts separately (``worker.non_torch_memory``).
+      * ``allocated_mb`` / ``reserved_mb`` / ``device_mb`` — the same three
+                              torch/driver totals the per-substage records carry,
+                              so the static record can be reconciled against them.
+
+    Everything is best-effort: a missing attribute (different vLLM version or
+    architecture) yields 0 for that field rather than raising, so the probe
+    degrades gracefully.
+    """
+    to_mb = 1 / 1024**2
+    device = torch.cuda.current_device()
+    torch.cuda.synchronize(device)
+
+    runner = getattr(worker, "model_runner", None)
+
+    weights_bytes = int(getattr(runner, "model_memory_usage", 0) or 0)
+
+    kv_cache_bytes = 0
+    seen: set[int] = set()
+    for cache in getattr(runner, "kv_caches", []) or []:
+        if torch.is_tensor(cache) and cache.device.type == "cuda":
+            ident = id(cache)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            kv_cache_bytes += cache.numel() * cache.element_size()
+
+    non_torch_bytes = int(getattr(worker, "non_torch_memory", 0) or 0)
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    return {
+        "weights_mb": weights_bytes * to_mb,
+        "kv_cache_mb": kv_cache_bytes * to_mb,
+        "non_torch_mb": non_torch_bytes * to_mb,
+        "allocated_mb": torch.cuda.memory_allocated(device) * to_mb,
+        "reserved_mb": torch.cuda.memory_reserved(device) * to_mb,
+        "device_mb": (total_bytes - free_bytes) * to_mb,
+    }
+
+
+def write_vllm_static_memory_record(
+    path: str | Path,
+    *,
+    record: dict[str, Any],
+    step: int,
+    n_training_samples: int | None,
+    rank: int,
+    producer_idx: int | None = None,
+    vllm_tp_rank: int | None = None,
+) -> None:
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "step": step,
+        "n_training_samples": n_training_samples,
+        "rank": rank,
+        "producer_idx": producer_idx,
+        "vllm_tp_rank": vllm_tp_rank,
+        **record,
+    }
+    with out_path.open("a") as f:
+        json.dump(payload, f)
+        f.write("\n")
+
+
+def write_vllm_memory_records(
+    path: str | Path,
+    *,
+    records: list[dict[str, Any]],
+    step: int,
+    n_training_samples: int | None,
+    rank: int,
+    producer_idx: int | None = None,
+    vllm_tp_rank: int | None = None,
+) -> None:
+    if not records:
+        return
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("a") as f:
+        for record in records:
+            payload: dict[str, Any] = {
+                "step": step,
+                "n_training_samples": n_training_samples,
+                "rank": rank,
+                "producer_idx": producer_idx,
+                "vllm_tp_rank": vllm_tp_rank,
+                **record,
+            }
+            json.dump(payload, f)
+            f.write("\n")
+
+
+@contextmanager
+def _maybe_record_vllm_memory_timeline(
+    *,
+    enabled: bool,
+    target_step: int,
+    current_step: int,
+    path: str | Path | None,
+) -> Iterator[None]:
+    """Record one vLLM ``run_with_cache`` allocator timeline as a pickle."""
+    if (
+        not enabled
+        or target_step < 0
+        or current_step != target_step
+        or path is None
+        or not torch.cuda.is_available()
+    ):
+        yield
+        return
+
+    device = torch.cuda.current_device()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.cuda.synchronize(device)
+    torch.cuda.memory._record_memory_history(
+        max_entries=1_000_000,
+        stacks="all",
+        context="all",
+    )
+    try:
+        yield
+    finally:
+        torch.cuda.synchronize(device)
+        torch.cuda.memory._dump_snapshot(str(path))
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+
+def _vllm_timeline_worker_path(
+    path: str | Path,
+    *,
+    suffix_tp_rank: bool,
+) -> Path:
+    out_path = Path(path)
+    if not suffix_tp_rank:
+        return out_path
+    tp_rank = _get_vllm_tp_rank()
+    if tp_rank is None:
+        tp_rank = torch.cuda.current_device()
+    return out_path.with_name(f"{out_path.stem}_vllm_tp{tp_rank}{out_path.suffix}")
+
+
+def _start_vllm_memory_timeline(
+    model: nn.Module,
+    *,
+    path: str | Path,
+    suffix_tp_rank: bool = False,
+) -> str | None:
+    """Start allocator history inside a vLLM worker process."""
+    if not torch.cuda.is_available():
+        return None
+    out_path = _vllm_timeline_worker_path(path, suffix_tp_rank=suffix_tp_rank)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    device = torch.cuda.current_device()
+    torch.cuda.synchronize(device)
+    torch.cuda.memory._record_memory_history(
+        max_entries=1_000_000,
+        stacks="all",
+        context="all",
+    )
+    model._sae_vllm_memory_timeline_path = str(out_path)  # type: ignore[attr-defined]
+    model._sae_vllm_memory_timeline_active = True  # type: ignore[attr-defined]
+    return str(out_path)
+
+
+def _stop_vllm_memory_timeline(model: nn.Module) -> str | None:
+    """Dump and stop allocator history inside a vLLM worker process."""
+    if not getattr(model, "_sae_vllm_memory_timeline_active", False):
+        return None
+    path = getattr(model, "_sae_vllm_memory_timeline_path")
+    device = torch.cuda.current_device()
+    try:
+        torch.cuda.synchronize(device)
+        torch.cuda.memory._dump_snapshot(str(path))
+        return str(path)
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
+        for attr in (
+            "_sae_vllm_memory_timeline_path",
+            "_sae_vllm_memory_timeline_active",
+        ):
+            if hasattr(model, attr):
+                delattr(model, attr)
+
+
 def _register_hooks(
     model: nn.Module,
     hook_specs: list[tuple[str, str, Callable, bool, Callable | None]],
@@ -674,6 +986,30 @@ class HookedVLLMModel:
         arch_config = ARCH_CONFIGS[self._arch]
         total_tokens = B * S
         stop_at_layer: int | None = kwargs.get("stop_at_layer", None)
+        memory_probe_layer: int | None = kwargs.get("vllm_memory_probe_layer", None)
+        memory_probe_path: str | Path | None = kwargs.get("vllm_memory_history_path", None)
+        memory_probe_step: int = int(kwargs.get("vllm_memory_step", 0))
+        memory_probe_samples = kwargs.get("vllm_memory_n_training_samples", None)
+        memory_probe_rank: int = int(kwargs.get("vllm_memory_rank", 0))
+        memory_probe_producer_idx = kwargs.get("vllm_memory_producer_idx", None)
+        memory_probe_tp_rank = kwargs.get("vllm_memory_tp_rank", None)
+        memory_timeline_step: int = int(
+            kwargs.get("vllm_memory_timeline_step", -1)
+        )
+        memory_timeline_current_step: int = int(
+            kwargs.get("vllm_memory_timeline_current_step", memory_probe_step)
+        )
+        memory_timeline_path: str | Path | None = kwargs.get(
+            "vllm_memory_timeline_path", None
+        )
+        memory_timeline_enabled = (
+            memory_timeline_step >= 0 and memory_timeline_path is not None
+        )
+        memory_probe_enabled = (
+            memory_probe_layer is not None
+            and memory_probe_path is not None
+            and memory_probe_step > 0
+        )
 
         # Resolve hook names → (name, module_path, extractor, is_pre_hook, gather_fn).
         hook_specs: list[tuple[str, str, Callable, bool, Callable | None]] = []
@@ -695,6 +1031,61 @@ class HookedVLLMModel:
             total_tokens=total_tokens,
             stop_at_layer=stop_at_layer,
         )
+        install_memory_probe = (
+            partial(_install_vllm_memory_probe, layer_idx=int(memory_probe_layer))
+            if memory_probe_enabled
+            else None
+        )
+
+        def collect_memory_probe() -> list[dict[str, Any]]:
+            if not memory_probe_enabled:
+                return []
+            records_by_rank = self.llm.apply_model(_collect_and_clear_vllm_memory_probe)
+            records: list[dict[str, Any]] = []
+            for worker_records in records_by_rank:
+                records.extend(worker_records)
+            return records
+
+        def remove_memory_probe() -> None:
+            if memory_probe_enabled:
+                self.llm.apply_model(_remove_vllm_memory_probe)
+
+        def collect_and_remove_memory_probe() -> list[dict[str, Any]]:
+            if not memory_probe_enabled:
+                return []
+            try:
+                return collect_memory_probe()
+            finally:
+                remove_memory_probe()
+
+        def write_static_memory() -> None:
+            """Collect the resting weights/kv/non_torch breakdown once (per
+            probed step) and append it to vllm_static_memory_rank{N}.jsonl next
+            to the per-substage history. Best-effort: never fail the run."""
+            if not memory_probe_enabled or memory_probe_path is None:
+                return
+            try:
+                records = self.llm.collective_rpc(_collect_vllm_static_memory)
+            except Exception as exc:  # pragma: no cover - version/runtime guard
+                logger.warning("vLLM static memory collection failed: %s", exc)
+                return
+            static_path = Path(memory_probe_path).with_name(
+                Path(memory_probe_path).name.replace(
+                    "vllm_memory_history", "vllm_static_memory"
+                )
+            )
+            # rank-0 worker's view is representative; under TP each rank holds
+            # the same weights footprint and an equal KV shard, so record rank 0.
+            if records:
+                write_vllm_static_memory_record(
+                    static_path,
+                    record=records[0],
+                    step=memory_probe_step,
+                    n_training_samples=memory_probe_samples,
+                    rank=memory_probe_rank,
+                    producer_idx=memory_probe_producer_idx,
+                    vllm_tp_rank=memory_probe_tp_rank,
+                )
 
         if self._tp == 1 or self._is_external_launcher:
             # UniProcExecutor (tp=1) or external_launcher: apply_model runs
@@ -705,10 +1096,32 @@ class HookedVLLMModel:
             # Post-allreduce hooks already hold the full tensor on every rank.
             # Sharded hooks need dist.all_gather across the TP ranks.
             self.llm.apply_model(register)
+            if install_memory_probe is not None:
+                self.llm.apply_model(install_memory_probe)
             try:
-                self.llm.generate(prompts, SamplingParams(max_tokens=1), use_tqdm=False)
+                with _maybe_record_vllm_memory_timeline(
+                    enabled=memory_timeline_enabled,
+                    target_step=memory_timeline_step,
+                    current_step=memory_timeline_current_step,
+                    path=memory_timeline_path,
+                ):
+                    self.llm.generate(
+                        prompts, SamplingParams(max_tokens=1), use_tqdm=False
+                    )
             finally:
+                memory_records = collect_and_remove_memory_probe()
                 results = self.llm.apply_model(_collect_and_cleanup)
+            if memory_probe_enabled and memory_probe_path is not None:
+                write_vllm_memory_records(
+                    memory_probe_path,
+                    records=memory_records,
+                    step=memory_probe_step,
+                    n_training_samples=memory_probe_samples,
+                    rank=memory_probe_rank,
+                    producer_idx=memory_probe_producer_idx,
+                    vllm_tp_rank=memory_probe_tp_rank,
+                )
+                write_static_memory()
 
             local_caps = results[0]
             activations: dict[str, torch.Tensor] = {}
@@ -750,10 +1163,39 @@ class HookedVLLMModel:
             )
 
             self.llm.apply_model(register)
+            if install_memory_probe is not None:
+                self.llm.apply_model(install_memory_probe)
+            timeline_active = False
+            if (
+                memory_timeline_enabled
+                and memory_timeline_current_step == memory_timeline_step
+                and memory_timeline_path is not None
+            ):
+                start_timeline = partial(
+                    _start_vllm_memory_timeline,
+                    path=memory_timeline_path,
+                    suffix_tp_rank=True,
+                )
+                self.llm.apply_model(start_timeline)
+                timeline_active = True
             try:
                 self.llm.generate(prompts, SamplingParams(max_tokens=1), use_tqdm=False)
             finally:
+                if timeline_active:
+                    self.llm.apply_model(_stop_vllm_memory_timeline)
+                memory_records = collect_and_remove_memory_probe()
                 ipc_bytes_per_rank: list[bytes] = self.llm.apply_model(collect)
+            if memory_probe_enabled and memory_probe_path is not None:
+                write_vllm_memory_records(
+                    memory_probe_path,
+                    records=memory_records,
+                    step=memory_probe_step,
+                    n_training_samples=memory_probe_samples,
+                    rank=memory_probe_rank,
+                    producer_idx=memory_probe_producer_idx,
+                    vllm_tp_rank=memory_probe_tp_rank,
+                )
+                write_static_memory()
 
             try:
                 activations = {}

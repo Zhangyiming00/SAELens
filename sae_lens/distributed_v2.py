@@ -78,6 +78,11 @@ _sae_endpoint_p2p_groups: dict[int, dist.ProcessGroup] = {}  # endpoint_idx -> N
 _sae_dp_replica_group: dist.ProcessGroup | None = None  # all PP*TP ranks of this DP replica
 _sae_dp_replica_root: int = -1  # world rank of the DP replica's PP-0 + TP-0
 
+# GPU direct streaming groups (created only when use_gpu_direct=True)
+_streaming_nccl_groups: list[dist.ProcessGroup] = []  # indexed by pp_stage
+_gloo_ctrl_group: dist.ProcessGroup | None = None  # vLLM TP root <-> SAE DP root
+_pp_coord_groups: list[dist.ProcessGroup] = []  # indexed by pp_stage; SAE DP root <-> pp_stage TP-0
+
 # Backwards-compatible aliases for code/tests that inspect module state directly.
 _consumer_world_ranks: dict[int, list[int]] = _sae_endpoint_world_ranks
 _consumer_tp_root: dict[int, int] = _sae_endpoint_tp_root
@@ -97,6 +102,7 @@ def _reset() -> None:
     global _vllm_tp_group, _sae_tp_group, _sae_dp_group
     global _sae_endpoint_p2p_groups, _consumer_p2p_groups, _routing_table
     global _sae_dp_replica_group, _sae_dp_replica_root
+    global _streaming_nccl_groups, _gloo_ctrl_group, _pp_coord_groups
 
     _initialized = False
     _P = _Q = _num_sae_stage_endpoints = 0
@@ -118,6 +124,9 @@ def _reset() -> None:
     _routing_table = []
     _sae_dp_replica_group = None
     _sae_dp_replica_root = -1
+    _streaming_nccl_groups = []
+    _gloo_ctrl_group = None
+    _pp_coord_groups = []
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +141,7 @@ def init_distributed_v2(
     batch_size: int,
     disjoint: bool = False,
     sae_pp_size: int = 1,
+    use_gpu_direct: bool = False,
 ) -> None:
     """Initialize all process groups for the unified shard-routing path.
 
@@ -162,6 +172,9 @@ def init_distributed_v2(
         ``world_size = P*vllm_tp_size + Q*sae_pp_size*sae_tp_size``.  When False
         (default), use the overlapping topology where
         ``world_size = max(P*vllm_tp, Q*sae_pp*sae_tp)``.
+    use_gpu_direct:
+        When True, create GPU direct streaming process groups (streaming_nccl_groups,
+        gloo_ctrl_group, pp_coord_groups). Only applies when both P > 0 and Q > 0.
     """
     global _initialized, _P, _Q, _vllm_tp_size, _sae_tp_size, _sae_pp_size
     global _num_sae_stage_endpoints
@@ -172,6 +185,7 @@ def init_distributed_v2(
     global _vllm_tp_group, _sae_tp_group, _sae_dp_group
     global _sae_endpoint_p2p_groups, _consumer_p2p_groups, _routing_table
     global _sae_dp_replica_group, _sae_dp_replica_root
+    global _streaming_nccl_groups, _gloo_ctrl_group, _pp_coord_groups
 
     assert dist.is_initialized(), "Call dist.init_process_group() before init_distributed_v2()"
 
@@ -297,6 +311,49 @@ def init_distributed_v2(
         grp = dist.new_group(p2p_members, backend="nccl")
         if rank in p2p_members:
             _sae_endpoint_p2p_groups[endpoint_idx] = grp
+
+    # --- GPU direct streaming groups (created only when use_gpu_direct=True) ---
+    if use_gpu_direct and P > 0 and Q > 0:
+        # streaming_nccl_group[pp_stage]: vLLM TP root + all SAE TP ranks for this PP stage
+        for pp_stage in range(sae_pp_size):
+            members = [_producer_tp_root[0]]  # vLLM TP root (only producer 0 in MVP)
+            for d in range(Q):
+                for tp_r in range(sae_tp_size):
+                    endpoint_idx = d * sae_pp_size + pp_stage
+                    members.append(_sae_endpoint_world_ranks[endpoint_idx][tp_r])
+            grp = dist.new_group(members, backend="nccl")
+            _streaming_nccl_groups.append(grp)
+            if rank in members:
+                # Store for later access by pp_stage
+                pass
+
+        # gloo_ctrl_group: vLLM TP root <-> SAE DP root (CPU tensors)
+        # Only create if both ranks exist in this process group
+        sae_dp_root = _sae_endpoint_world_ranks[0][0]  # First SAE endpoint's TP root
+        gloo_members = [_producer_tp_root[0], sae_dp_root]
+        if all(m < world_size for m in gloo_members):
+            gloo_grp = dist.new_group(gloo_members, backend="gloo")
+            if rank in gloo_members:
+                _gloo_ctrl_group = gloo_grp
+
+        # pp_coord_group[pp_stage]: SAE DP root (PP-0 TP-0) <-> pp_stage TP-0
+        for pp_stage in range(sae_pp_size):
+            if pp_stage == 0:
+                # Single member (DP root = PP-0 TP-0), skip
+                _pp_coord_groups.append(None)
+            else:
+                # DP root + pp_stage TP-0 of each DP replica
+                members = [sae_dp_root]
+                for d in range(Q):
+                    endpoint_idx = d * sae_pp_size + pp_stage
+                    members.append(_sae_endpoint_tp_root[endpoint_idx])
+                if all(m < world_size for m in members):
+                    grp = dist.new_group(members, backend="nccl")
+                    _pp_coord_groups.append(grp)
+                    if rank in members:
+                        pass
+                else:
+                    _pp_coord_groups.append(None)
 
     _consumer_world_ranks = _sae_endpoint_world_ranks
     _consumer_tp_root = _sae_endpoint_tp_root
@@ -431,3 +488,31 @@ def get_consumer_tp_root(endpoint_idx: int) -> int:
     an endpoint index, not a routing consumer index.
     """
     return _sae_endpoint_tp_root[endpoint_idx]
+
+
+def get_streaming_nccl_group(pp_stage: int) -> dist.ProcessGroup:
+    """Return the NCCL group for GPU direct streaming at a given PP stage.
+
+    Members: vLLM TP root + all SAE TP ranks for this PP stage.
+    Raises IndexError if pp_stage is out of range or groups not initialized.
+    """
+    return _streaming_nccl_groups[pp_stage]
+
+
+def get_gloo_ctrl_group() -> dist.ProcessGroup | None:
+    """Return the Gloo control group for GPU direct streaming.
+
+    Members: vLLM TP root <-> SAE DP root (CPU tensors).
+    Returns None if GPU direct groups not initialized.
+    """
+    return _gloo_ctrl_group
+
+
+def get_pp_coord_group(pp_stage: int) -> dist.ProcessGroup | None:
+    """Return the NCCL coordination group for a given PP stage.
+
+    Members: SAE DP root (PP-0 TP-0) <-> pp_stage TP-0 of each DP replica.
+    For pp_stage=0, returns None (single member, no-op).
+    Raises IndexError if pp_stage is out of range or groups not initialized.
+    """
+    return _pp_coord_groups[pp_stage]

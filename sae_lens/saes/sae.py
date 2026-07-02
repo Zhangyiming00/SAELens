@@ -924,6 +924,8 @@ class TrainingSAE(SAE[T_TRAINING_SAE_CONFIG], ABC):
         # is expected to handle reshaping before passing data to the SAE
         self.turn_off_forward_pass_hook_z_reshaping()
         self.mse_loss_fn = mse_loss
+        # Set by subclasses' shard_weights() / from_config_sharded() when TP>1.
+        self._tp_group: dist.ProcessGroup | None = None
 
     def forward(  # type: ignore[override]
         self, x: torch.Tensor | TrainStepInput
@@ -1089,9 +1091,45 @@ class TrainingSAE(SAE[T_TRAINING_SAE_CONFIG], ABC):
 
     def load_weights_from_checkpoint(self, checkpoint_path: Path | str) -> None:
         checkpoint_path = Path(checkpoint_path)
-        state_dict = load_file(checkpoint_path / SAE_WEIGHTS_FILENAME)
+        weights_path = checkpoint_path / SAE_WEIGHTS_FILENAME
+        if (
+            self._tp_group is not None
+            and dist.is_initialized()
+            and dist.get_world_size(self._tp_group) > 1
+        ):
+            self._assert_tp_slice_load_safe()
+            from sae_lens.training.tp_checkpoint import load_tp_sharded_state_dict
+
+            state_dict = load_tp_sharded_state_dict(
+                weights_path, self, self._tp_group
+            )
+            # state_dict is already shard-shaped; do NOT call
+            # process_state_dict_for_loading.
+            self.load_state_dict(state_dict)
+            return
+
+        state_dict = load_file(weights_path)
         self.process_state_dict_for_loading(state_dict)
         self.load_state_dict(state_dict)
+
+    def _assert_tp_slice_load_safe(self) -> None:
+        """Refuse TP slice load for SAE classes whose
+        ``process_state_dict_for_loading`` does work the slice loader doesn't
+        replicate (e.g. ``threshold ↔ log_threshold`` migration).
+
+        Maintained as an explicit allowlist so adding TP support to a new
+        architecture forces the developer to audit its loading hook.
+        """
+        from sae_lens.saes.topk_sae import TopKTrainingSAE
+
+        allowlist: tuple[type, ...] = (TopKTrainingSAE,)
+        if not isinstance(self, allowlist):
+            raise NotImplementedError(
+                f"TP slice load is only supported for {allowlist}; "
+                f"got {type(self).__name__}. Its process_state_dict_for_loading "
+                "may transform tensors in ways the slice loader does not "
+                "replicate. Add it to the allowlist after auditing."
+            )
 
 
 _blank_hook = nn.Identity()

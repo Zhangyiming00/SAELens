@@ -3,6 +3,7 @@ import math
 import os
 import signal
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Sequence
@@ -58,6 +59,566 @@ from sae_lens.training.multi_sae_trainer import MultiSAETrainer, sanitize_hook_n
 from sae_lens.training.sae_trainer import SAETrainer
 from sae_lens.training.types import DataProvider
 from sae_lens.util import temporary_seed
+
+
+# GPU direct streaming control message types
+_MSG_REQUEST_DATA = 1
+_MSG_DATA_READY = 2
+_MSG_READY_TO_RECV = 3
+_MSG_EOF = 4
+_MSG_CONSUMER_DONE = 5
+_GPU_DIRECT_DTYPE_CODES = {
+    torch.float32: 1,
+    torch.bfloat16: 2,
+    torch.float16: 3,
+}
+_GPU_DIRECT_CODE_DTYPES = {
+    code: dtype for dtype, code in _GPU_DIRECT_DTYPE_CODES.items()
+}
+
+
+class VLLMProducerStagingQueue:
+    """GPU staging buffer for GPU direct streaming."""
+
+    def __init__(self, capacity: int, chunk_shape: tuple, device: torch.device):
+        self.capacity = capacity
+        self.chunk_shape = chunk_shape
+        self.device = device
+        self._queue: list[tuple[torch.Tensor, int]] = []
+
+    def try_push(self, tensor: torch.Tensor, valid_tokens_per_hook: int) -> bool:
+        """Try to push tensor to queue. Returns False if full. Must clone tensor."""
+        if len(self._queue) >= self.capacity:
+            return False
+        stored = tensor.detach().contiguous().clone()
+        self._queue.append((stored, valid_tokens_per_hook))
+        return True
+
+    def pop(self) -> tuple[torch.Tensor, int]:
+        """Pop from queue. Raises IndexError if empty."""
+        return self._queue.pop(0)
+
+    @property
+    def count(self) -> int:
+        return len(self._queue)
+
+    @property
+    def is_full(self) -> bool:
+        return len(self._queue) >= self.capacity
+
+
+class VLLMGPUHandler:
+    """Persistent irecv state machine for GPU direct streaming control messages."""
+
+    def __init__(self, sae_dp_root_rank: int, gloo_ctrl_group: dist.ProcessGroup):
+        self._sae_dp_root_rank = sae_dp_root_rank
+        self._gloo_ctrl_group = gloo_ctrl_group
+        self._ctrl_recv_buf = torch.zeros(4, dtype=torch.int32)
+        self._pending_irecv: dist.Work | None = None
+        self._post_irecv()
+
+    def _post_irecv(self):
+        self._pending_irecv = dist.irecv(
+            self._ctrl_recv_buf,
+            src=self._sae_dp_root_rank,
+            group=self._gloo_ctrl_group,
+        )
+
+    def consume_pending_request(self) -> int | None:
+        """Check if pending irecv completed. Returns msg_type or None."""
+        if self._pending_irecv is None:
+            return None
+        if not self._pending_irecv.is_completed():
+            return None
+        self._pending_irecv.wait()
+        msg_type = int(self._ctrl_recv_buf[0])
+        self._pending_irecv = None
+        return msg_type
+
+
+class GpuDirectReceiver:
+    """Background Gloo/NCCL receiver for GPU direct streaming.
+
+    The receiver owns all control handshakes and NCCL recv calls. The trainer
+    thread only waits for local provider state to become available.
+    """
+
+    def __init__(
+        self,
+        inner,
+        gloo_ctrl_group: dist.ProcessGroup,
+        nccl_group: dist.ProcessGroup,
+        producer_global_rank: int,
+        d_model: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        cuda_log_path: Path | None = None,
+    ):
+        self._inner = inner
+        self._gloo_ctrl = gloo_ctrl_group
+        self._nccl_group = nccl_group
+        self._producer_rank = producer_global_rank
+        self._d_model = d_model
+        self._dtype = dtype
+        self._device = device
+        self._ctrl_buf = torch.zeros(4, dtype=torch.int32)
+        self._cuda_log_path = cuda_log_path
+        self._t_ready = time.time()
+        self._cv = threading.Condition()
+        self._thread: threading.Thread | None = None
+        self._closed = False
+        self._eof = False
+        self._done_sent = False
+        self._error: BaseException | None = None
+        if self._cuda_log_path is not None:
+            self._cuda_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._cuda_log_path.write_text("")
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="gpu-direct-receiver",
+            daemon=True,
+        )
+        self._thread.start()
+        self._cuda_log({"event": "receiver_started"})
+
+    def wait_for_data(self) -> None:
+        with self._cv:
+            t0 = time.perf_counter()
+            while (
+                self._inner_min_pool_tokens() == 0
+                and not self._eof
+                and self._error is None
+            ):
+                self._cv.wait(timeout=0.1)
+            if self._error is not None:
+                raise RuntimeError("GPU direct receiver thread failed") from self._error
+            wait_s = time.perf_counter() - t0
+        if wait_s > 0:
+            self._cuda_log({"event": "trainer_wait_for_data", "wait_time_s": wait_s})
+
+    def wait_for_prefill(
+        self,
+        requested_target_tokens: int,
+        timeout_s: float = 120.0,
+    ) -> None:
+        """Block until the inner provider has post-mixing serving tokens."""
+        prefill_target = getattr(self._inner, "prefill_target_tokens", None)
+        effective_target = (
+            int(prefill_target(requested_target_tokens))
+            if prefill_target is not None
+            else int(requested_target_tokens)
+        )
+        if effective_target <= 0:
+            return
+
+        prefill_satisfied = getattr(self._inner, "prefill_satisfied", None)
+        t0 = time.perf_counter()
+        with self._cv:
+            while (
+                not self._inner_prefill_satisfied(prefill_satisfied, effective_target)
+                and not self._eof
+                and self._error is None
+            ):
+                elapsed = time.perf_counter() - t0
+                if elapsed >= timeout_s:
+                    logger.warning(
+                        "[gpu-direct-receiver] Prefill timeout after %.1fs "
+                        "(serving=%d, target=%d)",
+                        elapsed,
+                        self._inner_serving_tokens(),
+                        effective_target,
+                    )
+                    break
+                self._cv.wait(timeout=0.5)
+            if self._error is not None:
+                raise RuntimeError("GPU direct receiver thread failed") from self._error
+
+        self._cuda_log({
+            "event": "prefill_complete",
+            "requested_target_tokens": int(requested_target_tokens),
+            "effective_target_tokens": effective_target,
+            "serving_tokens": self._inner_serving_tokens(),
+            "storage_tokens": self._inner_storage_tokens(),
+            "available_tokens": self._inner_available_tokens(),
+            "elapsed_s": time.perf_counter() - t0,
+        })
+
+    def next_batch(self) -> torch.Tensor | dict[str, torch.Tensor]:
+        while True:
+            with self._cv:
+                try:
+                    batch = next(self._inner)
+                    pool_tokens = self._inner_min_pool_tokens()
+                    available_tokens = self._inner_available_tokens()
+                    self._cv.notify_all()
+                except StopIteration:
+                    if self._eof:
+                        raise
+                    if self._error is not None:
+                        raise RuntimeError("GPU direct receiver thread failed") from self._error
+                    self._cv.wait(timeout=0.1)
+                    continue
+            self._cuda_log({
+                "event": "batch_served",
+                "pool_tokens": pool_tokens,
+                "available_tokens": available_tokens,
+            })
+            return batch
+
+    def notify_consumed(self) -> None:
+        with self._cv:
+            self._cv.notify_all()
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+        if self._thread is None:
+            self._send_consumer_done()
+        else:
+            self._thread.join()
+
+    @property
+    def eof(self) -> bool:
+        return self._eof
+
+    def _run(self) -> None:
+        try:
+            if self._device.type == "cuda":
+                torch.cuda.set_device(self._device)
+            while True:
+                with self._cv:
+                    while (
+                        not self._closed
+                        and not self._eof
+                        and not self._inner_needs_refill()
+                    ):
+                        self._cv.wait(timeout=0.1)
+                    if self._closed or self._eof:
+                        return
+                    desired_chunks = self._desired_refill_chunks()
+                received = self._request_and_recv(desired_chunks)
+                if not received:
+                    return
+                for _ in range(desired_chunks - 1):
+                    if not self._recv_one_chunk():
+                        return
+        except BaseException as exc:
+            with self._cv:
+                self._error = exc
+                self._cv.notify_all()
+            self._cuda_log({"event": "receiver_error", "error": repr(exc)})
+        finally:
+            if self._closed and not self._eof and self._error is None:
+                self._send_consumer_done()
+
+    def _send_consumer_done(self) -> None:
+        if self._done_sent or self._eof:
+            return
+        ctrl = torch.zeros(4, dtype=torch.int32)
+        ctrl[0] = _MSG_CONSUMER_DONE
+        dist.send(ctrl, dst=self._producer_rank, group=self._gloo_ctrl)
+        self._done_sent = True
+        self._cuda_log({"event": "consumer_done"})
+
+    def _request_and_recv(self, requested_chunks: int = 1) -> bool:
+        self._ctrl_buf.zero_()
+        self._ctrl_buf[0] = _MSG_REQUEST_DATA
+        self._ctrl_buf[1] = max(1, int(requested_chunks))
+        self._cuda_log({
+            "event": "request_data",
+            "producer_rank": self._producer_rank,
+            "requested_chunks": int(self._ctrl_buf[1]),
+        })
+        dist.send(self._ctrl_buf, dst=self._producer_rank, group=self._gloo_ctrl)
+        return self._recv_one_chunk()
+
+    def _recv_one_chunk(self) -> bool:
+        t0 = time.perf_counter()
+        dist.recv(self._ctrl_buf, src=self._producer_rank, group=self._gloo_ctrl)
+        wait_s = time.perf_counter() - t0
+        msg_type = int(self._ctrl_buf[0])
+
+        if msg_type == _MSG_EOF:
+            with self._cv:
+                self._eof = True
+                self._inner.mark_eof()
+                self._cv.notify_all()
+            self._cuda_log({"event": "eof", "wait_time_s": wait_s})
+            return False
+
+        assert msg_type == _MSG_DATA_READY
+        valid_tokens_per_hook = int(self._ctrl_buf[1])
+        dtype_code = int(self._ctrl_buf[2])
+        dtype = _GPU_DIRECT_CODE_DTYPES.get(dtype_code, self._dtype)
+        self._cuda_log({
+            "event": "data_ready",
+            "valid_tokens_per_hook": valid_tokens_per_hook,
+            "dtype_code": dtype_code,
+            "wait_time_s": wait_s,
+        })
+
+        self._ctrl_buf.zero_()
+        self._ctrl_buf[0] = _MSG_READY_TO_RECV
+        dist.send(self._ctrl_buf, dst=self._producer_rank, group=self._gloo_ctrl)
+
+        num_hooks = len(self._inner._pp_hook_names)
+        recv_rows = valid_tokens_per_hook * num_hooks
+        recv_buf = torch.empty(
+            recv_rows, self._d_model, dtype=dtype, device=self._device
+        )
+        t0 = time.perf_counter()
+        dist.broadcast(recv_buf, src=self._producer_rank, group=self._nccl_group)
+        nccl_time_s = time.perf_counter() - t0
+
+        with self._cv:
+            self._inner.receive_chunk(recv_buf)
+            pool_tokens = self._inner_min_pool_tokens()
+            available_tokens = self._inner_available_tokens()
+            self._cv.notify_all()
+        self._cuda_log({
+            "event": "nccl_recv_complete",
+            "rows": recv_rows,
+            "d_model": self._d_model,
+            "dtype": str(dtype).removeprefix("torch."),
+            "nccl_time_s": nccl_time_s,
+            "pool_tokens": pool_tokens,
+            "available_tokens": available_tokens,
+        })
+        return True
+
+    def _inner_needs_refill(self) -> bool:
+        receiver_needs_refill = getattr(self._inner, "receiver_needs_refill", None)
+        if receiver_needs_refill is not None:
+            return bool(receiver_needs_refill())
+        needs_refill = getattr(self._inner, "needs_refill", None)
+        if needs_refill is not None:
+            return bool(needs_refill())
+        return self._inner_min_pool_tokens() == 0
+
+    def _inner_available_tokens(self) -> int:
+        return int(getattr(self._inner, "available_tokens", self._inner_min_pool_tokens()))
+
+    def _inner_serving_tokens(self) -> int:
+        serving_tokens = getattr(self._inner, "serving_tokens", None)
+        if serving_tokens is not None:
+            return int(serving_tokens())
+        return self._inner_min_pool_tokens()
+
+    def _inner_storage_tokens(self) -> int:
+        storage_tokens = getattr(self._inner, "storage_tokens", None)
+        if storage_tokens is not None:
+            return int(storage_tokens())
+        return -1
+
+    def _inner_prefill_satisfied(self, prefill_satisfied: Any, target: int) -> bool:
+        if prefill_satisfied is not None:
+            return bool(prefill_satisfied(target))
+        return self._inner_min_pool_tokens() >= target
+
+    def _inner_min_pool_tokens(self) -> int:
+        return int(self._inner._min_pool_tokens())
+
+    def _desired_refill_chunks(self) -> int:
+        desired = getattr(self._inner, "desired_receiver_refill_chunks", None)
+        if desired is None:
+            desired = getattr(self._inner, "desired_refill_chunks", None)
+        if desired is None:
+            return 1
+        return max(1, int(desired()))
+
+    def _cuda_log(self, record: dict) -> None:
+        if self._cuda_log_path is None:
+            return
+        record["elapsed_s"] = time.time() - self._t_ready
+        with open(self._cuda_log_path, "a") as f:
+            json.dump(record, f)
+            f.write("\n")
+
+
+class GpuDirectDataProvider:
+    """Wraps GpuStreamingActivationProvider with GPU direct receive logic.
+
+    Blocks in __next__ to perform the control handshake when the inner
+    provider's pool is empty unless a background receiver is provided.
+    """
+
+    def __init__(
+        self,
+        inner,
+        gloo_ctrl_group: dist.ProcessGroup | None = None,
+        nccl_group: dist.ProcessGroup | None = None,
+        producer_global_rank: int | None = None,
+        d_model: int | None = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        cuda_log_path: Path | None = None,
+        receiver: GpuDirectReceiver | None = None,
+    ):
+        self._inner = inner
+        self._receiver = receiver
+        self._gloo_ctrl = gloo_ctrl_group
+        self._nccl_group = nccl_group
+        self._producer_rank = producer_global_rank
+        self._d_model = d_model
+        self._dtype = dtype
+        self._device = device
+        self._eof = False
+        self._closed = False
+        self._ctrl_buf = torch.zeros(4, dtype=torch.int32)
+        self._cuda_log_path = cuda_log_path
+        self._t_ready = time.time()
+        if self._cuda_log_path is not None:
+            self._cuda_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._cuda_log_path.write_text("")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> torch.Tensor | dict[str, torch.Tensor]:
+        if self._receiver is not None:
+            return self._receiver.next_batch()
+
+        while True:
+            try:
+                batch = next(self._inner)
+                self._refill_inner_to_high_watermark()
+                return batch
+            except StopIteration:
+                if self._eof:
+                    raise
+                self._refill_inner_to_high_watermark(force_one=True)
+
+    def close(self) -> None:
+        """Tell the producer that training ended before upstream EOF."""
+        if self._receiver is not None:
+            self._receiver.close()
+            self._closed = True
+            return
+        if self._closed or self._eof:
+            return
+        self._ctrl_buf.zero_()
+        self._ctrl_buf[0] = _MSG_CONSUMER_DONE
+        dist.send(self._ctrl_buf, dst=self._producer_rank, group=self._gloo_ctrl)
+        self._closed = True
+        self._cuda_log({"event": "consumer_done"})
+
+    def _request_and_recv(self, requested_chunks: int = 1) -> bool:
+        self._ctrl_buf.zero_()
+        self._ctrl_buf[0] = _MSG_REQUEST_DATA
+        self._ctrl_buf[1] = max(1, int(requested_chunks))
+        self._cuda_log({
+            "event": "request_data",
+            "producer_rank": self._producer_rank,
+            "requested_chunks": int(self._ctrl_buf[1]),
+        })
+        dist.send(self._ctrl_buf, dst=self._producer_rank, group=self._gloo_ctrl)
+
+        return self._recv_one_chunk()
+
+    def _recv_one_chunk(self) -> bool:
+        t0 = time.perf_counter()
+        dist.recv(self._ctrl_buf, src=self._producer_rank, group=self._gloo_ctrl)
+        wait_s = time.perf_counter() - t0
+        msg_type = int(self._ctrl_buf[0])
+
+        if msg_type == _MSG_EOF:
+            self._eof = True
+            self._inner.mark_eof()
+            self._cuda_log({"event": "eof", "wait_time_s": wait_s})
+            return False
+
+        assert msg_type == _MSG_DATA_READY
+        valid_tokens_per_hook = int(self._ctrl_buf[1])
+        dtype_code = int(self._ctrl_buf[2])
+        dtype = _GPU_DIRECT_CODE_DTYPES.get(dtype_code, self._dtype)
+        self._cuda_log({
+            "event": "data_ready",
+            "valid_tokens_per_hook": valid_tokens_per_hook,
+            "dtype_code": dtype_code,
+            "wait_time_s": wait_s,
+        })
+
+        self._ctrl_buf.zero_()
+        self._ctrl_buf[0] = _MSG_READY_TO_RECV
+        dist.send(self._ctrl_buf, dst=self._producer_rank, group=self._gloo_ctrl)
+
+        num_hooks = len(self._inner._pp_hook_names)
+        recv_rows = valid_tokens_per_hook * num_hooks
+        recv_buf = torch.empty(
+            recv_rows, self._d_model, dtype=dtype, device=self._device
+        )
+        t0 = time.perf_counter()
+        dist.broadcast(recv_buf, src=self._producer_rank, group=self._nccl_group)
+        nccl_time_s = time.perf_counter() - t0
+
+        self._inner.receive_chunk(recv_buf)
+        self._cuda_log({
+            "event": "nccl_recv_complete",
+            "rows": recv_rows,
+            "d_model": self._d_model,
+            "dtype": str(dtype).removeprefix("torch."),
+            "nccl_time_s": nccl_time_s,
+            "pool_tokens": self._inner._min_pool_tokens(),
+        })
+        return True
+
+    def _refill_inner_to_high_watermark(self, *, force_one: bool = False) -> None:
+        requested = 0
+        while not self._eof and (
+            force_one or self._inner_needs_refill()
+        ):
+            force_one = False
+            desired_chunks = self._desired_refill_chunks()
+            received = self._request_and_recv(desired_chunks)
+            if not received:
+                break
+            requested += 1
+            for _ in range(desired_chunks - 1):
+                if self._eof or not self._inner_needs_refill():
+                    break
+                if not self._recv_one_chunk():
+                    break
+                requested += 1
+        if requested > 0:
+            self._cuda_log({
+                "event": "refill_to_high_watermark",
+                "chunks": requested,
+                "available_tokens": self._inner_available_tokens(),
+                "pool_tokens": self._inner._min_pool_tokens(),
+            })
+
+    def _inner_needs_refill(self) -> bool:
+        receiver_needs_refill = getattr(self._inner, "receiver_needs_refill", None)
+        if receiver_needs_refill is not None:
+            return bool(receiver_needs_refill())
+        needs_refill = getattr(self._inner, "needs_refill", None)
+        if needs_refill is not None:
+            return bool(needs_refill())
+        return self._inner._min_pool_tokens() == 0
+
+    def _inner_available_tokens(self) -> int:
+        return int(getattr(self._inner, "available_tokens", self._inner._min_pool_tokens()))
+
+    def _desired_refill_chunks(self) -> int:
+        desired = getattr(self._inner, "desired_receiver_refill_chunks", None)
+        if desired is None:
+            desired = getattr(self._inner, "desired_refill_chunks", None)
+        if desired is None:
+            return 1
+        return max(1, int(desired()))
+
+    def _cuda_log(self, record: dict) -> None:
+        if self._cuda_log_path is None:
+            return
+        record["elapsed_s"] = time.time() - self._t_ready
+        with open(self._cuda_log_path, "a") as f:
+            json.dump(record, f)
+            f.write("\n")
 
 
 class InterruptedException(Exception):
@@ -170,7 +731,11 @@ class LanguageModelSAETrainingRunner:
         self.sae_dp_size = sae_dp_size
         self.sae_pp_size = sae_pp_size
         self.cfg.sae_pp_size = sae_pp_size
-        self.is_multi_sae = len(self.hook_names) > 1 or self.sae_pp_size > 1
+        self.is_multi_sae = (
+            len(self.hook_names) > 1
+            or self.sae_pp_size > 1
+            or os.environ.get("SAELENS_FORCE_MULTI_SAE_TRAINER", "0") == "1"
+        )
         if self.is_multi_sae and self.cfg.sae_dp_mode == "manual":
             logger.warning(
                 "Multi-layer/PP SAE training does not use manual DP sync; "
@@ -229,6 +794,44 @@ class LanguageModelSAETrainingRunner:
 
         self._quiesce_dir = quiesce_dir
         self.streaming_mode = streaming_mode or cfg.streaming_mode
+
+        # GPU direct streaming validation (must run before _streaming_init)
+        one_side_absent = vllm_dp_size == 0 or sae_dp_size == 0
+        if cfg.streaming_use_gpu_direct:
+            if not cfg.streaming_mode:
+                raise ValueError("streaming_use_gpu_direct requires streaming_mode=True")
+            if one_side_absent:
+                logger.warning(
+                    "streaming_use_gpu_direct=True but vllm_dp_size=%d sae_dp_size=%d; "
+                    "one side absent, falling back to shm path",
+                    vllm_dp_size, sae_dp_size,
+                )
+                self._use_gpu_direct = False
+            elif vllm_dp_size != 1 or sae_dp_size != 1:
+                raise ValueError(
+                    "streaming_use_gpu_direct requires vllm_dp_size=1 and sae_dp_size=1 "
+                    f"(got vllm_dp_size={vllm_dp_size}, sae_dp_size={sae_dp_size})"
+                )
+            elif (
+                self.vllm_tp_size != 1
+                or self.sae_tp_size != 1
+                or self.sae_pp_size != 1
+            ):
+                raise ValueError(
+                    "streaming_use_gpu_direct background receiver MVP requires "
+                    "vllm_tp_size=1, sae_tp_size=1, and sae_pp_size=1 "
+                    f"(got vllm_tp_size={self.vllm_tp_size}, "
+                    f"sae_tp_size={self.sae_tp_size}, sae_pp_size={self.sae_pp_size})"
+                )
+            else:
+                if cfg.streaming_staging_queue_capacity < 1:
+                    raise ValueError(
+                        "streaming_staging_queue_capacity must be >= 1"
+                    )
+                self._use_gpu_direct = True
+        else:
+            self._use_gpu_direct = False
+
         if self.streaming_mode:
             self._streaming_init(cfg)
             return
@@ -260,6 +863,7 @@ class LanguageModelSAETrainingRunner:
                     sae_tp_size=self.sae_tp_size,
                     batch_size=batch_size,
                     sae_pp_size=self.sae_pp_size,
+                    use_gpu_direct=cfg.streaming_use_gpu_direct,
                 )
             elif self.shared_tp_size is not None:
                 init_distributed(
@@ -336,6 +940,7 @@ class LanguageModelSAETrainingRunner:
                     "Prefix-overlap training does not yet support "
                     "normalize_activations='expected_average_only_in'."
                 )
+
         if self.is_multi_sae:
             requires_dp_wrapper = (
                 self.cached_activations_only and self.sae_dp_size > 1
@@ -485,31 +1090,44 @@ class LanguageModelSAETrainingRunner:
 
         if self.sae_active:
             if override_sae is None:
-                with temporary_seed(self.cfg.seed):
-                    if self.cfg.from_pretrained_path is not None:
-                        self.sae = TrainingSAE.load_from_disk(
-                            self.cfg.from_pretrained_path, self.cfg.device
-                        )
+                if self.sae_tp_size > 1:
+                    if self.use_shard_routing:
+                        import sae_lens.distributed_v2 as v2_mod
+                        tp_group = v2_mod.get_sae_tp_group()
                     else:
-                        self.sae = TrainingSAE.from_dict(
-                            TrainingSAEConfig.from_dict(
-                                self.cfg.get_training_sae_cfg_dict(),
-                            ).to_dict()
-                        )
+                        tp_group = get_tp_group()
+                else:
+                    tp_group = None
+                self.sae = self._create_training_sae(
+                    seed=self.cfg.seed,
+                    tp_group=tp_group,
+                    device=self.cfg.device,
+                    from_pretrained_path=self.cfg.from_pretrained_path,
+                )
             else:
                 self.sae = override_sae
-            self.sae.to(self.cfg.device)
+                self.sae.to(self.cfg.device)
         else:
             self.sae = None
 
-        # Shard SAE weights across TP ranks if applicable.
-        if self.sae is not None and self.sae_tp_size > 1:
+        # _create_training_sae already shards under TP>1; the legacy
+        # "init full then shard_weights" branch only applies to override_sae,
+        # which we still allow callers to pass in pre-built (e.g. tests).
+        if (
+            self.sae is not None
+            and self.sae_tp_size > 1
+            and override_sae is not None
+        ):
             if self.use_shard_routing:
                 import sae_lens.distributed_v2 as v2_mod
                 tp_group = v2_mod.get_sae_tp_group()
             else:
                 tp_group = get_tp_group()
-            if tp_group is not None and hasattr(self.sae, "shard_weights"):
+            if (
+                tp_group is not None
+                and hasattr(self.sae, "shard_weights")
+                and getattr(self.sae, "_tp_group", None) is None
+            ):
                 self.sae.shard_weights(tp_group)
 
         # _base_sae is always the raw module before any torch DP wrapper.
@@ -555,6 +1173,8 @@ class LanguageModelSAETrainingRunner:
                     process_group=sae_dp_group,
                     sharding_strategy=ShardingStrategy.FULL_SHARD,
                     use_orig_params=True,
+                    backward_prefetch=self._resolve_fsdp_backward_prefetch(),
+                    forward_prefetch=False,
                 )
             else:
                 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -580,6 +1200,62 @@ class LanguageModelSAETrainingRunner:
                 )
         else:
             self._compile_sae_if_needed()
+
+    def _create_training_sae(
+        self,
+        *,
+        seed: int,
+        tp_group: "dist.ProcessGroup | None",
+        device: str,
+        from_pretrained_path: str | None = None,
+        resume_checkpoint_path: str | None = None,
+        hook_metadata_overrides: dict[str, Any] | None = None,
+    ) -> TrainingSAE[Any]:
+        """Single SAE-construction code path used by every runner entry point.
+
+        TP=1: behaves exactly like the legacy ``temporary_seed +
+        TrainingSAE.from_dict/load_from_disk + .to(device)`` sequence.
+
+        TP>1: TopK-only. Calls ``TopKTrainingSAE.from_config_sharded`` so each
+        rank only ever materializes its local shard of W_enc/W_dec/b_enc; the
+        legacy "full init then shard_weights" path is not used. Pretrained or
+        resume checkpoints are read via the TP slice loader (only the local
+        rank's slice ever lands on the device).
+        """
+        from sae_lens.saes.topk_sae import TopKTrainingSAE, TopKTrainingSAEConfig
+
+        cfg_dict = self.cfg.get_training_sae_cfg_dict()
+        sae_cfg = TrainingSAEConfig.from_dict(cfg_dict)
+
+        is_tp = tp_group is not None and dist.get_world_size(tp_group) > 1
+        if is_tp and not isinstance(sae_cfg, TopKTrainingSAEConfig):
+            raise NotImplementedError(
+                f"sae_tp_size>1 only supports TopK; got {type(sae_cfg).__name__}"
+            )
+
+        sae_cfg.device = device
+        with temporary_seed(seed):
+            if is_tp:
+                assert isinstance(sae_cfg, TopKTrainingSAEConfig)
+                sae = TopKTrainingSAE.from_config_sharded(sae_cfg, tp_group)  # type: ignore[arg-type]
+            elif from_pretrained_path is not None:
+                sae = TrainingSAE.load_from_disk(from_pretrained_path, device)
+            else:
+                sae = TrainingSAE.from_dict(sae_cfg.to_dict())
+
+        if not is_tp:
+            sae.to(device)
+
+        if hook_metadata_overrides:
+            for key, value in hook_metadata_overrides.items():
+                setattr(sae.cfg.metadata, key, value)
+
+        if is_tp and from_pretrained_path is not None:
+            sae.load_weights_from_checkpoint(from_pretrained_path)
+        if resume_checkpoint_path is not None:
+            sae.load_weights_from_checkpoint(resume_checkpoint_path)
+
+        return sae
 
     def _init_multi_saes(self) -> None:
         if self.cfg.sae_dp_mode == "fsdp" and not dist.is_initialized():
@@ -630,24 +1306,6 @@ class LanguageModelSAETrainingRunner:
                 if self.cfg.multi_sae_seed_mode == "same"
                 else self.cfg.seed + idx
             )
-            with temporary_seed(seed):
-                sae = TrainingSAE.from_dict(
-                    TrainingSAEConfig.from_dict(
-                        self.cfg.get_training_sae_cfg_dict(),
-                    ).to_dict()
-                )
-            sae.to(self.cfg.device)
-            sae.cfg.metadata.hook_name = hook_name
-            sae.cfg.metadata.hook_head_index = self.cfg.hook_head_index
-            sae.cfg.metadata.dataset_path = self.cfg.dataset_path
-            sae.cfg.metadata.model_name = self.cfg.model_name
-            sae.cfg.metadata.model_class_name = self.cfg.model_class_name
-            sae.cfg.metadata.context_size = self.cfg.context_size
-            sae.cfg.metadata.seqpos_slice = self.cfg.seqpos_slice
-            sae.cfg.metadata.prepend_bos = self.cfg.prepend_bos
-            sae.cfg.metadata.exclude_special_tokens = self.cfg.exclude_special_tokens
-            self.base_sae_by_hook[hook_name] = sae
-
             if self.sae_tp_size > 1:
                 if self.use_shard_routing:
                     import sae_lens.distributed_v2 as v2_mod
@@ -655,8 +1313,25 @@ class LanguageModelSAETrainingRunner:
                     tp_group = v2_mod.get_sae_tp_group()
                 else:
                     tp_group = get_tp_group()
-                if tp_group is not None and hasattr(sae, "shard_weights"):
-                    sae.shard_weights(tp_group)
+            else:
+                tp_group = None
+            sae = self._create_training_sae(
+                seed=seed,
+                tp_group=tp_group,
+                device=self.cfg.device,
+                hook_metadata_overrides={
+                    "hook_name": hook_name,
+                    "hook_head_index": self.cfg.hook_head_index,
+                    "dataset_path": self.cfg.dataset_path,
+                    "model_name": self.cfg.model_name,
+                    "model_class_name": self.cfg.model_class_name,
+                    "context_size": self.cfg.context_size,
+                    "seqpos_slice": self.cfg.seqpos_slice,
+                    "prepend_bos": self.cfg.prepend_bos,
+                    "exclude_special_tokens": self.cfg.exclude_special_tokens,
+                },
+            )
+            self.base_sae_by_hook[hook_name] = sae
 
             wrapped: Any
             if self.cfg.sae_dp_mode == "fsdp":
@@ -668,6 +1343,8 @@ class LanguageModelSAETrainingRunner:
                     process_group=sae_dp_group,
                     sharding_strategy=ShardingStrategy.FULL_SHARD,
                     use_orig_params=True,
+                    backward_prefetch=self._resolve_fsdp_backward_prefetch(),
+                    forward_prefetch=False,
                 )
             elif sae_dp_world_size > 1:
                 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -734,6 +1411,24 @@ class LanguageModelSAETrainingRunner:
         logger.info(f"Effective DDP config: {effective}")
         return ddp_kwargs
 
+    def _resolve_fsdp_backward_prefetch(self) -> Any:
+        if self.cfg.fsdp_backward_prefetch == "none":
+            value = None
+        else:
+            from torch.distributed.fsdp.api import BackwardPrefetch
+
+            value = (
+                BackwardPrefetch.BACKWARD_PRE
+                if self.cfg.fsdp_backward_prefetch == "backward_pre"
+                else BackwardPrefetch.BACKWARD_POST
+            )
+        logger.info(
+            "Effective FSDP config: "
+            f"{{'backward_prefetch': {self.cfg.fsdp_backward_prefetch!r}, "
+            "'forward_prefetch': False}}"
+        )
+        return value
+
     def _sync_run_paths_across_ranks(self) -> None:
         if not dist.is_initialized() or dist.get_world_size() <= 1:
             return
@@ -749,10 +1444,16 @@ class LanguageModelSAETrainingRunner:
         if self.streaming_mode:
             import sae_lens.distributed_streaming as ds
             if ds.is_producer():
-                self._run_streaming_producer_loop()
+                if self._use_gpu_direct:
+                    self._run_gpu_direct_producer_loop()
+                else:
+                    self._run_streaming_producer_loop()
                 return None
             else:
-                return self._run_streaming_consumer_loop()
+                if self._use_gpu_direct:
+                    return self._run_gpu_direct_consumer_loop()
+                else:
+                    return self._run_streaming_consumer_loop()
 
         if self.use_shard_routing and self.vllm_active and not self.sae_active:
             self._load_producer_resume_state_if_needed()
@@ -1236,6 +1937,10 @@ class LanguageModelSAETrainingRunner:
         from sae_lens.training.shared_activation_buffer import SharedActivationBuffer
         from sae_lens.util import str_to_dtype
 
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        self.device = torch.device(f"cuda:{local_rank}")
+
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
 
@@ -1245,10 +1950,8 @@ class LanguageModelSAETrainingRunner:
             sae_tp=self.sae_tp_size,
             sae_dp=self.sae_dp_size,
             sae_pp_size=self.sae_pp_size,
+            use_gpu_direct=getattr(self, "_use_gpu_direct", False),
         )
-
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self.device = torch.device(f"cuda:{local_rank}")
 
         # Buffer name: rank 0 generates, all ranks receive via CUDA tensor broadcast (NCCL)
         buffer_name = cfg.streaming_buffer_name
@@ -1270,41 +1973,45 @@ class LanguageModelSAETrainingRunner:
         # Multi-hook: each chunk stores all hooks' activations concatenated.
         buf_chunk_size = cfg.streaming_chunk_size_tokens * self._streaming_num_hooks
 
-        # True when no existing buffer was provided — we just generated a fresh name.
-        # False on restart — cfg.streaming_buffer_name was set from control state.
-        is_new_buffer = not cfg.streaming_buffer_name
+        if getattr(self, "_use_gpu_direct", False):
+            self._streaming_buffer = None
+            dist.barrier()
+        else:
+            # True when no existing buffer was provided — we just generated a fresh name.
+            # False on restart — cfg.streaming_buffer_name was set from control state.
+            is_new_buffer = not cfg.streaming_buffer_name
 
-        # On first run: rank 0 creates the buffer, others attach after barrier.
-        # On restart: all ranks attach to the existing buffer (READY chunks preserved).
-        if is_new_buffer and dist.get_rank() == 0:
-            buffer_dtype = str_to_dtype(cfg.dtype)
-            SharedActivationBuffer.assert_has_space(
-                num_chunks=cfg.streaming_num_chunks,
-                chunk_size_tokens=buf_chunk_size,
-                d_model=cfg.sae.d_in,
-                dtype=buffer_dtype,
-            )
-            self._streaming_buffer = SharedActivationBuffer(
-                name=buffer_name,
-                num_chunks=cfg.streaming_num_chunks,
-                chunk_size_tokens=buf_chunk_size,
-                d_model=cfg.sae.d_in,
-                num_producers=self.vllm_dp_size,
-                target_chunks=target_chunks,
-                create=True,
-                dtype=buffer_dtype,
-            )
-        dist.barrier()
-        if not (is_new_buffer and dist.get_rank() == 0):
-            self._streaming_buffer = SharedActivationBuffer(
-                name=buffer_name,
-                num_chunks=cfg.streaming_num_chunks,
-                chunk_size_tokens=buf_chunk_size,
-                d_model=cfg.sae.d_in,
-                num_producers=self.vllm_dp_size,
-                target_chunks=target_chunks,
-                create=False,
-            )
+            # On first run: rank 0 creates the buffer, others attach after barrier.
+            # On restart: all ranks attach to the existing buffer (READY chunks preserved).
+            if is_new_buffer and dist.get_rank() == 0:
+                buffer_dtype = str_to_dtype(cfg.dtype)
+                SharedActivationBuffer.assert_has_space(
+                    num_chunks=cfg.streaming_num_chunks,
+                    chunk_size_tokens=buf_chunk_size,
+                    d_model=cfg.sae.d_in,
+                    dtype=buffer_dtype,
+                )
+                self._streaming_buffer = SharedActivationBuffer(
+                    name=buffer_name,
+                    num_chunks=cfg.streaming_num_chunks,
+                    chunk_size_tokens=buf_chunk_size,
+                    d_model=cfg.sae.d_in,
+                    num_producers=self.vllm_dp_size,
+                    target_chunks=target_chunks,
+                    create=True,
+                    dtype=buffer_dtype,
+                )
+            dist.barrier()
+            if not (is_new_buffer and dist.get_rank() == 0):
+                self._streaming_buffer = SharedActivationBuffer(
+                    name=buffer_name,
+                    num_chunks=cfg.streaming_num_chunks,
+                    chunk_size_tokens=buf_chunk_size,
+                    d_model=cfg.sae.d_in,
+                    num_producers=self.vllm_dp_size,
+                    target_chunks=target_chunks,
+                    create=False,
+                )
 
         self.sae_active = ds.is_consumer()
         self.vllm_active = ds.is_producer()
@@ -1403,27 +2110,25 @@ class LanguageModelSAETrainingRunner:
             self._streaming_init_consumer_multi(cfg)
             return
 
-        with temporary_seed(cfg.seed):
-            sae = TrainingSAE.from_dict(
-                TrainingSAEConfig.from_dict(
-                    cfg.get_training_sae_cfg_dict(),
-                ).to_dict()
-            )
-        sae.to(self.device)
-
         if self.sae_tp_size > 1:
             tp_group = ds.get_sae_tp_group()
-            if tp_group is not None and hasattr(sae, "shard_weights"):
-                sae.shard_weights(tp_group)
+        else:
+            tp_group = None
 
         if cfg.resume_from_checkpoint is not None:
             logger.info(
                 f"[streaming-consumer] Loading weights from checkpoint: "
                 f"{cfg.resume_from_checkpoint}"
             )
-            sae.load_weights_from_checkpoint(cfg.resume_from_checkpoint)
         else:
             logger.info("[streaming-consumer] No checkpoint to resume from — using fresh weights")
+
+        sae = self._create_training_sae(
+            seed=cfg.seed,
+            tp_group=tp_group,
+            device=str(self.device),
+            resume_checkpoint_path=cfg.resume_from_checkpoint,
+        )
 
         self._base_sae = sae
         self.sae = sae
@@ -1451,24 +2156,24 @@ class LanguageModelSAETrainingRunner:
                 if cfg.multi_sae_seed_mode == "same"
                 else cfg.seed + idx
             )
-            with temporary_seed(seed):
-                sae = TrainingSAE.from_dict(
-                    TrainingSAEConfig.from_dict(
-                        cfg.get_training_sae_cfg_dict(),
-                    ).to_dict()
-                )
-            sae.to(self.device)
-            sae.cfg.metadata.hook_name = hook_name
+            tp_group = ds.get_sae_tp_group() if self.sae_tp_size > 1 else None
 
-            if self.sae_tp_size > 1:
-                tp_group = ds.get_sae_tp_group()
-                if tp_group is not None and hasattr(sae, "shard_weights"):
-                    sae.shard_weights(tp_group)
-
+            hook_resume = None
             if cfg.resume_from_checkpoint is not None:
-                hook_ckpt = Path(cfg.resume_from_checkpoint) / sanitize_hook_name_for_path(hook_name)
+                hook_ckpt = (
+                    Path(cfg.resume_from_checkpoint)
+                    / sanitize_hook_name_for_path(hook_name)
+                )
                 if hook_ckpt.exists():
-                    sae.load_weights_from_checkpoint(str(hook_ckpt))
+                    hook_resume = str(hook_ckpt)
+
+            sae = self._create_training_sae(
+                seed=seed,
+                tp_group=tp_group,
+                device=str(self.device),
+                resume_checkpoint_path=hook_resume,
+                hook_metadata_overrides={"hook_name": hook_name},
+            )
 
             self.base_sae_by_hook[hook_name] = sae
             self.sae_by_hook[hook_name] = sae
@@ -1550,6 +2255,7 @@ class LanguageModelSAETrainingRunner:
                 )
             _shm_log({"event": "vllm_stopped_produce_ack", "total_chunks": chunk_step})
             if vllm_stopped_ack_path is not None:
+                vllm_stopped_ack_path.parent.mkdir(parents=True, exist_ok=True)
                 vllm_stopped_ack_path.touch()
 
         while True:
@@ -1652,8 +2358,263 @@ class LanguageModelSAETrainingRunner:
             buf.signal_done()
             _shm_log({"event": "producer_done", "total_chunks": chunk_step})
             if vllm_finished_ack_path is not None:
+                vllm_finished_ack_path.parent.mkdir(parents=True, exist_ok=True)
                 vllm_finished_ack_path.touch()
         buf.close()
+
+    def _run_gpu_direct_producer_loop(self) -> None:
+        import sae_lens.distributed_streaming as ds
+
+        vllm_tp_group = ds.get_vllm_tp_group()
+        is_tp_root = ds.is_vllm_tp_root()
+        tp_root_world = ds.get_producer_tp_root()
+        gloo_ctrl = ds.get_gloo_ctrl_group()
+        nccl_group = ds.get_streaming_nccl_group(0)
+
+        store = self.activations_store
+        chunk_size = self.cfg.streaming_chunk_size_tokens
+        num_hooks = len(self.hook_names)
+        consumer_global_rank = ds.get_consumer_tp_root()
+
+        ctrl = torch.zeros(1, dtype=torch.int32, device=self.device)
+        requested_chunks_ctrl = torch.zeros(1, dtype=torch.int32, device=self.device)
+        ctrl_msg = torch.zeros(4, dtype=torch.int32)
+
+        staging = VLLMProducerStagingQueue(
+            capacity=self.cfg.streaming_staging_queue_capacity,
+            chunk_shape=(chunk_size * num_hooks, self.cfg.sae.d_in),
+            device=self.device,
+        )
+        dataset_exhausted = False
+        chunks_sent = 0
+        cuda_log_path: Path | None = None
+        t_ready = time.time()
+        if is_tp_root and self.cfg.output_path is not None:
+            out_dir = Path(self.cfg.output_path)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            cuda_log_path = out_dir / "cuda_log_vllm.jsonl"
+            cuda_log_path.write_text("")
+
+        def _cuda_log(record: dict) -> None:
+            if cuda_log_path is None:
+                return
+            record["elapsed_s"] = time.time() - t_ready
+            with open(cuda_log_path, "a") as f:
+                json.dump(record, f)
+                f.write("\n")
+
+        def _generate_one() -> bool:
+            nonlocal dataset_exhausted
+            acts_gpu, valid_rows = store.get_streaming_activations_gpu(chunk_size)
+            if is_tp_root:
+                if acts_gpu is None:
+                    dataset_exhausted = True
+                    return False
+                vph = valid_rows // num_hooks
+                staging.try_push(acts_gpu, vph)
+                return True
+            return True
+
+        prefill_generated = self._refill_gpu_staging_until_full(
+            staging=staging,
+            is_tp_root=is_tp_root,
+            is_dataset_exhausted=lambda: dataset_exhausted,
+            generate_one=_generate_one,
+            ctrl=ctrl,
+            vllm_tp_group=vllm_tp_group,
+            tp_root_world=tp_root_world,
+        )
+
+        logger.info(
+            "[gpu-direct-producer] Pre-fill done: staging=%d exhausted=%s",
+            staging.count if is_tp_root else -1,
+            dataset_exhausted,
+        )
+        if is_tp_root:
+            _cuda_log({
+                "event": "prefill_complete",
+                "staging_count": staging.count,
+                "dataset_exhausted": dataset_exhausted,
+                "generated_chunks": prefill_generated,
+            })
+
+        # Main request-response loop
+        while True:
+            # TP root: block waiting for REQUEST_DATA
+            requested_chunks = 1
+            if is_tp_root:
+                t0 = time.perf_counter()
+                dist.recv(ctrl_msg, src=consumer_global_rank, group=gloo_ctrl)
+                request_wait_s = time.perf_counter() - t0
+                msg_type = int(ctrl_msg[0])
+                if msg_type == _MSG_CONSUMER_DONE:
+                    _cuda_log({
+                        "event": "consumer_done_received",
+                        "chunks_sent": chunks_sent,
+                        "request_wait_s": request_wait_s,
+                    })
+                    ctrl[0] = 4  # consumer stopped before producer EOF
+                else:
+                    assert msg_type == _MSG_REQUEST_DATA
+                    ctrl[0] = 0
+                    requested_chunks = max(1, int(ctrl_msg[1]))
+                _cuda_log({
+                    "event": "request_received",
+                    "consumer_rank": consumer_global_rank,
+                    "request_wait_s": request_wait_s,
+                    "requested_chunks": requested_chunks,
+                    "staging_count": staging.count,
+                    "dataset_exhausted": dataset_exhausted,
+                })
+                requested_chunks_ctrl[0] = requested_chunks
+
+                if int(ctrl[0]) == 4:
+                    pass
+                elif staging.count > 0:
+                    ctrl[0] = 1  # SEND
+                elif dataset_exhausted:
+                    ctrl[0] = 2  # EOF
+                else:
+                    ctrl[0] = 3  # NEED_GENERATE
+            if vllm_tp_group is not None:
+                dist.broadcast(
+                    requested_chunks_ctrl, src=tp_root_world, group=vllm_tp_group
+                )
+            requested_chunks = int(requested_chunks_ctrl[0])
+            if vllm_tp_group is not None:
+                dist.broadcast(ctrl, src=tp_root_world, group=vllm_tp_group)
+            action = int(ctrl[0])
+
+            if action == 4:
+                break
+
+            if action == 3:
+                _generate_one()
+                if is_tp_root:
+                    if staging.count > 0:
+                        action = 1
+                    elif dataset_exhausted:
+                        action = 2
+                    ctrl[0] = action
+                if vllm_tp_group is not None:
+                    dist.broadcast(ctrl, src=tp_root_world, group=vllm_tp_group)
+                action = int(ctrl[0])
+
+            if action == 2:
+                if is_tp_root:
+                    ctrl_msg[0] = _MSG_EOF
+                    ctrl_msg[1] = 0
+                    ctrl_msg[2] = 0
+                    ctrl_msg[3] = 0
+                    dist.send(ctrl_msg, dst=consumer_global_rank, group=gloo_ctrl)
+                    _cuda_log({
+                        "event": "eof_sent",
+                        "chunks_sent": chunks_sent,
+                    })
+                break
+
+            # action == 1: Send data
+            for _ in range(requested_chunks):
+                generated = self._refill_gpu_staging_until_full(
+                    staging=staging,
+                    is_tp_root=is_tp_root,
+                    is_dataset_exhausted=lambda: dataset_exhausted,
+                    generate_one=_generate_one,
+                    ctrl=ctrl,
+                    vllm_tp_group=vllm_tp_group,
+                    tp_root_world=tp_root_world,
+                )
+                if is_tp_root and generated > 0:
+                    _cuda_log({
+                        "event": "refill_complete",
+                        "generated_chunks": generated,
+                        "staging_count": staging.count,
+                        "dataset_exhausted": dataset_exhausted,
+                    })
+
+                if is_tp_root:
+                    if staging.count == 0:
+                        ctrl[0] = 2 if dataset_exhausted else 3
+                    else:
+                        ctrl[0] = 1
+                if vllm_tp_group is not None:
+                    dist.broadcast(ctrl, src=tp_root_world, group=vllm_tp_group)
+                send_action = int(ctrl[0])
+                if send_action == 2:
+                    if is_tp_root:
+                        ctrl_msg[0] = _MSG_EOF
+                        ctrl_msg[1] = 0
+                        ctrl_msg[2] = 0
+                        ctrl_msg[3] = 0
+                        dist.send(ctrl_msg, dst=consumer_global_rank, group=gloo_ctrl)
+                        _cuda_log({
+                            "event": "eof_sent",
+                            "chunks_sent": chunks_sent,
+                        })
+                    action = 2
+                    break
+                if send_action != 1:
+                    break
+
+                if is_tp_root:
+                    chunk_tensor, valid_tph = staging.pop()
+                    ctrl_msg[0] = _MSG_DATA_READY
+                    ctrl_msg[1] = valid_tph
+                    ctrl_msg[2] = _GPU_DIRECT_DTYPE_CODES.get(chunk_tensor.dtype, 0)
+                    ctrl_msg[3] = 0
+                    dist.send(ctrl_msg, dst=consumer_global_rank, group=gloo_ctrl)
+                    t_ready_to_recv = time.perf_counter()
+                    dist.recv(ctrl_msg, src=consumer_global_rank, group=gloo_ctrl)
+                    ready_wait_s = time.perf_counter() - t_ready_to_recv
+                    assert int(ctrl_msg[0]) == _MSG_READY_TO_RECV
+                    t_nccl = time.perf_counter()
+                    dist.broadcast(chunk_tensor, src=dist.get_rank(), group=nccl_group)
+                    nccl_time_s = time.perf_counter() - t_nccl
+                    chunks_sent += 1
+                    _cuda_log({
+                        "event": "chunk_sent",
+                        "chunk": chunks_sent,
+                        "valid_tokens_per_hook": valid_tph,
+                        "rows": int(chunk_tensor.shape[0]),
+                        "d_model": int(chunk_tensor.shape[1]),
+                        "dtype": str(chunk_tensor.dtype).removeprefix("torch."),
+                        "ready_wait_s": ready_wait_s,
+                        "nccl_time_s": nccl_time_s,
+                        "staging_count_after_pop": staging.count,
+                    })
+                elif nccl_group is not None:
+                    # Non-root producer TP ranks do not join the streaming NCCL
+                    # group in the vllm_tp=1 MVP.
+                    pass
+
+            if action == 2:
+                break
+
+        logger.info("[gpu-direct-producer] Done: sent %d chunks", chunks_sent)
+
+    @staticmethod
+    def _refill_gpu_staging_until_full(
+        *,
+        staging: VLLMProducerStagingQueue,
+        is_tp_root: bool,
+        is_dataset_exhausted: Any,
+        generate_one: Any,
+        ctrl: torch.Tensor,
+        vllm_tp_group: dist.ProcessGroup | None,
+        tp_root_world: int,
+    ) -> int:
+        """Generate chunks until the GPU staging queue is full or data ends."""
+        generated = 0
+        while True:
+            if is_tp_root:
+                ctrl[0] = 0 if (staging.is_full or is_dataset_exhausted()) else 1
+            if vllm_tp_group is not None:
+                dist.broadcast(ctrl, src=tp_root_world, group=vllm_tp_group)
+            if int(ctrl[0]) == 0:
+                break
+            if generate_one():
+                generated += 1
+        return generated
 
     def _run_streaming_consumer_loop(self) -> TrainingSAE[Any]:
         import sae_lens.distributed_streaming as ds
@@ -1725,6 +2686,77 @@ class LanguageModelSAETrainingRunner:
             return self._run_streaming_consumer_multi(provider, ds)
         return self._run_streaming_consumer_single(provider, ds)
 
+    def _run_gpu_direct_consumer_loop(self) -> TrainingSAE[Any]:
+        import sae_lens.distributed_streaming as ds
+        from sae_lens import distributed_v2
+        from sae_lens.training.gpu_streaming_activation_provider import (
+            GpuStreamingActivationProvider,
+        )
+        from sae_lens.util import str_to_dtype
+
+        gloo_ctrl = ds.get_gloo_ctrl_group()
+        nccl_group = ds.get_streaming_nccl_group(0)
+        producer_global_rank = distributed_v2.get_producer_tp_root(0)
+        cuda_log_path: Path | None = None
+        if self.cfg.output_path is not None:
+            out_dir = Path(self.cfg.output_path)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            cuda_log_path = out_dir / "cuda_log_sae.jsonl"
+
+        pp_hook_names = (
+            self._pp_hook_names
+            if self.is_multi_sae and hasattr(self, "_pp_hook_names")
+            else self.hook_names
+        )
+
+        inner = GpuStreamingActivationProvider(
+            pp_hook_names=pp_hook_names,
+            is_multi_sae=self.is_multi_sae,
+            train_batch_size_tokens=self.cfg.train_batch_size_tokens,
+            d_model=self.cfg.sae.d_in,
+            shuffle=self.cfg.streaming_shuffle,
+            buffer_size=self.cfg.n_batches_in_buffer
+            * len(range(self.cfg.context_size)[slice(*self.cfg.seqpos_slice)]),
+            mix_fraction=self.cfg.activations_mixing_fraction,
+            mixing_seed=self.cfg.seed,
+            mixing_shard_index=0,
+            device=self.device,
+        )
+
+        receiver = GpuDirectReceiver(
+            inner=inner,
+            gloo_ctrl_group=gloo_ctrl,
+            nccl_group=nccl_group,
+            producer_global_rank=producer_global_rank,
+            d_model=self.cfg.sae.d_in,
+            dtype=str_to_dtype(self.cfg.dtype),
+            device=self.device,
+            cuda_log_path=cuda_log_path,
+        )
+        receiver.start()
+
+        prefill_chunks = self.cfg.streaming_consumer_prefill_chunks
+        if prefill_chunks > 0:
+            requested_target_tokens = (
+                prefill_chunks * self.cfg.streaming_chunk_size_tokens
+            )
+            logger.info(
+                "[gpu-direct-consumer] Waiting for prefill: %d chunks "
+                "(%d requested tokens)",
+                prefill_chunks,
+                requested_target_tokens,
+            )
+            receiver.wait_for_prefill(requested_target_tokens)
+
+        provider = GpuDirectDataProvider(
+            inner=inner,
+            receiver=receiver,
+        )
+
+        if self.is_multi_sae:
+            return self._run_streaming_consumer_multi(provider, ds)
+        return self._run_streaming_consumer_single(provider, ds)
+
     def _run_streaming_consumer_single(self, provider: Any, ds: Any) -> TrainingSAE[Any]:
         trainer = SAETrainer(
             sae=self.sae,
@@ -1770,8 +2802,12 @@ class LanguageModelSAETrainingRunner:
                 )
                 self._streaming_save_checkpoint(checkpoint_path)
             raise
+        finally:
+            if isinstance(provider, GpuDirectDataProvider):
+                provider.close()
 
-        self._streaming_buffer.close()
+        if self._streaming_buffer is not None:
+            self._streaming_buffer.close()
 
         if self.cfg.output_path is not None:
             self._streaming_save_final(sae, self.cfg.output_path, trainer.log_feature_sparsity)
@@ -1797,7 +2833,7 @@ class LanguageModelSAETrainingRunner:
             backward_mode=self.cfg.multi_sae_backward_mode,
             seed_mode=self.cfg.multi_sae_seed_mode,
             append_logs=self.cfg.resume_from_checkpoint is not None
-            or self.cfg.append_history_logs,
+            or getattr(self.cfg, "append_history_logs", False),
         )
 
         if self.cfg.resume_from_checkpoint is not None:
@@ -1826,8 +2862,12 @@ class LanguageModelSAETrainingRunner:
                     checkpoint_name=str(trainer.n_training_samples)
                 )
             raise
+        finally:
+            if isinstance(provider, GpuDirectDataProvider):
+                provider.close()
 
-        self._streaming_buffer.close()
+        if self._streaming_buffer is not None:
+            self._streaming_buffer.close()
 
         if self.cfg.output_path is not None:
             trainer.save_final(self.cfg.output_path)

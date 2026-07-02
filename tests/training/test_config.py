@@ -119,6 +119,17 @@ def test_LanguageModelSAERunnerConfig_to_dict_and_from_dict():
     assert cfg == LanguageModelSAERunnerConfig.from_dict(cfg_dict)
 
 
+def test_vllm_max_num_batched_tokens_is_passed_to_vllm_kwargs():
+    cfg = LanguageModelSAERunnerConfig(
+        sae=StandardTrainingSAEConfig(d_in=5, d_sae=10),
+        model_class_name="VLLMModel",
+        vllm_max_num_batched_tokens=2048,
+    )
+
+    assert cfg.model_from_pretrained_kwargs is not None
+    assert cfg.model_from_pretrained_kwargs["max_num_batched_tokens"] == 2048
+
+
 def test_LanguageModelSAERunnerConfig_errors_when_loading_from_dict_with_missing_fields():
     cfg = LanguageModelSAERunnerConfig(
         sae=StandardTrainingSAEConfig(d_in=5, d_sae=10),

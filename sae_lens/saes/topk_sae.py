@@ -1,6 +1,8 @@
 """Inference-only TopKSAE variant, similar in spirit to StandardSAE but using a TopK-based activation."""
 
+import copy
 import json
+import math
 import os
 from pathlib import Path
 from dataclasses import dataclass
@@ -23,6 +25,7 @@ from sae_lens.saes.sae import (
     TrainingSAEConfig,
     TrainStepInput,
 )
+from sae_lens.util import str_to_dtype
 
 
 class SparseHookPoint(HookPoint):
@@ -388,9 +391,45 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
 
     def __init__(self, cfg: TopKTrainingSAEConfig, use_error_term: bool = False):
         super().__init__(cfg, use_error_term)
-        self._tp_group: dist.ProcessGroup | None = None
         self.hook_sae_acts_post = SparseHookPoint(self.cfg.d_sae)
         self.setup()
+
+    @classmethod
+    def from_config_sharded(
+        cls,
+        cfg: TopKTrainingSAEConfig,
+        tp_group: dist.ProcessGroup,
+        use_error_term: bool = False,
+    ) -> "TopKTrainingSAE":
+        """Create a TP-sharded ``TopKTrainingSAE`` without ever materializing
+        the full weight tensors.
+
+        The resulting SAE's local parameters are bit-identical to the legacy
+        path of constructing a full SAE under the same ``torch`` RNG state and
+        then calling ``shard_weights(tp_group)`` (CPU initialization is used so
+        that bit-equivalence holds regardless of the requested device — TP-aware
+        training that previously relied on CUDA-RNG initialization will see
+        different weights, by design).
+        """
+        tp_size = dist.get_world_size(tp_group)
+        tp_rank = dist.get_rank(tp_group)
+        target_device = torch.device(cfg.device)
+
+        # Run __init__ on a meta-device cfg so the standard initialize_weights
+        # chain doesn't allocate full-size storage.
+        meta_cfg = copy.deepcopy(cfg)
+        meta_cfg.device = "meta"
+        sae = cls(meta_cfg, use_error_term=use_error_term)
+        sae.cfg = copy.deepcopy(cfg)
+        sae.device = target_device
+
+        w_dec, w_enc, b_enc, b_dec = _shard_init_topk_cpu(cfg, tp_size, tp_rank)
+        sae.W_dec = nn.Parameter(w_dec.to(target_device))
+        sae.W_enc = nn.Parameter(w_enc.to(target_device))
+        sae.b_enc = nn.Parameter(b_enc.to(target_device))
+        sae.b_dec = nn.Parameter(b_dec.to(target_device))
+        sae._tp_group = tp_group
+        return sae
 
     def _tp_param_shard_dims(self) -> dict[str, int | None]:
         return {
@@ -442,6 +481,11 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
         Each rank owns d_sae // tp_size latents.  W_enc, W_dec, and b_enc are
         sliced in-place; self._tp_group is set so that encode/decode use
         allgather / allreduce to coordinate across ranks.
+
+        Implementation note: the slice tensors are ``.clone()``-d before being
+        swapped into ``Parameter.data`` so the underlying full-size storage's
+        refcount drops to zero and is freed. ``narrow().contiguous()`` alone is
+        a view, which would keep the full storage alive.
         """
         tp_rank = dist.get_rank(tp_group)
         tp_size = dist.get_world_size(tp_group)
@@ -452,9 +496,13 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
         start = tp_rank * shard_size
         end = start + shard_size
         self._tp_group = tp_group
-        self.W_enc = nn.Parameter(self.W_enc.data[:, start:end].contiguous())
-        self.W_dec = nn.Parameter(self.W_dec.data[start:end, :].contiguous())
-        self.b_enc = nn.Parameter(self.b_enc.data[start:end].contiguous())
+        with torch.no_grad():
+            self.W_enc.data = self.W_enc.data[:, start:end].contiguous().clone()
+            self.W_dec.data = self.W_dec.data[start:end, :].contiguous().clone()
+            self.b_enc.data = self.b_enc.data[start:end].contiguous().clone()
+        self.W_enc.grad = None
+        self.W_dec.grad = None
+        self.b_enc.grad = None
 
     @override
     def process_state_dict_for_saving(self, state_dict: dict[str, Any]) -> None:
@@ -804,6 +852,75 @@ def _init_weights_topk(
     sae.b_enc = nn.Parameter(
         torch.zeros(sae.cfg.d_sae, dtype=sae.dtype, device=sae.device)
     )
+
+
+_RNG_CHUNK_NUMEL = 4 * 1024 * 1024
+
+
+def _advance_cpu_rng(numel: int, dtype: torch.dtype, bound: float) -> None:
+    """Advance the CPU MT19937 by ``numel`` uniform_(-bound, bound) draws.
+
+    Uses a fixed-size scratch buffer that is reused across iterations so peak
+    temporary memory is bounded by ``_RNG_CHUNK_NUMEL`` elements regardless of
+    ``numel``. Equivalence with a single ``torch.empty(numel).uniform_(...)``
+    call is enforced by ``test_chunked_skip_matches_single_uniform``.
+    """
+    if numel <= 0:
+        return
+    scratch = torch.empty(min(numel, _RNG_CHUNK_NUMEL), dtype=dtype, device="cpu")
+    remaining = numel
+    while remaining > 0:
+        n = min(remaining, scratch.numel())
+        scratch.narrow(0, 0, n).uniform_(-bound, bound)
+        remaining -= n
+
+
+def _shard_init_topk_cpu(
+    cfg: "TopKTrainingSAEConfig",
+    tp_size: int,
+    tp_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bit-equivalent CPU shard initialization for ``TopKTrainingSAE``.
+
+    Reproduces the row-major slice of the legacy full-init path:
+
+        full = torch.empty(d_sae, d_in, dtype, "cpu"); full.uniform_(-b, b)
+        shard = full[r*S:(r+1)*S].contiguous()
+
+    followed by ``TrainingSAE``'s per-row decoder norm (if ``decoder_init_norm``
+    is set) and ``_init_weights_topk``'s ``b_enc=0``. The pre/post skip calls
+    keep the CPU MT19937 state aligned with a single full-tensor ``uniform_``
+    of length ``d_sae * d_in`` so external code in the same ``temporary_seed``
+    scope sees the same RNG endpoint regardless of TP size or rank.
+
+    Returns ``(W_dec_shard, W_enc_shard, b_enc_shard, b_dec_full)`` on CPU.
+    """
+    assert cfg.d_sae % tp_size == 0, (
+        f"d_sae={cfg.d_sae} must be divisible by tp_size={tp_size}"
+    )
+    shard_size = cfg.d_sae // tp_size
+    dtype = str_to_dtype(cfg.dtype)
+    # kaiming_uniform_ defaults: a=0, mode='fan_in', nonlinearity='leaky_relu'
+    # → gain = sqrt(2), bound = gain * sqrt(3 / fan_in) = sqrt(6 / d_in)
+    bound = math.sqrt(6.0 / cfg.d_in)
+
+    pre_numel = tp_rank * shard_size * cfg.d_in
+    post_numel = (tp_size - tp_rank - 1) * shard_size * cfg.d_in
+
+    _advance_cpu_rng(pre_numel, dtype, bound)
+    w_dec_shard = torch.empty(shard_size, cfg.d_in, dtype=dtype, device="cpu")
+    w_dec_shard.uniform_(-bound, bound)
+    _advance_cpu_rng(post_numel, dtype, bound)
+
+    if cfg.decoder_init_norm is not None:
+        with torch.no_grad():
+            w_dec_shard /= w_dec_shard.norm(dim=-1, keepdim=True)
+            w_dec_shard *= cfg.decoder_init_norm
+
+    w_enc_shard = w_dec_shard.T.contiguous()
+    b_enc_shard = torch.zeros(shard_size, dtype=dtype, device="cpu")
+    b_dec_full = torch.zeros(cfg.d_in, dtype=dtype, device="cpu")
+    return w_dec_shard, w_enc_shard, b_enc_shard, b_dec_full
 
 
 def _fold_norm_topk(

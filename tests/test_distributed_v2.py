@@ -33,6 +33,8 @@ def _run_init(
     Q: int,
     vllm_tp: int = 1,
     sae_tp: int = 1,
+    sae_pp: int = 1,
+    disjoint: bool = False,
     batch_size: int = 60,
 ) -> list:
     """Call init_distributed_v2 for the given rank, return list of new_group call args."""
@@ -53,6 +55,8 @@ def _run_init(
             P=P, Q=Q,
             vllm_tp_size=vllm_tp,
             sae_tp_size=sae_tp,
+            sae_pp_size=sae_pp,
+            disjoint=disjoint,
             batch_size=batch_size,
         )
     return new_group_calls
@@ -92,6 +96,18 @@ def test_init_v2_wrong_world_size_raises() -> None:
 def test_init_v2_no_divisibility_check() -> None:
     """5:3 should succeed without divisibility constraint."""
     _run_init(0, 5, P=5, Q=3)  # world = max(5,3) = 5
+
+
+def test_init_v2_sae_only_disjoint_pp2_uses_two_endpoint_ranks() -> None:
+    """P=0, Q=1, sae_pp=2, sae_tp=1 -> world=2 and one SAE DP consumer."""
+    _run_init(1, 2, P=0, Q=1, sae_tp=1, sae_pp=2, disjoint=True)
+    assert not v2_mod._is_producer
+    assert v2_mod._is_consumer
+    assert v2_mod._consumer_idx == 0
+    assert v2_mod._sae_dp_idx == 0
+    assert v2_mod._sae_pp_rank == 1
+    assert v2_mod._num_sae_stage_endpoints == 2
+    assert v2_mod._sae_endpoint_world_ranks == {0: [0], 1: [1]}
 
 
 # ---------------------------------------------------------------------------
@@ -140,21 +156,21 @@ def test_init_v2_producer_only_large_producer_block() -> None:
 
 
 def test_init_v2_new_group_total_count_3_1() -> None:
-    """P=3, Q=1: P + Q + sae_tp_size + Q = 3+1+1+1 = 6 new_group calls."""
+    """P=3, Q=1: P + endpoints + DP groups + replica groups + P2P = 7 calls."""
     calls = _run_init(0, 3, P=3, Q=1)
-    assert len(calls) == 6
+    assert len(calls) == 7
 
 
 def test_init_v2_new_group_total_count_2_3() -> None:
-    """P=2, Q=3: P + Q + sae_tp_size + Q = 2+3+1+3 = 9 new_group calls."""
+    """P=2, Q=3: P + endpoints + DP groups + replica groups + P2P = 12 calls."""
     calls = _run_init(0, 3, P=2, Q=3)
-    assert len(calls) == 9
+    assert len(calls) == 12
 
 
 def test_init_v2_new_group_total_count_with_tp() -> None:
-    """P=2, Q=2, vllm_tp=2, sae_tp=2: 2+2+2+2 = 8 new_group calls."""
+    """P=2, Q=2, vllm_tp=2, sae_tp=2: includes 2 replica groups."""
     calls = _run_init(0, 4, P=2, Q=2, vllm_tp=2, sae_tp=2)
-    assert len(calls) == 8
+    assert len(calls) == 10
 
 
 # ---------------------------------------------------------------------------

@@ -294,9 +294,30 @@ class ActivationsStore:
         self.model = model
         if model_kwargs is None:
             model_kwargs = {}
-        self.model_kwargs = model_kwargs
+        self.model_kwargs = dict(model_kwargs)
         self._consumer_only = consumer_only
         self._skip_raw_dataset_load = skip_raw_dataset_load
+        self._vllm_memory_every_n_steps = int(
+            self.model_kwargs.pop("vllm_memory_every_n_steps", 0) or 0
+        )
+        self._vllm_memory_probe_layer = self.model_kwargs.pop(
+            "vllm_memory_probe_layer", None
+        )
+        self._vllm_memory_history_path = self.model_kwargs.pop(
+            "vllm_memory_history_path", None
+        )
+        vllm_memory_timeline_step = self.model_kwargs.pop(
+            "vllm_memory_timeline_step", -1
+        )
+        self._vllm_memory_timeline_step = (
+            -1
+            if vllm_memory_timeline_step is None
+            else int(vllm_memory_timeline_step)
+        )
+        self._vllm_memory_timeline_path = self.model_kwargs.pop(
+            "vllm_memory_timeline_path", None
+        )
+        self._vllm_memory_capture_step = 0
         if skip_raw_dataset_load:
             self.dataset = None  # type: ignore[assignment]
         elif isinstance(dataset, str):
@@ -533,11 +554,11 @@ class ActivationsStore:
         # We assume that all necessary BOS/EOS/SEP tokens have been added during pretokenization.
         if self.is_dataset_tokenized:
             for row in self._iterate_raw_dataset():
-                yield (
-                    row[: self.context_size]  # If self.context_size = None, this line simply returns the whole row
-                    .detach()
-                    .clone()
-                    .to(dtype=torch.long, device=self.device)
+                if not isinstance(row, torch.Tensor):
+                    row = torch.as_tensor(row)
+                yield row[: self.context_size].detach().clone().to(
+                    dtype=torch.long,
+                    device=self.device,
                 )
         # If the dataset isn't tokenized, we'll tokenize, concat, and batch on the fly
         else:
@@ -891,12 +912,15 @@ class ActivationsStore:
             dtype=torch.bfloat16,
             enabled=self.autocast_lm and model_device.type != "cpu",
         ):
+            run_kwargs = dict(self.model_kwargs)
+            vllm_memory_kwargs = self._next_vllm_memory_kwargs()
+            run_kwargs.update(vllm_memory_kwargs)
             layerwise_activations_cache = self.model.run_with_cache(
                 batch_tokens,
                 names_filter=hook_names,
                 stop_at_layer=stop_at_layer,
                 prepend_bos=False,
-                **self.model_kwargs,
+                **run_kwargs,
             )[1]
 
         activations_by_hook = {
@@ -908,6 +932,72 @@ class ActivationsStore:
         if self.is_multi_hook:
             return activations_by_hook
         return activations_by_hook[self.hook_name]
+
+    def _next_vllm_memory_kwargs(self) -> dict[str, Any]:
+        timeline_current_step = self._vllm_memory_capture_step
+        self._vllm_memory_capture_step += 1
+        timeline_enabled = (
+            self._vllm_memory_timeline_step >= 0
+            and self._vllm_memory_timeline_path is not None
+            and timeline_current_step == self._vllm_memory_timeline_step
+        )
+        probe_enabled = (
+            self._vllm_memory_every_n_steps > 0
+            and self._vllm_memory_capture_step % self._vllm_memory_every_n_steps == 0
+            and self._vllm_memory_probe_layer is not None
+            and self._vllm_memory_history_path is not None
+        )
+        if not probe_enabled and not timeline_enabled:
+            return {}
+
+        kwargs: dict[str, Any] = {
+            "vllm_memory_step": self._vllm_memory_capture_step,
+            "vllm_memory_n_training_samples": (
+                self._vllm_memory_capture_step
+                * self.store_batch_size_prompts
+                * self.training_context_size
+            ),
+        }
+        if timeline_enabled:
+            kwargs.update(
+                {
+                    "vllm_memory_timeline_step": self._vllm_memory_timeline_step,
+                    "vllm_memory_timeline_current_step": timeline_current_step,
+                    "vllm_memory_timeline_path": self._vllm_memory_timeline_path,
+                }
+            )
+        if not probe_enabled:
+            return kwargs
+
+        if (
+            self._vllm_memory_probe_layer is None
+            or self._vllm_memory_history_path is None
+        ):
+            return kwargs
+        rank = int(os.environ.get("LOCAL_RANK", "0"))
+        producer_idx: int | None = None
+        vllm_tp_rank: int | None = None
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            try:
+                import sae_lens.distributed_v2 as v2_mod
+
+                if getattr(v2_mod, "_initialized", False) and v2_mod.is_producer():
+                    producer_idx = int(v2_mod.get_producer_idx())
+                    vllm_tp_rank = int(v2_mod.get_vllm_tp_rank())
+            except ImportError:
+                producer_idx = None
+                vllm_tp_rank = None
+        kwargs.update(
+            {
+                "vllm_memory_probe_layer": self._vllm_memory_probe_layer,
+                "vllm_memory_history_path": self._vllm_memory_history_path,
+                "vllm_memory_rank": rank,
+                "vllm_memory_producer_idx": producer_idx,
+                "vllm_memory_tp_rank": vllm_tp_rank,
+            }
+        )
+        return kwargs
 
     def get_streaming_activations(
         self, chunk_size_tokens: int
@@ -1047,6 +1137,132 @@ class ActivationsStore:
                 full = full[:chunk_size_tokens]
 
         return full, full.shape[0]
+
+    def get_streaming_activations_gpu(
+        self, chunk_size_tokens: int
+    ) -> tuple[torch.Tensor | None, int]:
+        """Gather up to chunk_size_tokens activations for GPU direct streaming.
+
+        ALL vLLM TP ranks must call this together. Similar to get_streaming_activations()
+        but keeps residuals on GPU (no .cpu() call).
+
+        Returns:
+            (acts_gpu, valid_rows_total) on TP root — shape (<=chunk_size_tokens * len(all_hooks), d_model).
+                valid_rows_total = valid_tokens_per_hook * len(all_hooks).
+            (None, 0) on TP non-root ranks (always).
+            (None, 0) on TP root when dataset is exhausted.
+        """
+        import os
+
+        import sae_lens.distributed_streaming as ds
+
+        tp_group = ds.get_vllm_tp_group()
+        tp_root_world = ds.get_producer_tp_root()
+        is_root = ds.is_vllm_tp_root()
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        ctrl_dev = torch.device(f"cuda:{local_rank}")
+        ctrl = torch.zeros(1, dtype=torch.int32, device=ctrl_dev)
+
+        if is_root and not hasattr(self, "_stream_residual_gpu"):
+            self._stream_residual_gpu: torch.Tensor | None = None
+            self._stream_exhausted_gpu = False
+            self._stream_collected_by_hook_gpu: dict[str, list[torch.Tensor]] = {}
+
+        if is_root:
+            collected: list[torch.Tensor] = []
+            if self.is_multi_hook:
+                if not self._stream_collected_by_hook_gpu:
+                    self._stream_collected_by_hook_gpu = {h: [] for h in self.hook_names}
+                tokens_so_far = sum(
+                    t.shape[0] for t in self._stream_collected_by_hook_gpu[self.hook_names[0]]
+                )
+            else:
+                if self._stream_residual_gpu is not None:
+                    collected.append(self._stream_residual_gpu)
+                    self._stream_residual_gpu = None
+                tokens_so_far = sum(t.shape[0] for t in collected)
+
+        while True:
+            if is_root:
+                if self._stream_exhausted_gpu or tokens_so_far >= chunk_size_tokens:
+                    ctrl[0] = 0
+                else:
+                    try:
+                        batch_tokens = self._get_batch_tokens_local(
+                            self.store_batch_size_prompts
+                        )
+                        ctrl[0] = 1
+                    except StopIteration:
+                        self._stream_exhausted_gpu = True
+                        ctrl[0] = 0
+            if tp_group is not None:
+                dist.broadcast(ctrl, src=tp_root_world, group=tp_group)
+            if int(ctrl[0]) == 0:
+                break
+
+            if tp_group is not None:
+                if not is_root:
+                    batch_tokens = torch.zeros(
+                        self.store_batch_size_prompts,
+                        self.context_size,
+                        dtype=torch.long,
+                        device=ctrl_dev,
+                    )
+                batch_tokens_cuda = batch_tokens.to(ctrl_dev)
+                dist.broadcast(batch_tokens_cuda, src=tp_root_world, group=tp_group)
+                batch_tokens = batch_tokens_cuda
+
+            acts = self._get_activations_local(batch_tokens)
+
+            if is_root:
+                if isinstance(acts, dict):
+                    if not hasattr(self, "_stream_collected_by_hook_gpu"):
+                        self._stream_collected_by_hook_gpu: dict[str, list[torch.Tensor]] = {
+                            h: [] for h in self.hook_names
+                        }
+                    for hook_name in self.hook_names:
+                        a = acts[hook_name]
+                        if a.ndim == 3:
+                            a = a.reshape(-1, a.shape[-1])
+                        self._stream_collected_by_hook_gpu[hook_name].append(a)
+                    tokens_so_far += next(iter(acts.values())).reshape(-1, acts[self.hook_names[0]].shape[-1]).shape[0]
+                else:
+                    if acts.ndim == 3:
+                        acts = acts.reshape(-1, acts.shape[-1])
+                    collected.append(acts)
+                    tokens_so_far += acts.shape[0]
+
+        if not is_root:
+            return None, 0
+
+        if tokens_so_far == 0:
+            return None, 0
+
+        if self.is_multi_hook:
+            num_hooks = len(self.hook_names)
+            per_hook_cats = [
+                torch.cat(self._stream_collected_by_hook_gpu[h], dim=0)
+                for h in self.hook_names
+            ]
+            trimmed = [cat[:chunk_size_tokens] for cat in per_hook_cats]
+            full = torch.cat(trimmed, dim=0)
+            for i, h in enumerate(self.hook_names):
+                if per_hook_cats[i].shape[0] > chunk_size_tokens:
+                    self._stream_collected_by_hook_gpu[h] = [per_hook_cats[i][chunk_size_tokens:]]
+                else:
+                    self._stream_collected_by_hook_gpu[h] = []
+        else:
+            full = torch.cat(collected, dim=0)
+            if full.shape[0] > chunk_size_tokens:
+                self._stream_residual_gpu = full[chunk_size_tokens:]
+                full = full[:chunk_size_tokens]
+
+        valid_rows_total = full.shape[0]
+        assert valid_rows_total % len(self.hook_names) == 0, (
+            f"valid_rows_total={valid_rows_total} not divisible by len(hook_names)={len(self.hook_names)}"
+        )
+        return full, valid_rows_total
 
     def _postprocess_hook_activations(
         self, layerwise_activations: torch.Tensor
@@ -1235,6 +1451,7 @@ class ActivationsStore:
     def get_raw_llm_batch(
         self,
         raise_on_epoch_end: bool = False,
+        batch_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Loads the next batch of activations from the LLM and returns it.
@@ -1254,9 +1471,10 @@ class ActivationsStore:
             return self._load_raw_llm_batch_from_cached(raise_on_epoch_end)
 
         # move batch toks to gpu for model
-        batch_tokens = self.get_batch_tokens(raise_at_epoch_end=raise_on_epoch_end).to(
-            _get_model_device(self.model)
-        )
+        batch_tokens = self.get_batch_tokens(
+            batch_size=batch_size,
+            raise_at_epoch_end=raise_on_epoch_end,
+        ).to(_get_model_device(self.model))
         activations_raw = self.get_activations(batch_tokens)
         if isinstance(activations_raw, dict):
             activations = {

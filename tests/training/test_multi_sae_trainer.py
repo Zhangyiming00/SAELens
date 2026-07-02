@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import pickle
+import time
 from collections.abc import Iterator
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from sae_lens.config import LoggingConfig, SAETrainerConfig
 from sae_lens.saes.topk_sae import TopKTrainingSAE
 from sae_lens.training.multi_sae_trainer import MultiSAETrainer
+from sae_lens.training.multi_sae_trainer import _load_hook_optimizer_state_safetensors
+from sae_lens.training.multi_sae_trainer import _load_tp_sharded_state_dict
+from sae_lens.training.multi_sae_trainer import _save_hook_optimizer_state_safetensors
 from sae_lens.training.shared_activation_buffer import SharedActivationBuffer
 from sae_lens.training.streaming_activation_provider import StreamingActivationProvider
 from tests.helpers import assert_close, build_topk_sae_training_cfg, random_params
@@ -42,6 +50,8 @@ def _make_trainer_cfg(
         save_mse_every_n_steps=0,
         save_timing_every_n_steps=0,
         save_memory_every_n_steps=0,
+        record_memory_empty_cache=False,
+        record_memory_timeline_step=-1,
         synchronize_timing=False,
         multi_sae_backward_order="forward",
         multi_sae_stats_sync_mode="immediate",
@@ -58,6 +68,7 @@ def _make_trainer_cfg(
         feature_sampling_window=100,
         autocast=False,
         checkpoint_path=str(tmp_path / "checkpoints"),
+        quiesce_checkpoint_path=None,
         save_final_checkpoint=False,
         logger=LoggingConfig(log_to_wandb=False),
     )
@@ -185,6 +196,317 @@ def test_checkpoint_round_trip_preserves_all_state(tmp_path: Path) -> None:
         fresh_trainer.lr_scheduler.state_dict()
         == trainer.lr_scheduler.state_dict()
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="device sampler is cuda-only")
+def test_device_sampler_writes_timestamped_records(tmp_path: Path) -> None:
+    sae_by_hook = {hook: _make_sae().to("cuda") for hook in HOOK_NAMES}
+    cfg = _make_trainer_cfg(tmp_path, total_training_samples=100)
+    cfg.device = "cuda"
+    cfg.output_path = str(tmp_path / "out")
+    cfg.save_memory_every_n_steps = 1
+    trainer = MultiSAETrainer(
+        hook_names=HOOK_NAMES,
+        sae_by_hook=sae_by_hook,
+        base_sae_by_hook=sae_by_hook,
+        data_provider=iter([]),
+        save_checkpoint_fn=None,
+        cfg=cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+    trainer._device_sampler_interval_s = 0.02
+
+    trainer._start_device_sampler()
+    # Allocate after sampling starts so device_used must reflect a real load.
+    scratch = torch.empty(64 * 1024 * 1024 // 4, device="cuda")  # 64 MB
+    time.sleep(0.25)
+    del scratch
+    trainer._stop_device_sampler()
+
+    assert trainer._device_sampler_thread is None
+    rows = [
+        json.loads(line)
+        for line in trainer.device_history_path.read_text().splitlines()
+    ]
+    # ~0.25s at 0.02s interval -> several samples; require at least a handful.
+    assert len(rows) >= 5
+    times = [r["t_s"] for r in rows]
+    assert times == sorted(times)
+    assert all(r["device_used_mb"] > 0 for r in rows)
+    # device_used is the OS watermark and must be >= this process' reserved pool.
+    assert all(r["device_used_mb"] >= r["reserved_mb"] for r in rows)
+    assert all(r["reserved_mb"] >= r["allocated_mb"] for r in rows)
+
+
+def test_append_history_logs_preserves_existing_multi_sae_history(tmp_path: Path) -> None:
+    cfg = _make_trainer_cfg(tmp_path, total_training_samples=100)
+    cfg.output_path = str(tmp_path / "out")
+    cfg.save_mse_every_n_steps = 1
+    cfg.save_timing_every_n_steps = 1
+    output = Path(cfg.output_path)
+    output.mkdir()
+    (output / "mse_history.jsonl").write_text('{"existing": "mse"}\n')
+    (output / "timing_history.jsonl").write_text('{"existing": "timing"}\n')
+
+    sae_by_hook = {hook: _make_sae() for hook in HOOK_NAMES}
+    MultiSAETrainer(
+        hook_names=HOOK_NAMES,
+        sae_by_hook=sae_by_hook,
+        base_sae_by_hook=sae_by_hook,
+        data_provider=_make_data_provider(1),
+        save_checkpoint_fn=None,
+        cfg=cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+        append_logs=True,
+    )
+
+    assert (output / "mse_history.jsonl").read_text() == '{"existing": "mse"}\n'
+    assert (output / "timing_history.jsonl").read_text() == '{"existing": "timing"}\n'
+
+
+def test_save_final_writes_pp_local_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _make_trainer_cfg(tmp_path, total_training_samples=100)
+    cfg.output_path = str(tmp_path / "out")
+    trainer = MultiSAETrainer(
+        hook_names=HOOK_NAMES,
+        sae_by_hook={hook: _make_sae() for hook in HOOK_NAMES},
+        base_sae_by_hook={hook: _make_sae() for hook in HOOK_NAMES},
+        data_provider=_make_data_provider(1),
+        save_checkpoint_fn=None,
+        cfg=cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+
+    monkeypatch.setattr("sae_lens.training.multi_sae_trainer.dist.is_available", lambda: True)
+    monkeypatch.setattr("sae_lens.training.multi_sae_trainer.dist.is_initialized", lambda: True)
+    monkeypatch.setattr("sae_lens.training.multi_sae_trainer.dist.get_rank", lambda group=None: 1)
+    monkeypatch.setattr(trainer, "_pp_rank", lambda: 1)
+    monkeypatch.setattr(trainer, "_tp_rank", lambda: 0)
+    monkeypatch.setattr(trainer, "_dp_rank", lambda: 0)
+
+    trainer.save_final(cfg.output_path)
+
+    local_manifest = Path(cfg.output_path) / "multi_sae_manifest_pp1_rank1.json"
+    assert local_manifest.exists()
+    manifest = json.loads(local_manifest.read_text())
+    assert manifest["hook_names"] == HOOK_NAMES
+
+
+def test_record_mse_non_writer_pp_stage_writes_rank_local_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _make_trainer_cfg(tmp_path, total_training_samples=100)
+    cfg.output_path = str(tmp_path / "out")
+    cfg.save_mse_every_n_steps = 1
+    trainer = MultiSAETrainer(
+        hook_names=[HOOK_NAMES[1]],
+        sae_by_hook={HOOK_NAMES[1]: _make_sae()},
+        base_sae_by_hook={HOOK_NAMES[1]: _make_sae()},
+        data_provider=_make_data_provider(1),
+        save_checkpoint_fn=None,
+        cfg=cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+
+    class Output:
+        loss = torch.tensor(2.25)
+        losses = {"mse_loss": torch.tensor(2.0)}
+        sae_out = torch.zeros(1, D_IN)
+        sae_in = torch.ones(1, D_IN)
+
+    monkeypatch.setattr("sae_lens.training.multi_sae_trainer.dist.is_available", lambda: True)
+    monkeypatch.setattr("sae_lens.training.multi_sae_trainer.dist.is_initialized", lambda: True)
+    monkeypatch.setattr("sae_lens.training.multi_sae_trainer.dist.get_rank", lambda group=None: 1)
+    monkeypatch.setattr(trainer, "_pp_rank", lambda: 1)
+    monkeypatch.setattr(trainer, "_tp_rank", lambda: 0)
+    monkeypatch.setattr(trainer, "_dp_rank", lambda: 0)
+
+    trainer.n_training_samples = BATCH
+    trainer._record_mse_if_needed({HOOK_NAMES[1]: Output()}, local_n=BATCH)  # type: ignore[arg-type]
+
+    records = [
+        json.loads(line)
+        for line in (
+            Path(cfg.output_path) / "mse_history_pp1_rank1.jsonl"
+        ).read_text().splitlines()
+    ]
+    assert records[0]["pp_rank"] == 1
+    assert set(records[0]["hooks"]) == {HOOK_NAMES[1]}
+    assert records[0]["hooks"][HOOK_NAMES[1]]["mse_loss"] == 2.0
+
+
+def test_multi_sae_checkpoint_stores_adam_outside_root_trainer_state(
+    tmp_path: Path,
+) -> None:
+    trainer = _build_trainer(tmp_path, total_samples=100, n_batches=1)
+    batch = next(_make_data_provider(1))
+    batch_by_hook = {
+        hook: trainer.activation_scaler_by_hook[hook](batch[hook])
+        for hook in HOOK_NAMES
+    }
+    trainer._train_step(batch_by_hook, BATCH)
+    trainer.n_training_samples += BATCH
+    trainer.n_training_steps += 1
+
+    ckpt_dir = tmp_path / "ckpt"
+    trainer.save_trainer_state(ckpt_dir)
+    for hook_name in HOOK_NAMES:
+        trainer._save_one_checkpoint_model(ckpt_dir, hook_name)
+
+    root_state = torch.load(ckpt_dir / "trainer_state.pt", map_location="cpu")
+    assert "optimizer_by_hook_by_name" not in root_state
+    for hook_name in HOOK_NAMES:
+        hook_dir = ckpt_dir / hook_name.replace(".", "_")
+        assert (hook_dir / "optimizer_state.safetensors").exists()
+        hook_state = torch.load(hook_dir / "hook_state.pt", map_location="cpu")
+        assert "optimizer_state" not in hook_state
+
+    resumed = _build_trainer(tmp_path / "resume", total_samples=100, n_batches=1)
+    resumed.load_trainer_state(ckpt_dir)
+    assert resumed.n_training_samples == trainer.n_training_samples
+    assert resumed.n_training_steps == trainer.n_training_steps
+    assert len(resumed.optimizer.state) == len(trainer.optimizer.state)
+
+
+def test_load_tp_sharded_state_dict_reads_only_local_slices(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    weights_path = tmp_path / "sae_weights.safetensors"
+    save_file(
+        {
+            "W_enc": torch.arange(32, dtype=torch.float32).reshape(4, 8),
+            "W_dec": torch.arange(48, dtype=torch.float32).reshape(8, 6),
+            "b_enc": torch.arange(8, dtype=torch.float32),
+            "b_dec": torch.arange(4, dtype=torch.float32),
+        },
+        weights_path,
+    )
+    base_sae = SimpleNamespace(
+        _tp_param_shard_dims=lambda: {
+            "W_enc": 1,
+            "W_dec": 0,
+            "b_enc": 0,
+            "b_dec": None,
+        }
+    )
+    monkeypatch.setattr(
+        "sae_lens.training.multi_sae_trainer.dist.get_world_size",
+        lambda group: 2,
+    )
+    monkeypatch.setattr(
+        "sae_lens.training.multi_sae_trainer.dist.get_rank",
+        lambda group: 1,
+    )
+    monkeypatch.setattr(
+        "sae_lens.training.multi_sae_trainer.dist.scatter",
+        lambda *args, **kwargs: pytest.fail(
+            "TP checkpoint load must not scatter CPU tensors"
+        ),
+    )
+    monkeypatch.setattr(
+        "sae_lens.training.multi_sae_trainer.dist.broadcast",
+        lambda *args, **kwargs: pytest.fail(
+            "TP checkpoint load must not broadcast CPU tensors"
+        ),
+    )
+
+    state = _load_tp_sharded_state_dict(weights_path, base_sae, object())
+
+    assert torch.equal(
+        state["W_enc"],
+        torch.arange(32, dtype=torch.float32).reshape(4, 8)[:, 4:8],
+    )
+    assert torch.equal(
+        state["W_dec"],
+        torch.arange(48, dtype=torch.float32).reshape(8, 6)[4:8, :],
+    )
+    assert torch.equal(state["b_enc"], torch.arange(8, dtype=torch.float32)[4:8])
+    assert torch.equal(state["b_dec"], torch.arange(4, dtype=torch.float32))
+
+
+def test_hook_optimizer_safetensors_loads_tp2_slices_and_tp1_full(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hook_dir = tmp_path / "hook"
+    hook_dir.mkdir()
+    optimizer_state = {
+        "W_enc": {
+            "step": torch.tensor(3.0),
+            "exp_avg": torch.arange(32, dtype=torch.float32).reshape(4, 8),
+            "exp_avg_sq": torch.arange(100, 132, dtype=torch.float32).reshape(4, 8),
+        },
+        "W_dec": {
+            "step": torch.tensor(3.0),
+            "exp_avg": torch.arange(48, dtype=torch.float32).reshape(8, 6),
+        },
+        "b_enc": {
+            "step": torch.tensor(3.0),
+            "exp_avg": torch.arange(8, dtype=torch.float32),
+        },
+        "b_dec": {
+            "step": torch.tensor(3.0),
+            "exp_avg": torch.arange(4, dtype=torch.float32),
+        },
+    }
+    _save_hook_optimizer_state_safetensors(hook_dir, optimizer_state)
+    base_sae = SimpleNamespace(
+        _tp_param_shard_dims=lambda: {
+            "W_enc": 1,
+            "W_dec": 0,
+            "b_enc": 0,
+            "b_dec": None,
+        }
+    )
+
+    full = _load_hook_optimizer_state_safetensors(
+        hook_dir,
+        base_sae,
+        tp_group=None,
+    )
+    assert torch.equal(full["W_enc"]["exp_avg"], optimizer_state["W_enc"]["exp_avg"])
+    assert torch.equal(full["W_dec"]["exp_avg"], optimizer_state["W_dec"]["exp_avg"])
+    assert torch.equal(full["b_enc"]["exp_avg"], optimizer_state["b_enc"]["exp_avg"])
+    assert torch.equal(full["b_dec"]["exp_avg"], optimizer_state["b_dec"]["exp_avg"])
+
+    monkeypatch.setattr(
+        "sae_lens.training.multi_sae_trainer.dist.get_world_size",
+        lambda group: 2,
+    )
+    monkeypatch.setattr(
+        "sae_lens.training.multi_sae_trainer.dist.get_rank",
+        lambda group: 1,
+    )
+    local = _load_hook_optimizer_state_safetensors(hook_dir, base_sae, object())
+
+    assert torch.equal(
+        local["W_enc"]["exp_avg"],
+        optimizer_state["W_enc"]["exp_avg"][:, 4:8],
+    )
+    assert torch.equal(
+        local["W_enc"]["exp_avg_sq"],
+        optimizer_state["W_enc"]["exp_avg_sq"][:, 4:8],
+    )
+    assert torch.equal(
+        local["W_dec"]["exp_avg"],
+        optimizer_state["W_dec"]["exp_avg"][4:8, :],
+    )
+    assert torch.equal(
+        local["b_enc"]["exp_avg"],
+        optimizer_state["b_enc"]["exp_avg"][4:8],
+    )
+    assert torch.equal(local["b_dec"]["exp_avg"], optimizer_state["b_dec"]["exp_avg"])
+    assert torch.equal(local["W_enc"]["step"], optimizer_state["W_enc"]["step"])
 
 
 def test_checkpoint_resume_mismatched_hooks_raises(tmp_path: Path) -> None:
@@ -629,6 +951,8 @@ def _make_gpu_trainer_cfg(
         save_mse_every_n_steps=0,
         save_timing_every_n_steps=0,
         save_memory_every_n_steps=0,
+        record_memory_empty_cache=False,
+        record_memory_timeline_step=-1,
         synchronize_timing=False,
         multi_sae_backward_order="forward",
         multi_sae_stats_sync_mode="immediate",
@@ -645,6 +969,7 @@ def _make_gpu_trainer_cfg(
         feature_sampling_window=100,
         autocast=False,
         checkpoint_path=str(tmp_path / "checkpoints"),
+        quiesce_checkpoint_path=None,
         save_final_checkpoint=False,
         logger=LoggingConfig(log_to_wandb=False),
     )
@@ -862,3 +1187,123 @@ def test_gpu_streaming_multi_hook_checkpoint_resume(tmp_path: Path) -> None:
             )
 
     torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_data_provider_buffer_bytes_sums_gpu_streaming_shapes(tmp_path: Path) -> None:
+    trainer = _build_trainer(tmp_path, total_samples=BATCH, n_batches=1)
+    # GpuStreamingActivationProvider-shaped buffers: two dicts of tensors plus
+    # a list-of-dicts chunk buffer. 4 + 8 + 2 = 14 fp32 rows of width D_IN.
+    pool = {h: torch.zeros(4, D_IN, device="cuda") for h in HOOK_NAMES}
+    serving = {h: torch.zeros(8, D_IN, device="cuda") for h in HOOK_NAMES}
+    chunk_buffer = [{h: torch.zeros(2, D_IN, device="cuda") for h in HOOK_NAMES}]
+    trainer.data_provider = SimpleNamespace(
+        _pool_by_hook=pool,
+        _serving_by_hook=serving,
+        _chunk_buffer=chunk_buffer,
+    )
+    expected = len(HOOK_NAMES) * (4 + 8 + 2) * D_IN * 4
+    assert trainer._data_provider_buffer_bytes(set()) == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_data_provider_buffer_bytes_handles_single_mixing_pool(
+    tmp_path: Path,
+) -> None:
+    trainer = _build_trainer(tmp_path, total_samples=BATCH, n_batches=1)
+    # StreamingActivationProvider-shaped buffer: one _mixing_pool tensor.
+    trainer.data_provider = SimpleNamespace(
+        _mixing_pool=torch.zeros(7, D_IN, device="cuda")
+    )
+    assert trainer._data_provider_buffer_bytes(set()) == 7 * D_IN * 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_data_provider_buffer_bytes_recurses_into_inner(tmp_path: Path) -> None:
+    trainer = _build_trainer(tmp_path, total_samples=BATCH, n_batches=1)
+    # GpuDirectDataProvider wraps an inner provider; buffers live on _inner.
+    inner = SimpleNamespace(
+        _pool_by_hook={h: torch.zeros(3, D_IN, device="cuda") for h in HOOK_NAMES}
+    )
+    trainer.data_provider = SimpleNamespace(_inner=inner)
+    assert trainer._data_provider_buffer_bytes(set()) == (
+        len(HOOK_NAMES) * 3 * D_IN * 4
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_data_provider_buffer_bytes_dedupes_against_seen_batch(
+    tmp_path: Path,
+) -> None:
+    trainer = _build_trainer(tmp_path, total_samples=BATCH, n_batches=1)
+    served = torch.zeros(4, D_IN, device="cuda")
+    residual = torch.zeros(5, D_IN, device="cuda")
+    # The pool still references `served` (already counted as the batch) plus a
+    # not-yet-served `residual`. With a shared `seen`, only the residual counts.
+    trainer.data_provider = SimpleNamespace(
+        _pool_by_hook={HOOK_NAMES[0]: served, HOOK_NAMES[1]: residual}
+    )
+    seen: set[int] = set()
+    trainer._tensor_tree_bytes(served, seen)  # pretend already counted as batch
+    assert trainer._data_provider_buffer_bytes(seen) == 5 * D_IN * 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_data_provider_buffer_bytes_ignores_non_cuda_tensors(
+    tmp_path: Path,
+) -> None:
+    trainer = _build_trainer(tmp_path, total_samples=BATCH, n_batches=1)
+    # A cross-process pool is not Python-reachable; a CPU pool stands in for
+    # "not on this process's cuda device" and must contribute nothing.
+    trainer.data_provider = SimpleNamespace(
+        _mixing_pool=torch.zeros(7, D_IN, device="cpu")
+    )
+    assert trainer._data_provider_buffer_bytes(set()) == 0
+
+
+def test_memory_timeline_disabled_by_default(tmp_path: Path) -> None:
+    trainer = _build_trainer(tmp_path, total_samples=BATCH, n_batches=1)
+    assert trainer._memory_timeline_step == -1
+    assert trainer.memory_timeline_path is None
+    # Hooks must be inert when disabled (no recorder started, no dump).
+    trainer._maybe_start_memory_timeline()
+    assert trainer._memory_timeline_active is False
+    trainer._maybe_stop_memory_timeline()  # no-op, must not raise
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_memory_timeline_dumps_pickle_for_target_step(tmp_path: Path) -> None:
+    sae_by_hook = {hook: _make_sae().to("cuda") for hook in HOOK_NAMES}
+    cfg = _make_trainer_cfg(tmp_path, total_training_samples=3 * BATCH)
+    cfg.device = "cuda"
+    cfg.output_path = str(tmp_path / "out")
+    cfg.save_memory_every_n_steps = 1
+    cfg.record_memory_timeline_step = 1
+    provider = _make_data_provider(3, seed=7)
+    trainer = MultiSAETrainer(
+        hook_names=HOOK_NAMES,
+        sae_by_hook=sae_by_hook,
+        base_sae_by_hook=sae_by_hook,
+        data_provider=provider,
+        save_checkpoint_fn=None,
+        cfg=cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+    expected = Path(cfg.output_path) / f"memory_timeline_rank{trainer._memory_rank}.pickle"
+    assert trainer.memory_timeline_path == expected
+
+    trainer.fit()
+
+    # Recording is scoped to exactly the target step and stopped afterwards.
+    assert trainer._memory_timeline_active is False
+    assert expected.exists()
+    assert expected.stat().st_size > 0
+    # The dumped snapshot must be a loadable allocator history with events.
+    with open(expected, "rb") as f:
+        snapshot = pickle.load(f)
+    assert snapshot["device_traces"] or snapshot["segments"]
+
+
+

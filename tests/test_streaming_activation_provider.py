@@ -9,14 +9,20 @@ import pytest
 import torch
 
 from sae_lens.training.streaming_activation_provider import StreamingActivationProvider
+from sae_lens.training.mixing_buffer import mixing_buffer
 
 
 def _make_sequential_buffer(chunks: list[torch.Tensor]) -> MagicMock:
     """Buffer that yields chunks one at a time in order, then raises StopIteration."""
     buf = MagicMock()
+    buf._chunk_size_tokens = chunks[0].shape[0] if chunks else 0
     remaining = list(chunks)
 
-    def acquire_up_to(n, random=True):
+    def acquire_up_to(n, random=True, refcount=1, stop_check=None):
+        _ = n
+        _ = random
+        _ = refcount
+        _ = stop_check
         if not remaining:
             raise StopIteration
         return [0], 0.0
@@ -44,6 +50,29 @@ def _provider(buf, batch_size: int, d_model: int, prefetch: int = 1):
         sae_tp_rank=0,
         sae_tp_root_global_rank=0,
         d_model=d_model,
+    )
+
+
+def _provider_with_mix(
+    buf,
+    batch_size: int,
+    d_model: int,
+    *,
+    mix_chunks: int,
+    mix_fraction: float = 0.5,
+):
+    return StreamingActivationProvider(
+        buffer=buf,
+        train_batch_size_tokens=batch_size,
+        prefetch_chunks=1,
+        device=torch.device("cpu"),
+        sae_tp_group=None,
+        sae_tp_rank=0,
+        sae_tp_root_global_rank=0,
+        d_model=d_model,
+        shuffle=False,
+        mix_chunks=mix_chunks,
+        mix_fraction=mix_fraction,
     )
 
 
@@ -97,6 +126,238 @@ def test_final_partial_batch_not_dropped():
     sizes = _drain(p)
     assert sum(sizes) == 50
     assert sizes == [32, 18]
+
+
+def test_drain_local_pool_stops_acquiring_new_chunks():
+    d_model = 4
+    chunks = [
+        torch.randn(96, d_model, dtype=torch.bfloat16),
+        torch.randn(96, d_model, dtype=torch.bfloat16),
+    ]
+    buf = _make_sequential_buffer(chunks)
+    p = _provider(buf, batch_size=32, d_model=d_model)
+
+    first = next(p)
+    assert first.shape[0] == 32
+    p.request_drain_local_pool()
+
+    sizes = [first.shape[0]]
+    with pytest.raises(StopIteration):
+        while True:
+            sizes.append(next(p).shape[0])
+
+    assert sizes == [32, 32, 32]
+    assert buf.acquire_up_to.call_count == 1
+    assert p.consumed_tokens == 96
+
+
+def test_external_stop_check_drains_without_new_acquire():
+    d_model = 4
+    chunks = [
+        torch.randn(96, d_model, dtype=torch.bfloat16),
+        torch.randn(96, d_model, dtype=torch.bfloat16),
+    ]
+    stop = {"value": False}
+    buf = _make_sequential_buffer(chunks)
+    p = StreamingActivationProvider(
+        buffer=buf,
+        train_batch_size_tokens=32,
+        prefetch_chunks=1,
+        device=torch.device("cpu"),
+        sae_tp_group=None,
+        sae_tp_rank=0,
+        sae_tp_root_global_rank=0,
+        d_model=d_model,
+        stop_acquire_check=lambda: stop["value"],
+    )
+
+    next(p)
+    stop["value"] = True
+    sizes = _drain(p)
+
+    assert sizes == [32, 32]
+    assert buf.acquire_up_to.call_count == 1
+
+
+def test_streaming_local_mixing_keeps_bounded_window():
+    d_model = 1
+    chunks = [
+        torch.arange(0, 64, dtype=torch.float32).reshape(-1, 1),
+        torch.arange(64, 128, dtype=torch.float32).reshape(-1, 1),
+        torch.arange(128, 192, dtype=torch.float32).reshape(-1, 1),
+    ]
+    buf = _make_sequential_buffer(chunks)
+    p = _provider_with_mix(
+        buf, batch_size=32, d_model=d_model, mix_chunks=2, mix_fraction=0.5
+    )
+
+    sizes = _drain(p)
+
+    assert sum(sizes) == 192
+    assert sizes == [32, 32, 32, 32, 32, 32]
+
+
+def test_streaming_local_mixing_waits_for_full_mixing_buffer():
+    d_model = 1
+    chunks = [
+        torch.arange(0, 32, dtype=torch.float32).reshape(-1, 1),
+        torch.arange(32, 64, dtype=torch.float32).reshape(-1, 1),
+        torch.arange(64, 96, dtype=torch.float32).reshape(-1, 1),
+    ]
+    buf = _make_sequential_buffer(chunks)
+    p = _provider_with_mix(
+        buf, batch_size=16, d_model=d_model, mix_chunks=3, mix_fraction=0.5
+    )
+
+    first = next(p)
+
+    assert first.shape == (16, 1)
+    assert buf.read_chunk.call_count == 3
+
+
+def test_streaming_local_mixing_matches_standard_mixing_buffer():
+    d_model = 1
+    chunks = [
+        torch.arange(0, 32, dtype=torch.float32).reshape(-1, 1),
+        torch.arange(32, 64, dtype=torch.float32).reshape(-1, 1),
+        torch.arange(64, 96, dtype=torch.float32).reshape(-1, 1),
+    ]
+    buf = _make_sequential_buffer([chunk.clone() for chunk in chunks])
+    p = StreamingActivationProvider(
+        buffer=buf,
+        train_batch_size_tokens=16,
+        prefetch_chunks=1,
+        device=torch.device("cpu"),
+        sae_tp_group=None,
+        sae_tp_rank=0,
+        sae_tp_root_global_rank=0,
+        d_model=d_model,
+        shuffle=True,
+        mix_chunks=3,
+        mix_fraction=0.5,
+        mixing_seed=123,
+    )
+    streaming = torch.cat([batch for batch in p], dim=0)
+
+    gen = torch.Generator()
+    gen.manual_seed(123)
+    standard = torch.cat(
+        list(
+            mixing_buffer(
+                buffer_size=96,
+                batch_size=16,
+                activations_loader=iter(chunks),
+                mix_fraction=0.5,
+                generator=gen,
+            )
+        ),
+        dim=0,
+    )
+
+    assert torch.equal(streaming, standard)
+
+
+def test_tp_mixing_uses_same_shuffle_order_across_ranks(monkeypatch):
+    import torch.distributed as dist
+
+    fake_group = MagicMock()
+    broadcasted: list[torch.Tensor] = []
+
+    def fake_broadcast(tensor, src, group):
+        assert src == 0
+        assert group is fake_group
+        if not broadcasted:
+            broadcasted.append(tensor.detach().clone())
+        else:
+            tensor.copy_(broadcasted[0])
+
+    def make_provider(tp_rank: int) -> StreamingActivationProvider:
+        buf = MagicMock()
+        buf._chunk_size_tokens = 4
+        provider = StreamingActivationProvider(
+            buffer=buf,
+            train_batch_size_tokens=2,
+            prefetch_chunks=1,
+            device=torch.device("cpu"),
+            sae_tp_group=fake_group,
+            sae_tp_rank=tp_rank,
+            sae_tp_root_global_rank=0,
+            d_model=1,
+            shuffle=True,
+            mix_chunks=2,
+            mix_fraction=0.0,
+        )
+        provider._pool = torch.arange(0, 4, dtype=torch.float32).reshape(-1, 1)
+        provider._pool_start = 0
+        provider._pool_len = 4
+        provider._mixing_pool = torch.arange(4, 8, dtype=torch.float32).reshape(-1, 1)
+        return provider
+
+    monkeypatch.setattr(dist, "broadcast", fake_broadcast)
+    new_data = torch.arange(8, 12, dtype=torch.float32).reshape(-1, 1)
+
+    root = make_provider(tp_rank=0)
+    torch.manual_seed(1)
+    root._merge_into_mixing_pool(new_data)
+
+    follower = make_provider(tp_rank=1)
+    torch.manual_seed(2)
+    follower._merge_into_mixing_pool(new_data)
+
+    assert torch.equal(root._pool, follower._pool)
+    assert torch.equal(root._mixing_pool, follower._mixing_pool)
+
+
+def test_multi_hook_mixing_shuffle_preserves_hook_pairing(monkeypatch):
+    buf = MagicMock()
+    buf._chunk_size_tokens = 4
+    p = StreamingActivationProvider(
+        buffer=buf,
+        train_batch_size_tokens=2,
+        prefetch_chunks=1,
+        device=torch.device("cpu"),
+        sae_tp_group=None,
+        sae_tp_rank=0,
+        sae_tp_root_global_rank=0,
+        d_model=1,
+        shuffle=True,
+        mix_chunks=2,
+        mix_fraction=0.5,
+        hook_names=["h0", "h1"],
+    )
+    prepared = torch.tensor(
+        [
+            [0.0],
+            [1.0],
+            [100.0],
+            [101.0],
+            [2.0],
+            [3.0],
+            [102.0],
+            [103.0],
+        ]
+    )
+
+    perms = [
+        torch.tensor([1, 0, 3, 2], dtype=torch.long),
+        torch.tensor([2, 3, 0, 1], dtype=torch.long),
+    ]
+
+    def fake_randperm(n: int, device: torch.device) -> torch.Tensor:
+        assert n == 4
+        return perms.pop(0).to(device)
+
+    monkeypatch.setattr(p, "_randperm_for_tp", fake_randperm)
+    p._merge_into_mixing_pool(prepared)
+
+    batch = p._take()
+
+    assert isinstance(batch, dict)
+    assert torch.all(batch["h0"] < 10)
+    assert torch.all(batch["h1"] >= 100)
+    assert torch.equal(batch["h1"].flatten(), batch["h0"].flatten() + 100)
+    assert len(perms) == 1
+    assert torch.equal(perms[0], torch.tensor([2, 3, 0, 1], dtype=torch.long))
 
 
 def test_stop_iteration_on_buffer_exhausted():

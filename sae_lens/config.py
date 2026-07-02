@@ -204,10 +204,13 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         save_mse_every_n_steps (int): Save an `mse_history.jsonl` record every N training steps. 0 disables it. (default is 0)
         save_timing_every_n_steps (int): Save a `timing_history.jsonl` record every N training steps with separate `vllm_step_time_s`, `transfer_time_s`, and `sae_time_s` wall times. 0 disables it. (default is 0)
         save_memory_every_n_steps (int): Save a `memory_history_rank{rank}.jsonl` record every N training steps with peak GPU memory stats per training phase. 0 disables it. Uses PyTorch allocator stats (not nvidia-smi). (default is 0)
+        record_memory_empty_cache (bool): When memory profiling is enabled, call `torch.cuda.empty_cache()` before every per-phase snapshot so `reserved_mb`/`driver_used_mb` reflect current live tensors rather than the historical allocator watermark. This stalls the device and adds tens of ms per phase, so it is only for memory-profiling runs and should be left off for normal training. (default is False)
+        record_memory_timeline_step (int): When set to a step index >= 0, capture the full PyTorch allocator history (every alloc/free event with its Python stack, plus the peak-moment snapshot) for that single training step and dump it to `memory_timeline_rank{rank}.pickle` in `output_path`. Open the file at https://pytorch.org/memory_viz to see the timeline and inspect what is resident at the peak. Recording carries noticeable overhead and unbounded memory growth if left on, so it is scoped to exactly one step. Set to -1 to disable. (default is -1)
         synchronize_timing (bool): If True, call `torch.cuda.synchronize()` around timed sections for accurate GPU timings. This changes observed runtime and should only be used for profiling. (default is False)
         verbose (bool): Whether to print verbose output. (default is True)
         model_kwargs (dict[str, Any]): Keyword arguments for `model.run_with_cache`
         model_from_pretrained_kwargs (dict[str, Any], optional): Additional keyword arguments to pass to the model's `from_pretrained` method.
+        vllm_max_num_batched_tokens (int, optional): If set with model_class_name="VLLMModel", pass this as vLLM's max_num_batched_tokens. This also controls the minimal KV cache size in activation-capture mode.
         sae_lens_version (str): The version of the sae_lens library.
         sae_lens_training_version (str): The version of the sae_lens training library.
         exclude_special_tokens (bool | list[int]): Whether to exclude special tokens from the activations. If True, excludes all special tokens. If a list of ints, excludes those token IDs.
@@ -300,6 +303,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     save_mse_every_n_steps: int = 0
     save_timing_every_n_steps: int = 0
     save_memory_every_n_steps: int = 0
+    record_memory_empty_cache: bool = False
+    record_memory_timeline_step: int = -1
     append_history_logs: bool = False
     synchronize_timing: bool = False
     resume_from_checkpoint: str | None = None
@@ -308,6 +313,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     verbose: bool = True
     model_kwargs: dict[str, Any] = dict_field(default={})
     model_from_pretrained_kwargs: dict[str, Any] | None = dict_field(default=None)
+    vllm_max_num_batched_tokens: int | None = None
     sae_lens_version: str = field(default_factory=lambda: __version__)
     sae_lens_training_version: str = field(default_factory=lambda: __version__)
     exclude_special_tokens: bool | list[int] = False
@@ -327,6 +333,9 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     ddp_static_graph: bool | None = None
     ddp_bucket_cap_mb: int | None = None
     ddp_config_strict: bool = False
+    fsdp_backward_prefetch: Literal["backward_pre", "backward_post", "none"] = (
+        "backward_pre"
+    )
     sae_pp_size: int = 1
 
     # Streaming mode (v1): vLLM and SAE on separate GPU sets, communicate via /dev/shm.
@@ -341,6 +350,9 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     streaming_buffer_name: str = ""  # auto-generated unique name if empty
     streaming_shuffle: bool = True
     streaming_random_chunks: bool = True
+    streaming_use_gpu_direct: bool = False
+    streaming_staging_queue_capacity: int = 4
+    streaming_consumer_prefill_chunks: int = 0
 
     def __post_init__(self):
         if self.multi_sae_seed_mode not in ("same", "offset"):
@@ -357,6 +369,14 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             raise ValueError("multi_sae_stats_sync_interval must be >= 1")
         if self.ddp_bucket_cap_mb is not None and self.ddp_bucket_cap_mb <= 0:
             raise ValueError("ddp_bucket_cap_mb must be > 0 when set")
+        if self.fsdp_backward_prefetch not in (
+            "backward_pre",
+            "backward_post",
+            "none",
+        ):
+            raise ValueError(
+                "fsdp_backward_prefetch must be 'backward_pre', 'backward_post', or 'none'"
+            )
         if self.sae_pp_size < 1:
             raise ValueError("sae_pp_size must be >= 1")
         if self.streaming_mode:
@@ -370,6 +390,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
                 raise ValueError("streaming_mix_chunks must be >= 0.")
             if not 0 <= self.streaming_mix_fraction <= 1:
                 raise ValueError("streaming_mix_fraction must be in [0, 1].")
+            if self.streaming_consumer_prefill_chunks < 0:
+                raise ValueError("streaming_consumer_prefill_chunks must be >= 0.")
         effective_num_hooks = 1
         if self.hook_names is not None:
             self.hook_names = list(dict.fromkeys(self.hook_names))
@@ -422,6 +444,13 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
                 self.model_from_pretrained_kwargs = {"center_writing_weights": False}
             else:
                 self.model_from_pretrained_kwargs = {}
+        if self.vllm_max_num_batched_tokens is not None:
+            if self.vllm_max_num_batched_tokens < 1:
+                raise ValueError("vllm_max_num_batched_tokens must be >= 1")
+            if self.model_class_name == "VLLMModel":
+                self.model_from_pretrained_kwargs["max_num_batched_tokens"] = (
+                    self.vllm_max_num_batched_tokens
+                )
 
         if self.act_store_device == "with_model":
             self.act_store_device = self.device
@@ -590,6 +619,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             save_mse_every_n_steps=self.save_mse_every_n_steps,
             save_timing_every_n_steps=self.save_timing_every_n_steps,
             save_memory_every_n_steps=self.save_memory_every_n_steps,
+            record_memory_empty_cache=self.record_memory_empty_cache,
+            record_memory_timeline_step=self.record_memory_timeline_step,
             append_history_logs=self.append_history_logs,
             synchronize_timing=self.synchronize_timing,
             multi_sae_backward_order=self.multi_sae_backward_order,
@@ -646,6 +677,8 @@ class CacheActivationsRunnerConfig:
         streaming (bool): Whether to stream the dataset. Streaming large datasets is usually practical.
         autocast_lm (bool): Whether to use autocast during activation fetching.
         dataset_trust_remote_code (bool): Whether to trust remote code when loading datasets from Huggingface.
+        dataset_shard_index (int): Which dataset shard this cache process should read.
+        dataset_shard_count (int): Number of cache-time dataset shards.
     """
 
     dataset_path: str
@@ -655,6 +688,7 @@ class CacheActivationsRunnerConfig:
     d_in: int
     training_tokens: int
 
+    hook_names: list[str] | None = None
     context_size: int = -1  # Required if dataset is not tokenized
     model_class_name: str = "HookedTransformer"
     # defaults to "activations/{dataset}/{model}/{hook_name}
@@ -683,6 +717,8 @@ class CacheActivationsRunnerConfig:
     streaming: bool = True
     autocast_lm: bool = False
     dataset_trust_remote_code: bool | None = None
+    dataset_shard_index: int = 0
+    dataset_shard_count: int = 1
 
     def __post_init__(self):
         # Automatically determine context_size if dataset is tokenized
@@ -711,6 +747,25 @@ class CacheActivationsRunnerConfig:
             raise ValueError(
                 f"context_size ({self.context_size}) is greater than training_tokens "
                 f"({self.training_tokens}). Please reduce context_size or increase training_tokens."
+            )
+
+        if self.dataset_shard_count < 1:
+            raise ValueError("dataset_shard_count must be >= 1")
+        if not 0 <= self.dataset_shard_index < self.dataset_shard_count:
+            raise ValueError(
+                "dataset_shard_index must satisfy "
+                f"0 <= index < count; got index={self.dataset_shard_index}, "
+                f"count={self.dataset_shard_count}"
+            )
+        global_seq_count = self.n_seq_to_cache
+        if (
+            self.dataset_shard_count > 1
+            and global_seq_count % self.dataset_shard_count != 0
+        ):
+            raise ValueError(
+                "The number of sequences cached by ordinary mode must be divisible by "
+                f"dataset_shard_count; got {global_seq_count} sequences and "
+                f"{self.dataset_shard_count} shards."
             )
 
         if self.new_cached_activations_path is None:
@@ -745,7 +800,9 @@ class CacheActivationsRunnerConfig:
 
     @property
     def n_seq_in_dataset(self) -> int:
-        return self.training_tokens // self.sliced_context_size
+        if self.dataset_shard_count == 1:
+            return self.n_seq_to_cache
+        return self.n_seq_to_cache // self.dataset_shard_count
 
     @property
     def n_seq_in_buffer(self) -> int:
@@ -753,7 +810,27 @@ class CacheActivationsRunnerConfig:
 
     @property
     def n_buffers(self) -> int:
-        return math.ceil(self.training_tokens / self.n_tokens_in_buffer)
+        if self.dataset_shard_count == 1:
+            return self.global_n_buffers
+        return math.ceil(
+            self.n_seq_in_dataset * self.sliced_context_size
+            / self.n_tokens_in_buffer
+        )
+
+    @property
+    def global_n_buffers(self) -> int:
+        return math.ceil(
+            self.n_seq_to_cache * self.sliced_context_size
+            / self.n_tokens_in_buffer
+        )
+
+    @property
+    def n_seq_to_cache(self) -> int:
+        return self.training_tokens // self.sliced_context_size
+
+    @property
+    def global_n_seq_to_cache(self) -> int:
+        return self.n_seq_to_cache
 
 
 def _default_cached_activations_path(
@@ -832,6 +909,8 @@ class SAETrainerConfig:
     save_mse_every_n_steps: int
     save_timing_every_n_steps: int
     save_memory_every_n_steps: int
+    record_memory_empty_cache: bool
+    record_memory_timeline_step: int
     synchronize_timing: bool
     multi_sae_backward_order: Literal["forward", "reverse", "largest_first"]
     multi_sae_stats_sync_mode: Literal["immediate", "deferred", "periodic"]

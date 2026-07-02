@@ -43,6 +43,7 @@ from sae_lens.llm_sae_training_runner import LanguageModelSAETrainingRunner
 from sae_lens.saes.topk_sae import TopKTrainingSAEConfig
 from sae_lens.training.multi_sae_trainer import MULTI_SAE_MANIFEST_FILENAME
 from sae_lens.topology_control import BufferParams, read_control_state, write_control_state
+from sae_lens.util import extract_layer_from_tlens_hook_name
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,7 +69,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-size", type=int, default=2048)
     parser.add_argument("--store-batch-size-prompts", type=int, default=16)
     parser.add_argument("--n-batches-in-buffer", type=int, default=None)
+    parser.add_argument("--activations-mixing-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--dead-feature-window",
+        type=int,
+        default=1000,
+        help=(
+            "Training steps before a feature is considered dead for TopK aux loss. "
+            "Use a negative value for profiling the all-dead aux-loss worst case."
+        ),
+    )
     parser.add_argument("--max-model-len", type=int, default=2049)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--dtype", default="float32")
     parser.add_argument("--autocast", action="store_true")
@@ -88,11 +100,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/results_1.55/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_1.61tmp/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
     parser.add_argument("--save-mse-every-n-steps", type=int, default=1)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=1)
     parser.add_argument("--save-memory-every-n-steps", type=int, default=1)
+    parser.add_argument(
+        "--save-vllm-memory-every-n-steps",
+        type=int,
+        default=0,
+        help=(
+            "Save vLLM decoder substage memory records every N capture calls. "
+            "0 disables it. Writes vllm_memory_history_rank{rank}.jsonl."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-memory-probe-layer",
+        type=int,
+        default=None,
+        help=(
+            "Decoder layer index for vLLM substage memory profiling "
+            "(ln1/attn/ln2/mlp). Defaults to the layer in --hook-name when "
+            "--save-vllm-memory-every-n-steps is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--record-memory-empty-cache",
+        action="store_true",
+        help="When memory profiling is on, call torch.cuda.empty_cache() before "
+        "each per-phase snapshot so reserved/driver_used reflect current live "
+        "tensors, not the historical watermark. Adds tens of ms per phase; "
+        "profiling-only.",
+    )
+    parser.add_argument(
+        "--record-memory-timeline-step",
+        type=int,
+        default=-1,
+        help="When >= 0, record the full PyTorch alloc/free history (every "
+        "event with its Python stack, plus the peak-moment snapshot) for that "
+        "single training step and dump it to memory_timeline_rank{rank}.pickle "
+        "in output_path. Open at https://pytorch.org/memory_viz. Profiling-only; "
+        "-1 disables.",
+    )
     parser.add_argument(
         "--append-history-logs",
         action="store_true",
@@ -111,7 +160,7 @@ def parse_args() -> argparse.Namespace:
             "This can perturb runtime; keep disabled for throughput/overlap runs."
         ),
     )
-    parser.add_argument("--checkpoint-path", default="checkpoints/1.55/")
+    parser.add_argument("--checkpoint-path", default="checkpoints/1.60/")
     parser.add_argument(
         "--checkpoint-storage",
         choices=["memory", "disk"],
@@ -255,6 +304,15 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Fail fast on invalid DDP config combinations instead of fallback.",
     )
+    parser.add_argument(
+        "--fsdp-backward-prefetch",
+        default="backward_pre",
+        choices=["backward_pre", "backward_post", "none"],
+        help=(
+            "FSDP backward prefetch policy. Use 'none' to disable FSDP's default "
+            "BACKWARD_PRE full-parameter prefetch/caching behavior."
+        ),
+    )
     # Streaming mode (v1): vLLM and SAE processes on separate GPU sets via /dev/shm.
     # Requires sae_dp_size=1. World size = vllm_tp * vllm_dp + sae_tp * 1.
     parser.add_argument(
@@ -317,6 +375,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(streaming_random_chunks=True)
     parser.add_argument(
+        "--streaming-use-gpu-direct",
+        action="store_true",
+        default=False,
+        help="Enable GPU direct NCCL streaming (vLLM→SAE GPU-to-GPU transfer, no CPU copy).",
+    )
+    parser.add_argument(
+        "--streaming-staging-queue-capacity",
+        type=int,
+        default=4,
+        help="GPU staging queue capacity (chunks) for GPU direct streaming.",
+    )
+    parser.add_argument(
+        "--streaming-consumer-prefill-chunks",
+        type=int,
+        default=0,
+        help=(
+            "GPU direct consumer prefill target in chunks. Set 0 to disable; "
+            "values >0 wait for post-mixing serving tokens before training starts."
+        ),
+    )
+    parser.add_argument(
         "--control-state-path",
         type=str,
         default=None,
@@ -365,20 +444,21 @@ def _resolve_hidden_size(model_name: str) -> int:
 
 
 def _resolve_d_in_for_cached(args: argparse.Namespace) -> int:
-    """Resolve d_in for cached mode: model config first, fall back to dataset_info.json."""
+    """Resolve d_in for cached mode.
+
+    The cached activations are the ground truth for d_in (the hook type may be
+    attn_v/mlp/etc. whose width differs from the model hidden_size), so read the
+    cache's dataset_info first and only fall back to the model config.
+    """
+    cache_dir = Path(args.cached_activations_path)
+    manifest_path = cache_dir / "cache_activations_manifest.json"
     try:
-        return _resolve_hidden_size(args.model_name)
-    except Exception as model_err:
-        cache_dir = Path(args.cached_activations_path)
-        manifest_path = cache_dir / "cache_activations_manifest.json"
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text())
             hook_to_dir = manifest.get("hook_to_dir", {})
             hook_dirs = list(hook_to_dir.values())
             if not hook_dirs:
-                raise ValueError(
-                    f"manifest at {manifest_path} has empty hook_to_dir"
-                ) from model_err
+                raise ValueError(f"manifest at {manifest_path} has empty hook_to_dir")
             first_hook_dir = cache_dir / hook_dirs[0]
             first_hook_name = manifest["hook_names"][0]
         else:
@@ -386,12 +466,18 @@ def _resolve_d_in_for_cached(args: argparse.Namespace) -> int:
             first_hook_name = args.hook_name
         info_path = first_hook_dir / "dataset_info.json"
         if not info_path.exists():
-            raise ValueError(
-                f"Could not infer d_in: model load failed and {info_path} missing"
-            ) from model_err
+            raise ValueError(f"{info_path} missing")
         info = json.loads(info_path.read_text())
         feat = info["features"][first_hook_name]
         return int(feat["shape"][-1])
+    except Exception as cache_err:
+        try:
+            return _resolve_hidden_size(args.model_name)
+        except Exception as model_err:
+            raise ValueError(
+                f"Could not infer d_in from cache ({cache_err}) or model "
+                f"({model_err})"
+            ) from cache_err
 
 
 def _validate_checkpoint_args(args: argparse.Namespace) -> None:
@@ -585,8 +671,12 @@ def main() -> None:
         raise ValueError("--sae-dp-size must be >= 0")
     if args.context_size < 1:
         raise ValueError("--context-size must be >= 1")
+    if args.max_num_batched_tokens is not None and args.max_num_batched_tokens < 1:
+        raise ValueError("--max-num-batched-tokens must be >= 1")
     if args.train_batch_size_tokens < 1:
         raise ValueError("--train-batch-size-tokens must be >= 1")
+    if args.save_vllm_memory_every_n_steps < 0:
+        raise ValueError("--save-vllm-memory-every-n-steps must be >= 0")
     if args.sae_dp_size > 1 and args.vllm_dp_size == 1:
         print(
             f"[INFO] vllm_dp_size=1, sae_dp_size={args.sae_dp_size} (1:m topology) — "
@@ -687,6 +777,34 @@ def main() -> None:
         )
 
     output_path = None if args.no_save_final_sae else args.output_path
+    vllm_memory_probe_layer = args.vllm_memory_probe_layer
+    model_kwargs: dict[str, object] = {}
+    if args.save_vllm_memory_every_n_steps > 0:
+        if args.use_cached_activations:
+            raise ValueError(
+                "--save-vllm-memory-every-n-steps requires live vLLM activation generation"
+            )
+        if output_path is None:
+            raise ValueError(
+                "--save-vllm-memory-every-n-steps requires output_path to be set"
+            )
+        if vllm_memory_probe_layer is None:
+            default_probe_hook = hook_names[0] if hook_names is not None else args.hook_name
+            vllm_memory_probe_layer = extract_layer_from_tlens_hook_name(default_probe_hook)
+        if vllm_memory_probe_layer is None:
+            raise ValueError(
+                "--vllm-memory-probe-layer is required when --hook-name has no layer"
+            )
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        model_kwargs.update(
+            {
+                "vllm_memory_every_n_steps": args.save_vllm_memory_every_n_steps,
+                "vllm_memory_probe_layer": vllm_memory_probe_layer,
+                "vllm_memory_history_path": str(
+                    Path(output_path) / f"vllm_memory_history_rank{rank}.jsonl"
+                ),
+            }
+        )
 
     device = _resolve_device()
     d_in = (
@@ -709,6 +827,7 @@ def main() -> None:
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": args.gpu_memory_utilization,
         },
+        vllm_max_num_batched_tokens=args.max_num_batched_tokens,
         hook_name=args.hook_name,
         hook_names=hook_names,
         dataset_path=args.dataset_path,
@@ -720,7 +839,7 @@ def main() -> None:
         train_batch_size_tokens=train_batch_size_tokens,
         store_batch_size_prompts=args.store_batch_size_prompts,
         n_batches_in_buffer=n_batches_in_buffer,
-        activations_mixing_fraction=0.5,
+        activations_mixing_fraction=args.activations_mixing_fraction,
         device=device,
         act_store_device=args.act_store_device,
         dtype=args.dtype,
@@ -728,6 +847,8 @@ def main() -> None:
         autocast_lm=args.autocast_lm,
         compile_llm=False,
         compile_sae=False,
+        model_kwargs=model_kwargs,
+        dead_feature_window=args.dead_feature_window,
         n_eval_batches=0,
         logger=LoggingConfig(log_to_wandb=False),
         n_checkpoints=args.n_checkpoints,
@@ -738,6 +859,8 @@ def main() -> None:
         save_mse_every_n_steps=args.save_mse_every_n_steps,
         save_timing_every_n_steps=args.save_timing_every_n_steps,
         save_memory_every_n_steps=args.save_memory_every_n_steps,
+        record_memory_empty_cache=args.record_memory_empty_cache,
+        record_memory_timeline_step=args.record_memory_timeline_step,
         append_history_logs=args.append_history_logs,
         synchronize_timing=args.synchronize_timing,
         seed=args.seed,
@@ -755,6 +878,7 @@ def main() -> None:
         ddp_static_graph=args.ddp_static_graph,
         ddp_bucket_cap_mb=args.ddp_bucket_cap_mb,
         ddp_config_strict=args.ddp_config_strict,
+        fsdp_backward_prefetch=args.fsdp_backward_prefetch,
         streaming_mode=args.streaming_mode,
         streaming_chunk_size_tokens=args.streaming_chunk_size_tokens,
         streaming_num_chunks=args.streaming_num_chunks,
@@ -764,6 +888,9 @@ def main() -> None:
         streaming_buffer_name=args.streaming_buffer_name,
         streaming_shuffle=args.streaming_shuffle,
         streaming_random_chunks=args.streaming_random_chunks,
+        streaming_use_gpu_direct=args.streaming_use_gpu_direct,
+        streaming_staging_queue_capacity=args.streaming_staging_queue_capacity,
+        streaming_consumer_prefill_chunks=args.streaming_consumer_prefill_chunks,
         use_cached_activations=args.use_cached_activations,
         cached_activations_path=args.cached_activations_path,
     )
@@ -805,12 +932,19 @@ def main() -> None:
         print(f"  ddp_bucket_cap_mb={args.ddp_bucket_cap_mb}")
     if args.ddp_config_strict:
         print("  ddp_config_strict=True")
+    if args.sae_dp_mode == "fsdp":
+        print(f"  fsdp_backward_prefetch={args.fsdp_backward_prefetch}")
     if args.save_mse_every_n_steps > 0:
         print(f"  save_mse_every_n_steps={args.save_mse_every_n_steps}")
     if args.save_timing_every_n_steps > 0:
         print(f"  save_timing_every_n_steps={args.save_timing_every_n_steps}")
+    if args.save_vllm_memory_every_n_steps > 0:
+        print(f"  save_vllm_memory_every_n_steps={args.save_vllm_memory_every_n_steps}")
+        print(f"  vllm_memory_probe_layer={vllm_memory_probe_layer}")
     if args.synchronize_timing:
         print("  synchronize_timing=True")
+    if args.max_num_batched_tokens is not None:
+        print(f"  max_num_batched_tokens={args.max_num_batched_tokens}")
     if args.checkpoint_path is not None:
         print(f"  checkpoint_path={args.checkpoint_path}")
     print(f"  checkpoint_storage={args.checkpoint_storage}")
@@ -819,6 +953,15 @@ def main() -> None:
     if args.streaming_mode:
         print(f"  streaming_mix_chunks={args.streaming_mix_chunks}")
         print(f"  streaming_mix_fraction={args.streaming_mix_fraction}")
+        if args.streaming_use_gpu_direct:
+            print("  streaming_use_gpu_direct=True")
+            print(f"  activations_mixing_fraction={args.activations_mixing_fraction}")
+            print(f"  n_batches_in_buffer={n_batches_in_buffer}")
+            print(f"  streaming_staging_queue_capacity={args.streaming_staging_queue_capacity}")
+            print(
+                "  streaming_consumer_prefill_chunks="
+                f"{args.streaming_consumer_prefill_chunks}"
+            )
     if args.n_checkpoints > 0:
         print(f"  n_checkpoints={args.n_checkpoints}")
     if args.save_final_checkpoint:

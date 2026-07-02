@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import math
 import os
+import threading
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -11,6 +13,14 @@ from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
+
+if os.environ.get("SAE_DUMP_ALLOC_SNAPSHOT") == "1":
+    try:
+        torch.cuda.memory._record_memory_history(
+            enabled="all", context="all", stacks="python", max_entries=200000,
+        )
+    except Exception:
+        pass
 from safetensors.torch import load_file, save_file
 from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -118,11 +128,25 @@ class MultiSAETrainer:
         params: list[torch.nn.Parameter] = []
         for hook_name in self.hook_names:
             params.extend(list(self.sae_by_hook[hook_name].parameters()))
-        self.optimizer = Adam(
-            params,
-            lr=cfg.lr,
-            betas=(cfg.adam_beta1, cfg.adam_beta2),
-        )
+        _adam_kwargs: dict[str, Any] = {
+            "lr": cfg.lr,
+            "betas": (cfg.adam_beta1, cfg.adam_beta2),
+        }
+        # Adam implementation selector. SAE_ADAM_IMPL takes precedence:
+        #   "fused"   -> fused=True       (single fused CUDA kernel)
+        #   "foreach" -> foreach=True     (multi-tensor apply; CUDA default)
+        #   "forloop" -> foreach=False    (single-tensor Python for-loop)
+        # SAE_FUSED_ADAM=1 is kept for backward compatibility (= "fused").
+        _adam_impl = os.environ.get("SAE_ADAM_IMPL", "").lower()
+        if not _adam_impl and os.environ.get("SAE_FUSED_ADAM") == "1":
+            _adam_impl = "fused"
+        if _adam_impl == "fused":
+            _adam_kwargs["fused"] = True
+        elif _adam_impl == "foreach":
+            _adam_kwargs["foreach"] = True
+        elif _adam_impl == "forloop":
+            _adam_kwargs["foreach"] = False
+        self.optimizer = Adam(params, **_adam_kwargs)
         self.lr_scheduler = get_lr_scheduler(
             scheduler_name=cfg.lr_scheduler_name,
             optimizer=self.optimizer,
@@ -190,9 +214,16 @@ class MultiSAETrainer:
         self.n_training_samples = 0
         self._t_ready: float = time.time()
         self.mse_history_path: Path | None = None
+        self.rank_local_mse_history_path: Path | None = None
         self.debug_mse_history_path: Path | None = None
         self.timing_history_path: Path | None = None
         self.memory_history_path: Path | None = None
+        self.memory_phase_history_path: Path | None = None
+        self._memory_phase_records: list[dict[str, object]] = []
+        self._memory_current_raw_batch_by_hook: dict[str, torch.Tensor] | None = None
+        self._memory_current_scaled_batch_by_hook: dict[str, torch.Tensor] | None = None
+        self._memory_current_outputs: dict[str, TrainStepOutput] | None = None
+        self._memory_retained_outputs: dict[str, TrainStepOutput] | None = None
         self.checkpoint_thresholds: list[int] = []
         if self.cfg.n_checkpoints > 0:
             self.checkpoint_thresholds = list(
@@ -216,6 +247,22 @@ class MultiSAETrainer:
             self.mse_history_path = output_path / MSE_HISTORY_FILENAME
             if not (append_logs or getattr(cfg, "append_history_logs", False)):
                 self.mse_history_path.write_text("")
+        if (
+            not should_write_logs
+            and cfg.output_path is not None
+            and cfg.save_mse_every_n_steps > 0
+            and self._dp_rank() == 0
+            and self._tp_rank() == 0
+            and self._pp_rank() > 0
+        ):
+            output_path = Path(cfg.output_path)
+            output_path.mkdir(exist_ok=True, parents=True)
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            self.rank_local_mse_history_path = (
+                output_path / f"mse_history_pp{self._pp_rank()}_rank{rank}.jsonl"
+            )
+            if not (append_logs or getattr(cfg, "append_history_logs", False)):
+                self.rank_local_mse_history_path.write_text("")
         if (
             os.environ.get("SAELENS_DEBUG_ALL_RANK_MSE") == "1"
             and cfg.output_path is not None
@@ -255,7 +302,43 @@ class MultiSAETrainer:
             self.memory_history_path = (
                 output_path / f"memory_history_rank{_global_rank}.jsonl"
             )
+            self.memory_phase_history_path = (
+                output_path / f"memory_phase_history_rank{_global_rank}.jsonl"
+            )
             self.memory_history_path.write_text("")
+            self.memory_phase_history_path.write_text("")
+            self.device_history_path = (
+                output_path / f"device_history_rank{_global_rank}.jsonl"
+            )
+            self.device_history_path.write_text("")
+            if os.environ.get("SAE_DUMP_ALLOC_SNAPSHOT") == "1":
+                # Already enabled at module load time; no-op here.
+                pass
+        # Background ~1 Hz device-memory sampler (see _device_sampler_loop).
+        self.device_history_path: Path | None = getattr(
+            self, "device_history_path", None
+        )
+        self._device_sampler_thread: threading.Thread | None = None
+        self._device_sampler_stop = threading.Event()
+        self._device_sampler_interval_s: float = float(
+            os.environ.get("SAE_DEVICE_SAMPLE_INTERVAL_S", "1.0")
+        )
+
+        # Full alloc/free timeline + peak-moment snapshot for a single step. The
+        # recorder logs every allocation/free with its Python stack; the dumped
+        # pickle opens at https://pytorch.org/memory_viz. Scoped to one step
+        # because the recorder grows unboundedly and adds noticeable overhead.
+        self.memory_timeline_path: Path | None = None
+        self._memory_timeline_step: int = getattr(
+            cfg, "record_memory_timeline_step", -1
+        )
+        self._memory_timeline_active: bool = False
+        if self._memory_timeline_step >= 0 and cfg.output_path is not None:
+            output_path = Path(cfg.output_path)
+            output_path.mkdir(exist_ok=True, parents=True)
+            self.memory_timeline_path = (
+                output_path / f"memory_timeline_rank{_global_rank}.pickle"
+            )
 
     def _dp_world_size(self) -> int:
         if (
@@ -356,6 +439,7 @@ class MultiSAETrainer:
         quiesce_finished_ack_path: Path | str | None = None,
     ) -> dict[str, TrainingSAE[Any]]:
         pbar = tqdm(total=self.cfg.total_training_samples, desc="Training Multi SAE")
+        self._start_device_sampler()
         quiesce_draining = False
         quiesce_checkpoint_now = False
         quiesce_checkpoint_saved = False
@@ -363,7 +447,9 @@ class MultiSAETrainer:
 
         def _touch_if_metric_writer(path: Path | str | None) -> None:
             if path is not None and self._is_metric_writer_rank():
-                Path(path).touch()
+                ack_path = Path(path)
+                ack_path.parent.mkdir(parents=True, exist_ok=True)
+                ack_path.touch()
 
         def _maybe_start_quiesce_drain() -> None:
             nonlocal quiesce_draining, quiesce_checkpoint_now
@@ -405,12 +491,17 @@ class MultiSAETrainer:
                 _save_quiesce_checkpoint()
                 break
             step_wall_t0 = time.perf_counter()
+            self._start_memory_phase_step()
+            self._reset_memory_phase_peak()
+            self._maybe_start_memory_timeline()
             self._maybe_synchronize_timing()
             with cuda_nvtx_range("multi_sae:data_fetch"):
                 try:
                     batch_by_hook = next(self.data_provider)
                 except StopIteration:
                     break
+            self._memory_current_raw_batch_by_hook = batch_by_hook
+            self._record_memory_phase("after_data_fetch")
             if not isinstance(batch_by_hook, dict):
                 raise TypeError(
                     "MultiSAETrainer expected data_provider to yield dict batches"
@@ -428,22 +519,24 @@ class MultiSAETrainer:
                 )
                 for hook_name in self.hook_names
             }
+            self._memory_current_scaled_batch_by_hook = scaled_batch_by_hook
+            self._record_memory_phase("after_scale_to_device")
             self.n_training_samples += local_n
 
             self._maybe_synchronize_timing()
             sae_t0 = time.perf_counter()
+            self._memory_retained_outputs = self._memory_current_outputs
+            self._memory_current_outputs = None
             if self._profile_memory:
                 torch.cuda.reset_peak_memory_stats(self.cfg.device)
             with cuda_nvtx_range("multi_sae:train_step"):
                 outputs, sae_phase_timing = self._train_step(scaled_batch_by_hook, local_n)
+            self._memory_current_outputs = outputs
             self._maybe_synchronize_timing()
             sae_time_s = time.perf_counter() - sae_t0
 
             if self._profile_memory:
-                memory_stats: dict[str, float] = {
-                    "peak_step_allocated_mb": torch.cuda.max_memory_allocated(self.cfg.device) / 1024**2,
-                    "peak_step_reserved_mb": torch.cuda.max_memory_reserved(self.cfg.device) / 1024**2,
-                }
+                memory_stats = self._aggregate_memory_phase_stats()
             else:
                 memory_stats = {}
 
@@ -461,6 +554,7 @@ class MultiSAETrainer:
                 **sae_phase_timing,
             )
             self._record_memory_if_needed(memory_stats)
+            self._maybe_stop_memory_timeline()
             self.n_training_steps += 1
             self.lr_scheduler.step()
             self._checkpoint_if_needed()
@@ -480,6 +574,7 @@ class MultiSAETrainer:
                 break
 
         pbar.close()
+        self._stop_device_sampler()
         # Ensure periodic/deferred stats are flushed before final save/logging.
         self._sync_deferred_stats_if_needed(force=True)
         if quiesce_draining:
@@ -498,6 +593,7 @@ class MultiSAETrainer:
             sae.train()
 
         self.optimizer.zero_grad(set_to_none=True)
+        self._record_memory_phase("after_zero_grad_start")
         outputs: dict[str, TrainStepOutput] = {}
         phase_timing = {
             "sae_forward_time_s": 0.0,
@@ -575,6 +671,8 @@ class MultiSAETrainer:
                 # single-layer training. Dividing by num_layers changes gradient
                 # clipping behavior and breaks equivalence.
                 scaled_loss_by_hook[hook_name] = output.loss * loss_scale
+        self._memory_current_outputs = outputs
+        self._record_memory_phase("after_forward_all")
 
         # Phase B: run backward in configured order.
         for hook_name in self._ordered_hook_names_for_backward():
@@ -585,6 +683,7 @@ class MultiSAETrainer:
                 with cuda_nvtx_range(f"multi_sae:{hook_name}:backward"):
                     self.grad_scaler.scale(scaled_loss_by_hook[hook_name]).backward()
             phase_timing["sae_backward_time_s"] += time.perf_counter() - t_bwd
+            self._record_memory_phase(f"after_backward_{sanitize_hook_name_for_path(hook_name)}")
 
         t_post = time.perf_counter()
         with cuda_nvtx_range("multi_sae:optimizer_unscale"):
@@ -599,16 +698,19 @@ class MultiSAETrainer:
                     dp_group=self.dp_group if self._is_fsdp else None,
                 )
         phase_timing["sae_post_backward_time_s"] += time.perf_counter() - t_post
+        self._record_memory_phase("after_post_backward")
         t_opt = time.perf_counter()
         with cuda_nvtx_range("multi_sae:optimizer_step"):
             self.grad_scaler.step(self.optimizer)
         with cuda_nvtx_range("multi_sae:scaler_update"):
             self.grad_scaler.update()
+        self._record_memory_phase("after_optimizer_step")
         t_stats = time.perf_counter()
         with cuda_nvtx_range("multi_sae:stats_sync_tail"):
             self._sync_deferred_stats_if_needed(force=False)
         phase_timing["sae_stats_sync_time_s"] += time.perf_counter() - t_stats
         phase_timing["sae_optimizer_time_s"] += time.perf_counter() - t_opt
+        self._record_memory_phase("after_stats_tail")
         return outputs, phase_timing
 
     def _train_step_combined_backward(
@@ -646,6 +748,8 @@ class MultiSAETrainer:
                     self._update_stats(hook_name, output, local_n)
                 phase_timing["sae_stats_sync_time_s"] += time.perf_counter() - t_stats
                 scaled_losses.append(output.loss * loss_scale)
+        self._memory_current_outputs = outputs
+        self._record_memory_phase("after_forward_all")
 
         total_loss = sum(scaled_losses)
         t_bwd = time.perf_counter()
@@ -655,6 +759,7 @@ class MultiSAETrainer:
             with cuda_nvtx_range("multi_sae:combined_backward"):
                 self.grad_scaler.scale(total_loss).backward()
         phase_timing["sae_backward_time_s"] += time.perf_counter() - t_bwd
+        self._record_memory_phase("after_combined_backward")
 
         t_post = time.perf_counter()
         with cuda_nvtx_range("multi_sae:optimizer_unscale"):
@@ -669,16 +774,19 @@ class MultiSAETrainer:
                     dp_group=self.dp_group if self._is_fsdp else None,
                 )
         phase_timing["sae_post_backward_time_s"] += time.perf_counter() - t_post
+        self._record_memory_phase("after_post_backward")
         t_opt = time.perf_counter()
         with cuda_nvtx_range("multi_sae:optimizer_step"):
             self.grad_scaler.step(self.optimizer)
         with cuda_nvtx_range("multi_sae:scaler_update"):
             self.grad_scaler.update()
+        self._record_memory_phase("after_optimizer_step")
         t_stats = time.perf_counter()
         with cuda_nvtx_range("multi_sae:stats_sync_tail"):
             self._sync_deferred_stats_if_needed(force=False)
         phase_timing["sae_stats_sync_time_s"] += time.perf_counter() - t_stats
         phase_timing["sae_optimizer_time_s"] += time.perf_counter() - t_opt
+        self._record_memory_phase("after_stats_tail")
         return outputs, phase_timing
 
     def _forward_one(self, hook_name: str, acts: torch.Tensor) -> TrainStepOutput:
@@ -815,20 +923,31 @@ class MultiSAETrainer:
         base_output = Path(output_path)
         base_output.mkdir(exist_ok=True, parents=True)
         manifest = self._manifest()
+        pp_rank = self._pp_rank()
+        global_rank = (
+            dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        )
         if self._is_metric_writer_rank():
             with open(base_output / MULTI_SAE_MANIFEST_FILENAME, "w") as f:
                 json.dump(manifest, f)
+        if pp_rank > 0:
+            local_manifest_path = (
+                base_output / f"multi_sae_manifest_pp{pp_rank}_rank{global_rank}.json"
+            )
+            with open(local_manifest_path, "w") as f:
+                json.dump(self._manifest(self.hook_names), f)
 
         for hook_name in self.hook_names:
             self._save_one_final(base_output, hook_name)
 
-    def _manifest(self) -> dict[str, Any]:
+    def _manifest(self, hook_names: list[str] | None = None) -> dict[str, Any]:
+        hook_names = self.hook_names if hook_names is None else hook_names
         return {
             "format": "multi_independent_sae_v1",
-            "hook_names": self.hook_names,
+            "hook_names": hook_names,
             "hook_to_dir": {
                 hook_name: sanitize_hook_name_for_path(hook_name)
-                for hook_name in self.hook_names
+                for hook_name in hook_names
             },
             "shared_hyperparams": True,
             "sae_dp_mode": self.sae_dp_mode,
@@ -1345,12 +1464,41 @@ class MultiSAETrainer:
                     continue
                 hook_record[loss_name] = _unwrap_item(loss_value)
             record["hooks"][hook_name] = hook_record
-        if self.mse_history_path is None:
+        pp_rank = self._pp_rank()
+        if (
+            self.rank_local_mse_history_path is None
+            and self.cfg.output_path is not None
+            and self._dp_rank() == 0
+            and self._tp_rank() == 0
+            and pp_rank > 0
+        ):
+            output_path = Path(self.cfg.output_path)
+            output_path.mkdir(exist_ok=True, parents=True)
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            self.rank_local_mse_history_path = (
+                output_path / f"mse_history_pp{pp_rank}_rank{rank}.jsonl"
+            )
+            if not getattr(self.cfg, "append_history_logs", False):
+                self.rank_local_mse_history_path.write_text("")
+        if self.mse_history_path is None and self.rank_local_mse_history_path is None:
             if self.debug_mse_history_path is None:
                 return
-        if self.mse_history_path is not None:
+        if self.mse_history_path is not None and pp_rank == 0:
             with open(self.mse_history_path, "a") as f:
                 json.dump(record, f)
+                f.write("\n")
+        if self.rank_local_mse_history_path is not None:
+            rank_record = {
+                **record,
+                "rank": dist.get_rank()
+                if dist.is_available() and dist.is_initialized()
+                else 0,
+                "tp_rank": self._tp_rank(),
+                "pp_rank": self._pp_rank(),
+                "dp_rank": self._dp_rank(),
+            }
+            with open(self.rank_local_mse_history_path, "a") as f:
+                json.dump(rank_record, f)
                 f.write("\n")
         if self.debug_mse_history_path is not None:
             debug_record = {
@@ -1408,6 +1556,400 @@ class MultiSAETrainer:
             json.dump(record, f)
             f.write("\n")
 
+    def _start_memory_phase_step(self) -> None:
+        if not self._profile_memory:
+            return
+        self._memory_phase_records = []
+
+    def _device_sampler_loop(self, wall_t0: float) -> None:
+        # Runs in a daemon thread, sampling device-memory at a fixed wall-clock
+        # interval (default 1 Hz). Each line records the device-used watermark
+        # (mem_get_info: total - free, includes the CUDA context and any other
+        # process on the device) alongside this process' allocator view, so the
+        # timeline can be compared against the per-phase snapshots.
+        device = self.cfg.device
+        with open(self.device_history_path, "a") as f:  # type: ignore[arg-type]
+            while not self._device_sampler_stop.is_set():
+                free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+                record = {
+                    "t_s": time.perf_counter() - wall_t0,
+                    "rank": self._memory_rank,
+                    "step": self.n_training_steps + 1,
+                    "n_training_samples": self.n_training_samples,
+                    "device_used_mb": (total_bytes - free_bytes) / 1024**2,
+                    "allocated_mb": torch.cuda.memory_allocated(device) / 1024**2,
+                    "reserved_mb": torch.cuda.memory_reserved(device) / 1024**2,
+                }
+                f.write(json.dumps(record) + "\n")
+                f.flush()
+                self._device_sampler_stop.wait(self._device_sampler_interval_s)
+
+    def _start_device_sampler(self) -> None:
+        if not self._profile_memory or self.device_history_path is None:
+            return
+        if torch.device(self.cfg.device).type != "cuda":
+            return
+        self._device_sampler_stop.clear()
+        self._device_sampler_thread = threading.Thread(
+            target=self._device_sampler_loop,
+            args=(time.perf_counter(),),
+            name=f"sae-device-sampler-rank{self._memory_rank}",
+            daemon=True,
+        )
+        self._device_sampler_thread.start()
+
+    def _stop_device_sampler(self) -> None:
+        if self._device_sampler_thread is None:
+            return
+        self._device_sampler_stop.set()
+        self._device_sampler_thread.join(timeout=5.0)
+        self._device_sampler_thread = None
+
+    def _reset_memory_phase_peak(self) -> None:
+        if not self._profile_memory:
+            return
+        torch.cuda.reset_peak_memory_stats(self.cfg.device)
+
+    def _maybe_start_memory_timeline(self) -> None:
+        """Begin recording the full alloc/free history for the target step.
+
+        Captures every allocation/free event together with the Python call
+        stack (``stacks="all"``, ``context="all"``) and the peak-moment block
+        layout. In memory_viz the forward/backward/optimizer phases are
+        separable both along the time axis (they run in sequence) and by the
+        captured stack (each allocation shows whether it came from an SAE
+        forward, autograd, or ``optimizer.step``).
+        """
+        if (
+            self.memory_timeline_path is None
+            or self.n_training_steps != self._memory_timeline_step
+            or self._memory_timeline_active
+        ):
+            return
+        if torch.device(self.cfg.device).type != "cuda":
+            return
+        torch.cuda.synchronize(self.cfg.device)
+        torch.cuda.memory._record_memory_history(
+            max_entries=1_000_000,
+            stacks="all",
+            context="all",
+        )
+        self._memory_timeline_active = True
+
+    def _maybe_stop_memory_timeline(self) -> None:
+        """Dump the recorded history for the target step and stop recording."""
+        if not self._memory_timeline_active:
+            return
+        assert self.memory_timeline_path is not None
+        torch.cuda.synchronize(self.cfg.device)
+        torch.cuda.memory._dump_snapshot(str(self.memory_timeline_path))
+        torch.cuda.memory._record_memory_history(enabled=None)
+        self._memory_timeline_active = False
+
+
+    @staticmethod
+    def _tensor_bytes(tensor: torch.Tensor) -> int:
+        return tensor.numel() * tensor.element_size()
+
+    def _tensor_tree_bytes(self, value: Any, seen: set[int]) -> int:
+        if torch.is_tensor(value):
+            if value.device.type != "cuda":
+                return 0
+            ident = id(value)
+            if ident in seen:
+                return 0
+            seen.add(ident)
+            return self._tensor_bytes(value)
+        if isinstance(value, dict):
+            return sum(self._tensor_tree_bytes(v, seen) for v in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(self._tensor_tree_bytes(v, seen) for v in value)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return sum(
+                self._tensor_tree_bytes(getattr(value, field.name), seen)
+                for field in dataclasses.fields(value)
+            )
+        return 0
+
+    def _data_provider_buffer_bytes(self, seen: set[int]) -> int:
+        """Sum GPU bytes held by the data provider's internal buffers.
+
+        Different providers expose different buffer attributes:
+
+        - GpuStreamingActivationProvider: ``_pool_by_hook`` and
+          ``_serving_by_hook`` (dicts) plus ``_chunk_buffer`` (list of dicts)
+        - StreamingActivationProvider: ``_mixing_pool`` (a single tensor)
+        - GpuDirectDataProvider: wraps another provider in ``_inner``
+
+        Reuses the shared ``seen`` set, so a buffer tensor that is the *same
+        object* as an already-counted batch tensor is not double counted; the
+        pool therefore contributes only the portion not yet handed out as a
+        batch. Cross-process pools owned by another process are not
+        Python-reachable here, so they contribute nothing, keeping this stat
+        consistent with this process's ``memory_allocated``.
+        """
+        provider: Any = self.data_provider
+        total = 0
+        visited: set[int] = set()
+        while provider is not None and id(provider) not in visited:
+            visited.add(id(provider))
+            for attr in (
+                "_pool_by_hook",
+                "_serving_by_hook",
+                "_chunk_buffer",
+                "_mixing_pool",
+            ):
+                value = getattr(provider, attr, None)
+                if value is not None:
+                    total += self._tensor_tree_bytes(value, seen)
+            provider = getattr(provider, "_inner", None)
+        return total
+
+    def _component_memory_stats_mb(self) -> dict[str, float]:
+        seen: set[int] = set()
+        param_bytes = 0
+        grad_bytes = 0
+        optimizer_state_bytes = 0
+
+        for sae in self.sae_by_hook.values():
+            for param in sae.parameters():
+                if param.device.type == "cuda":
+                    param_bytes += self._tensor_tree_bytes(param, seen)
+                if param.grad is not None and param.grad.device.type == "cuda":
+                    grad_bytes += self._tensor_tree_bytes(param.grad, seen)
+                state = self.optimizer.state.get(param, {})
+                optimizer_state_bytes += self._tensor_tree_bytes(state, seen)
+
+        trainer_buffer_values: list[Any] = [
+            self.act_freq_scores_by_hook,
+            self.n_forward_passes_since_fired_by_hook,
+            self._pending_did_fire_max_by_hook,
+        ]
+        trainer_buffer_bytes = sum(
+            self._tensor_tree_bytes(value, seen) for value in trainer_buffer_values
+        )
+        raw_batch_bytes = self._tensor_tree_bytes(
+            self._memory_current_raw_batch_by_hook, seen
+        )
+        scaled_batch_bytes = self._tensor_tree_bytes(
+            self._memory_current_scaled_batch_by_hook, seen
+        )
+        retained_outputs_bytes = self._tensor_tree_bytes(
+            self._memory_retained_outputs, seen
+        )
+        current_outputs_bytes = self._tensor_tree_bytes(
+            self._memory_current_outputs, seen
+        )
+        # Walk the data provider's buffers last, so any pool tensor that is the
+        # same object as a batch tensor already counted above is deduped to 0;
+        # the pool then contributes only its not-yet-served residual.
+        data_provider_buffer_bytes = self._data_provider_buffer_bytes(seen)
+        known_live_bytes = (
+            param_bytes
+            + grad_bytes
+            + optimizer_state_bytes
+            + trainer_buffer_bytes
+            + raw_batch_bytes
+            + scaled_batch_bytes
+            + retained_outputs_bytes
+            + current_outputs_bytes
+            + data_provider_buffer_bytes
+        )
+
+        allocated_bytes = torch.cuda.memory_allocated(self.cfg.device)
+        to_mb = 1 / 1024**2
+        return {
+            "params_mb": param_bytes * to_mb,
+            "grads_mb": grad_bytes * to_mb,
+            "optimizer_state_mb": optimizer_state_bytes * to_mb,
+            "trainer_buffers_mb": trainer_buffer_bytes * to_mb,
+            "raw_batch_mb": raw_batch_bytes * to_mb,
+            "scaled_batch_mb": scaled_batch_bytes * to_mb,
+            "retained_outputs_mb": retained_outputs_bytes * to_mb,
+            "current_outputs_mb": current_outputs_bytes * to_mb,
+            "outputs_mb": (retained_outputs_bytes + current_outputs_bytes) * to_mb,
+            "data_provider_buffers_mb": data_provider_buffer_bytes * to_mb,
+            "known_live_mb": known_live_bytes * to_mb,
+            "unattributed_allocated_mb": (allocated_bytes - known_live_bytes) * to_mb,
+        }
+
+    def _record_memory_phase(self, phase: str) -> None:
+        if not self._profile_memory:
+            return
+        # Optional: force the caching allocator to release empty blocks back
+        # to the CUDA driver before the snapshot, so driver_used_mb reflects
+        # *current* live tensors rather than the historical watermark. Off by
+        # default — empty_cache stalls the device and adds tens of ms per
+        # phase, so we only flip it on for memory-profiling runs. Enabled via
+        # cfg.record_memory_empty_cache (or the legacy SAE_RECORD_EMPTY_CACHE=1).
+        if (
+            getattr(self.cfg, "record_memory_empty_cache", False)
+            or os.environ.get("SAE_RECORD_EMPTY_CACHE") == "1"
+        ):
+            torch.cuda.synchronize(self.cfg.device)
+            torch.cuda.empty_cache()
+        torch.cuda.synchronize(self.cfg.device)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self.cfg.device)
+        record = {
+            "step": self.n_training_steps + 1,
+            "n_training_samples": self.n_training_samples,
+            "rank": self._memory_rank,
+            "phase": phase,
+            "allocated_mb": torch.cuda.memory_allocated(self.cfg.device) / 1024**2,
+            "reserved_mb": torch.cuda.memory_reserved(self.cfg.device) / 1024**2,
+            "peak_allocated_mb": torch.cuda.max_memory_allocated(self.cfg.device) / 1024**2,
+            "peak_reserved_mb": torch.cuda.max_memory_reserved(self.cfg.device) / 1024**2,
+            "driver_used_mb": (total_bytes - free_bytes) / 1024**2,
+        }
+        record.update(self._component_memory_stats_mb())
+        self._memory_phase_records.append(record)
+
+        if os.environ.get("SAE_DUMP_LIVE_TENSORS") == "1" and phase in {
+            "after_data_fetch", "after_optimizer_step"
+        } and self.n_training_steps + 1 in {15, 16}:
+            self._dump_live_tensors(phase, self.n_training_steps + 1)
+            if os.environ.get("SAE_DUMP_ALLOC_SNAPSHOT") == "1":
+                self._dump_alloc_snapshot(phase, self.n_training_steps + 1)
+            if os.environ.get("SAE_DUMP_SAVED_TENSORS") == "1":
+                self._dump_saved_tensors_via_grad_fn(phase, self.n_training_steps + 1)
+
+        torch.cuda.reset_peak_memory_stats(self.cfg.device)
+
+    def _dump_live_tensors(self, phase: str, step: int) -> None:
+        import gc as _gc
+        path = self.memory_phase_history_path
+        if path is None:
+            return
+        out = path.parent / f"live_tensors_rank{self._memory_rank}.jsonl"
+        by_shape: dict[tuple, dict] = {}
+        for obj in _gc.get_objects():
+            try:
+                if not torch.is_tensor(obj):
+                    continue
+                if obj.device.type != "cuda":
+                    continue
+                key = (tuple(obj.shape), str(obj.dtype))
+                d = by_shape.setdefault(key, {"count": 0, "bytes": 0})
+                d["count"] += 1
+                d["bytes"] += obj.numel() * obj.element_size()
+            except Exception:
+                continue
+        rows = sorted(by_shape.items(), key=lambda kv: -kv[1]["bytes"])
+        snap = {
+            "step": step, "phase": phase, "rank": self._memory_rank,
+            "allocated_mb": torch.cuda.memory_allocated(self.cfg.device) / 1024**2,
+            "rows": [
+                {"shape": list(k[0]), "dtype": k[1],
+                 "count": v["count"], "MB": v["bytes"]/1024**2}
+                for k, v in rows[:40]
+            ],
+        }
+        with open(out, "a") as f:
+            f.write(json.dumps(snap) + "\n")
+
+    def _dump_alloc_snapshot(self, phase: str, step: int) -> None:
+        """Use torch.cuda.memory._snapshot() to enumerate ALL live storages,
+        not just gc-visible Python tensors."""
+        path = self.memory_phase_history_path
+        if path is None:
+            return
+        out = path.parent / f"alloc_snapshot_rank{self._memory_rank}_{phase}_step{step}.json"
+        snap = torch.cuda.memory._snapshot()
+        # Reduce: aggregate live segments by allocator size
+        live_blocks = []
+        for seg in snap.get("segments", []):
+            for blk in seg.get("blocks", []):
+                if blk.get("state") in ("active_allocated", "active_pending_free", "inactive"):
+                    live_blocks.append({
+                        "size_MB": blk["size"] / 1024**2,
+                        "state": blk.get("state"),
+                        "frames": [
+                            {"name": f.get("name"), "filename": f.get("filename", "")[-60:],
+                             "line": f.get("line")}
+                            for f in (blk.get("frames") or [])[:16]
+                        ],
+                    })
+        live_blocks.sort(key=lambda b: -b["size_MB"])
+        with open(out, "w") as f:
+            json.dump({"phase": phase, "step": step, "rank": self._memory_rank,
+                       "n_blocks": len(live_blocks),
+                       "total_MB": sum(b["size_MB"] for b in live_blocks),
+                       "blocks": live_blocks[:60]}, f, indent=2)
+
+    def _dump_saved_tensors_via_grad_fn(self, phase: str, step: int) -> None:
+        """Walk grad_fn graphs of retained_outputs.* to enumerate autograd-saved tensors."""
+        path = self.memory_phase_history_path
+        if path is None:
+            return
+        out = path.parent / f"saved_via_gradfn_rank{self._memory_rank}_{phase}_step{step}.json"
+        records = []
+
+        def walk(grad_fn, depth=0, visited=None):
+            if visited is None:
+                visited = set()
+            if grad_fn is None or id(grad_fn) in visited or depth > 20:
+                return
+            visited.add(id(grad_fn))
+            entry = {"depth": depth, "name": type(grad_fn).__name__, "saved_tensors": []}
+            try:
+                # Inspect any 'saved_tensors' attribute (some custom Functions expose it)
+                for attr in dir(grad_fn):
+                    if attr.startswith("_saved_"):
+                        val = getattr(grad_fn, attr)
+                        if torch.is_tensor(val) and val.device.type == "cuda":
+                            entry["saved_tensors"].append({
+                                "attr": attr,
+                                "shape": list(val.shape),
+                                "dtype": str(val.dtype),
+                                "MB": val.numel() * val.element_size() / 1024**2,
+                                "data_ptr": val.data_ptr(),
+                            })
+            except Exception as e:
+                entry["error"] = str(e)
+            records.append(entry)
+            try:
+                for nf in grad_fn.next_functions:
+                    if nf[0] is not None:
+                        walk(nf[0], depth + 1, visited)
+            except Exception:
+                pass
+
+        if self._memory_retained_outputs is not None:
+            for hook_name, output in self._memory_retained_outputs.items():
+                for field_name in ["hidden_pre", "feature_acts", "sae_out", "loss"]:
+                    t = getattr(output, field_name, None)
+                    if torch.is_tensor(t) and t.grad_fn is not None:
+                        records.append({"depth": -1, "name": f"=== {hook_name}.{field_name} ===",
+                                        "saved_tensors": []})
+                        walk(t.grad_fn)
+
+        with open(out, "w") as f:
+            json.dump({"phase": phase, "step": step, "rank": self._memory_rank,
+                       "records": records}, f, indent=2)
+
+    def _aggregate_memory_phase_stats(self) -> dict[str, float]:
+        if not self._memory_phase_records:
+            return {
+                "peak_step_allocated_mb": torch.cuda.max_memory_allocated(self.cfg.device) / 1024**2,
+                "peak_step_reserved_mb": torch.cuda.max_memory_reserved(self.cfg.device) / 1024**2,
+            }
+        return {
+            "peak_step_allocated_mb": max(
+                float(record["peak_allocated_mb"])
+                for record in self._memory_phase_records
+            ),
+            "peak_step_reserved_mb": max(
+                float(record["peak_reserved_mb"])
+                for record in self._memory_phase_records
+            ),
+            "end_step_allocated_mb": float(
+                self._memory_phase_records[-1]["allocated_mb"]
+            ),
+            "end_step_reserved_mb": float(
+                self._memory_phase_records[-1]["reserved_mb"]
+            ),
+        }
+
     def _record_memory_if_needed(self, memory_stats: dict[str, float]) -> None:
         if self.memory_history_path is None:
             return
@@ -1423,6 +1965,12 @@ class MultiSAETrainer:
         with open(self.memory_history_path, "a") as f:
             json.dump(record, f)
             f.write("\n")
+        if self.memory_phase_history_path is None:
+            return
+        with open(self.memory_phase_history_path, "a") as f:
+            for phase_record in self._memory_phase_records:
+                json.dump(phase_record, f)
+                f.write("\n")
 
 
 def _load_tp_sharded_state_dict(
@@ -1432,47 +1980,13 @@ def _load_tp_sharded_state_dict(
 ) -> dict[str, torch.Tensor]:
     """Load only this TP rank's checkpoint tensor slices from safetensors.
 
-    Returns a state_dict containing only this rank's shard. Callers must NOT call
-    process_state_dict_for_loading afterwards.
+    Thin wrapper around :func:`sae_lens.training.tp_checkpoint.load_tp_sharded_state_dict`
+    kept here so existing callers within ``multi_sae_trainer`` need not be
+    rewritten. New call sites should import from ``tp_checkpoint`` directly.
     """
-    from safetensors import safe_open
-    from sae_lens.util import str_to_dtype
+    from sae_lens.training.tp_checkpoint import load_tp_sharded_state_dict
 
-    tp_rank = dist.get_rank(tp_group)
-    tp_size = dist.get_world_size(tp_group)
-    shard_dims: dict[str, int | None] = _tp_param_shard_dims(base_sae)
-
-    _safetensors_dtype_map = {
-        "F32": "float32", "BF16": "bfloat16", "F16": "float16",
-        "F64": "float64", "I32": "int32", "I64": "int64",
-    }
-
-    state_dict: dict[str, torch.Tensor] = {}
-    with safe_open(str(filepath), framework="pt", device="cpu") as f:
-        for k in f.keys():
-            sl = f.get_slice(k)
-            shape = list(sl.get_shape())
-            dtype_str = str(sl.get_dtype())
-            dtype = str_to_dtype(_safetensors_dtype_map.get(dtype_str, dtype_str.lower()))
-            shard_dim = shard_dims.get(k)
-
-            if shard_dim is None:
-                state_dict[k] = f.get_tensor(k)
-            else:
-                full_size = shape[shard_dim]
-                assert full_size % tp_size == 0, (
-                    f"Checkpoint tensor '{k}' size {full_size} on dim {shard_dim} "
-                    f"not divisible by tp_size={tp_size}"
-                )
-                shard_size = full_size // tp_size
-                slices: list[slice] = [slice(None)] * len(shape)
-                slices[shard_dim] = slice(
-                    tp_rank * shard_size,
-                    (tp_rank + 1) * shard_size,
-                )
-                state_dict[k] = sl[tuple(slices)].to(dtype=dtype)
-
-    return state_dict
+    return load_tp_sharded_state_dict(filepath, base_sae, tp_group)
 
 
 def _tp_param_shard_dims(base_sae: Any) -> dict[str, int | None]:
