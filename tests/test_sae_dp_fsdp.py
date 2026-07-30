@@ -1,6 +1,7 @@
 """Tests for sae_dp_mode config validation, forward() dispatch, clip_grad_norm_
 with dp_group, base_sae accessor, and FSDP save/load weight format."""
 
+import json
 import os
 import socket
 import unittest.mock as mock
@@ -11,7 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from safetensors.torch import load_file
-from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+from torch.distributed.fsdp import BackwardPrefetch, FullStateDictConfig, StateDictType
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import ShardingStrategy
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -29,6 +30,7 @@ from sae_lens.constants import (
 from sae_lens.llm_sae_training_runner import LanguageModelSAETrainingRunner
 from sae_lens.saes.sae import TrainStepInput, TrainStepOutput
 from sae_lens.saes.topk_sae import TopKTrainingSAE
+from sae_lens.training.multi_hook_sae import MultiHookSAE
 from sae_lens.training.multi_sae_trainer import MultiSAETrainer
 from sae_lens.training.sae_trainer import SAETrainer
 from tests.helpers import build_topk_sae_training_cfg, random_params
@@ -70,6 +72,8 @@ def _make_trainer_cfg(
         save_mse_every_n_steps=0,
         save_timing_every_n_steps=0,
         save_memory_every_n_steps=0,
+        record_memory_empty_cache=False,
+        record_memory_timeline_step=-1,
         synchronize_timing=False,
         multi_sae_backward_order="forward",
         multi_sae_stats_sync_mode="immediate",
@@ -96,6 +100,42 @@ def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("localhost", 0))
         return int(sock.getsockname()[1])
+
+
+def _build_unified_multi_sae_runner(
+    *,
+    hook_names: list[str],
+    d_in: int,
+    d_sae: int,
+    k: int,
+    sae_dp_mode: str,
+    device: str,
+    fsdp_forward_prefetch: bool = False,
+) -> LanguageModelSAETrainingRunner:
+    cfg = LanguageModelSAERunnerConfig(
+        sae=build_topk_sae_training_cfg(d_in=d_in, d_sae=d_sae, k=k),
+        hook_names=hook_names,
+        sae_dp_mode=sae_dp_mode,  # type: ignore[arg-type]
+        device=device,
+        n_eval_batches=0,
+        multi_sae_distributed_architecture="unified_multi_hook",
+        fsdp_backward_prefetch="backward_post",
+        fsdp_forward_prefetch=fsdp_forward_prefetch,
+    )
+    runner = LanguageModelSAETrainingRunner.__new__(LanguageModelSAETrainingRunner)
+    runner.cfg = cfg
+    runner.use_shard_routing = False
+    runner.sae_tp_size = 1
+    runner.sae_dp_size = dist.get_world_size() if dist.is_initialized() else 1
+    runner.sae_pp_size = 1
+    runner.hook_names = list(hook_names)
+    runner._pp_hook_names = list(hook_names)
+    runner.sae_by_hook = {}
+    runner.base_sae_by_hook = {}
+    runner.multi_hook_sae = None
+    runner.activations_store = None
+    runner._init_multi_saes()
+    return runner
 
 
 class _RecordingWrapper(torch.nn.Module):
@@ -401,6 +441,257 @@ def _fsdp_resume_worker(
         dist.destroy_process_group()
 
 
+def _unified_ddp_worker(
+    rank: int,
+    world_size: int,
+    hook_names: list[str],
+    d_in: int,
+    d_sae: int,
+    k: int,
+    state_dict_by_hook: dict[str, dict[str, torch.Tensor]],
+    x_by_hook_per_rank: dict[str, list[torch.Tensor]],
+    result_list: list,
+    port: int,
+    save_dir: str,
+) -> None:
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    try:
+        from sae_lens.distributed import init_distributed
+
+        init_distributed(
+            sae_tp_size=1,
+            sae_dp_size=world_size,
+            vllm_tp_size=1,
+            vllm_dp_size=world_size,
+        )
+        runner = _build_unified_multi_sae_runner(
+            hook_names=hook_names,
+            d_in=d_in,
+            d_sae=d_sae,
+            k=k,
+            sae_dp_mode="ddp",
+            device="cpu",
+        )
+        assert isinstance(runner.multi_hook_sae, DDP)
+        ddp_owner = runner.multi_hook_sae
+        owner = ddp_owner.module
+        assert isinstance(owner, MultiHookSAE)
+        root_state_dict = owner.merge_state_dict_by_hook(state_dict_by_hook)
+        ddp_owner.module.load_state_dict(root_state_dict)
+        base_sae_by_hook = runner.base_sae_by_hook
+
+        cfg = _make_trainer_cfg(
+            total_training_samples=x_by_hook_per_rank[hook_names[0]][rank].shape[0]
+            * world_size,
+            train_batch_size_samples=x_by_hook_per_rank[hook_names[0]][rank].shape[0],
+        )
+        cfg.checkpoint_path = save_dir
+        cfg.multi_sae_distributed_architecture = "unified_multi_hook"
+        trainer = MultiSAETrainer(
+            hook_names=hook_names,
+            sae_by_hook=base_sae_by_hook,
+            base_sae_by_hook=base_sae_by_hook,
+            multi_hook_sae=ddp_owner,
+            data_provider=mock.MagicMock(),
+            save_checkpoint_fn=None,
+            cfg=cfg,
+            dp_group=dist.group.WORLD,
+            token_count_weighted_dp=False,
+            sae_dp_mode="ddp",
+        )
+        batch_by_hook = {
+            hook_name: x_by_hook_per_rank[hook_name][rank]
+            for hook_name in hook_names
+        }
+        outputs, _ = trainer._train_step(batch_by_hook, local_n=batch_by_hook[hook_names[0]].shape[0])
+        trainer.n_training_steps = 1
+        trainer.n_training_samples = batch_by_hook[hook_names[0]].shape[0]
+        trainer.save_checkpoint("step")
+        dist.barrier()
+
+        checkpoint_path = Path(save_dir) / "step"
+        saved_architecture = None
+        saved_keys_by_hook = None
+        saved_manifest_architecture = None
+        if rank == 0:
+            state = torch.load(checkpoint_path / TRAINER_STATE_FILENAME, map_location="cpu")
+            saved_architecture = state["multi_sae_distributed_architecture"]
+            manifest = json.loads(
+                (checkpoint_path / "multi_sae_manifest.json").read_text()
+            )
+            saved_manifest_architecture = manifest["multi_sae_distributed_architecture"]
+            saved_keys_by_hook = {
+                hook_name: sorted(
+                    load_file(
+                        checkpoint_path
+                        / hook_name.replace(".", "_")
+                        / SAE_WEIGHTS_FILENAME
+                    )
+                )
+                for hook_name in hook_names
+            }
+
+        result_list.append(
+            (
+                rank,
+                {
+                    hook_name: {
+                        name: param.detach().clone()
+                        for name, param in base_sae_by_hook[hook_name].named_parameters()
+                    }
+                    for hook_name in hook_names
+                },
+                list(outputs.keys()),
+                sum(isinstance(module, DDP) for module in ddp_owner.modules()),
+                isinstance(ddp_owner.module, MultiHookSAE),
+                {
+                    hook_name: isinstance(owner.get_raw_sae(hook_name), DDP)
+                    for hook_name in hook_names
+                },
+                saved_architecture,
+                saved_manifest_architecture,
+                saved_keys_by_hook,
+            )
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _unified_fsdp_worker(
+    rank: int,
+    world_size: int,
+    hook_names: list[str],
+    d_in: int,
+    d_sae: int,
+    k: int,
+    state_dict_by_hook: dict[str, dict[str, torch.Tensor]],
+    x_by_hook_per_rank: dict[str, list[torch.Tensor]],
+    result_list: list,
+    port: int,
+    save_dir: str,
+) -> None:
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    device = f"cuda:{rank}"
+    try:
+        from sae_lens.distributed import init_distributed
+
+        init_distributed(
+            sae_tp_size=1,
+            sae_dp_size=world_size,
+            vllm_tp_size=1,
+            vllm_dp_size=world_size,
+        )
+        runner = _build_unified_multi_sae_runner(
+            hook_names=hook_names,
+            d_in=d_in,
+            d_sae=d_sae,
+            k=k,
+            sae_dp_mode="fsdp",
+            device=device,
+            fsdp_forward_prefetch=True,
+        )
+        assert isinstance(runner.multi_hook_sae, FSDP)
+        fsdp_owner = runner.multi_hook_sae
+        root_module = fsdp_owner.module
+        assert isinstance(root_module, MultiHookSAE)
+        root_state_dict = root_module.merge_state_dict_by_hook(state_dict_by_hook)
+        with FSDP.state_dict_type(fsdp_owner, StateDictType.FULL_STATE_DICT):
+            fsdp_owner.load_state_dict(root_state_dict)
+        child_modules = [
+            root_module.saes[root_module.module_key_by_hook[hook_name]]
+            for hook_name in hook_names
+        ]
+        child_modules_are_fsdp = [isinstance(module, FSDP) for module in child_modules]
+        fsdp_module_count = len(FSDP.fsdp_modules(fsdp_owner))
+        base_sae_by_hook = runner.base_sae_by_hook
+
+        cfg = _make_trainer_cfg(
+            device=device,
+            total_training_samples=x_by_hook_per_rank[hook_names[0]][rank].shape[0]
+            * world_size,
+            train_batch_size_samples=x_by_hook_per_rank[hook_names[0]][rank].shape[0],
+        )
+        cfg.checkpoint_path = save_dir
+        cfg.multi_sae_distributed_architecture = "unified_multi_hook"
+        trainer = MultiSAETrainer(
+            hook_names=hook_names,
+            sae_by_hook=base_sae_by_hook,
+            base_sae_by_hook=base_sae_by_hook,
+            multi_hook_sae=fsdp_owner,
+            data_provider=mock.MagicMock(),
+            save_checkpoint_fn=None,
+            cfg=cfg,
+            dp_group=dist.group.WORLD,
+            token_count_weighted_dp=False,
+            sae_dp_mode="fsdp",
+        )
+        batch_by_hook = {
+            hook_name: x_by_hook_per_rank[hook_name][rank].to(device)
+            for hook_name in hook_names
+        }
+        outputs, _ = trainer._train_step(batch_by_hook, local_n=batch_by_hook[hook_names[0]].shape[0])
+        trainer.n_training_steps = 1
+        trainer.n_training_samples = batch_by_hook[hook_names[0]].shape[0]
+        trainer.save_checkpoint("step")
+        dist.barrier()
+
+        root_exec_order_data = getattr(fsdp_owner, "_exec_order_data", None)
+        exec_order_shared = all(
+            getattr(module, "_exec_order_data", None) is root_exec_order_data
+            for module in child_modules
+        )
+        child_root_flags = [getattr(module, "_is_root", None) for module in child_modules]
+        child_backward_prefetch = [
+            getattr(module, "backward_prefetch", None) for module in child_modules
+        ]
+        child_forward_prefetch = [
+            getattr(module, "forward_prefetch", None) for module in child_modules
+        ]
+
+        checkpoint_path = Path(save_dir) / "step"
+        saved_architecture = None
+        saved_keys_by_hook = None
+        if rank == 0:
+            state = torch.load(checkpoint_path / TRAINER_STATE_FILENAME, map_location="cpu")
+            saved_architecture = state["multi_sae_distributed_architecture"]
+            saved_keys_by_hook = {
+                hook_name: sorted(
+                    load_file(
+                        checkpoint_path
+                        / hook_name.replace(".", "_")
+                        / SAE_WEIGHTS_FILENAME
+                    )
+                )
+                for hook_name in hook_names
+            }
+
+        result_list.append(
+            (
+                rank,
+                list(outputs.keys()),
+                fsdp_module_count,
+                child_modules_are_fsdp,
+                getattr(fsdp_owner, "_is_root", None),
+                child_root_flags,
+                root_exec_order_data is not None,
+                exec_order_shared,
+                getattr(fsdp_owner, "backward_prefetch", None),
+                getattr(fsdp_owner, "forward_prefetch", None),
+                child_backward_prefetch,
+                child_forward_prefetch,
+                saved_architecture,
+                saved_keys_by_hook,
+            )
+        )
+    finally:
+        dist.destroy_process_group()
+
+
 # ---------------------------------------------------------------------------
 # Config validation
 # ---------------------------------------------------------------------------
@@ -426,6 +717,58 @@ def test_multi_hook_defaults_manual_to_ddp_without_dist() -> None:
             ],
         )
     assert cfg.sae_dp_mode == "ddp"
+
+
+def test_multi_sae_distributed_architecture_defaults_to_legacy() -> None:
+    cfg = LanguageModelSAERunnerConfig(sae=build_topk_sae_training_cfg())
+
+    assert cfg.multi_sae_distributed_architecture == "legacy_per_hook_wrapper"
+    assert cfg.fsdp_forward_prefetch is False
+
+
+def test_multi_sae_distributed_architecture_rejects_invalid_value() -> None:
+    with pytest.raises(ValueError, match="multi_sae_distributed_architecture"):
+        LanguageModelSAERunnerConfig(
+            sae=build_topk_sae_training_cfg(),
+            multi_sae_distributed_architecture="invalid",  # type: ignore[arg-type]
+        )
+
+
+def test_unified_multi_hook_requires_combined_backward() -> None:
+    with pytest.raises(ValueError, match="multi_sae_backward_mode='combined'"):
+        LanguageModelSAERunnerConfig(
+            sae=build_topk_sae_training_cfg(),
+            hook_names=[
+                "blocks.20.hook_resid_post",
+                "blocks.21.hook_resid_post",
+            ],
+            multi_sae_distributed_architecture="unified_multi_hook",
+            multi_sae_backward_mode="sequential",
+        )
+
+
+def test_runner_unified_multi_hook_builds_single_owner_without_dist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert not dist.is_initialized(), "dist must not be initialized for this test"
+    hook_names = ["blocks.20.hook_resid_post", "blocks.21.hook_resid_post"]
+    cfg = LanguageModelSAERunnerConfig(
+        sae=build_topk_sae_training_cfg(),
+        hook_names=hook_names,
+        device="cpu",
+        n_eval_batches=0,
+        multi_sae_distributed_architecture="unified_multi_hook",
+    )
+    monkeypatch.setattr(
+        "sae_lens.llm_sae_training_runner.ActivationsStore.from_config",
+        mock.Mock(return_value=mock.MagicMock()),
+    )
+
+    runner = LanguageModelSAETrainingRunner(cfg=cfg, override_model=mock.MagicMock())
+
+    assert isinstance(runner.multi_hook_sae, MultiHookSAE)
+    assert set(runner.sae_by_hook) == set(hook_names)
+    assert runner.sae_by_hook == runner.base_sae_by_hook
 
 
 def test_multi_sae_trainer_ddp_mode_allows_dp1_without_dist() -> None:
@@ -1114,6 +1457,123 @@ def test_ddp_supports_tp_sharded_sae_and_saves_full_weight_shapes(
             assert saved_shapes == expected_shapes
 
 
+def test_unified_multi_hook_ddp_single_root_matches_reference_and_saves_per_hook_weights(
+    tmp_path: Path,
+) -> None:
+    hook_names = ["blocks.20.hook_resid_post", "blocks.21.hook_resid_post"]
+    d_in, d_sae, k = 8, 16, 4
+    world_size = 2
+    state_dict_by_hook: dict[str, dict[str, torch.Tensor]] = {}
+    for hook_name in hook_names:
+        sae = _make_sae(d_in=d_in, d_sae=d_sae, k=k)
+        state_dict_by_hook[hook_name] = {
+            name: value.clone() for name, value in sae.state_dict().items()
+        }
+    x_by_hook_per_rank = {
+        hook_name: [torch.randn(4, d_in), torch.randn(4, d_in)]
+        for hook_name in hook_names
+    }
+
+    ref_base_sae_by_hook: dict[str, TopKTrainingSAE] = {}
+    for hook_name in hook_names:
+        sae = _make_sae(d_in=d_in, d_sae=d_sae, k=k)
+        sae.load_state_dict(state_dict_by_hook[hook_name])
+        ref_base_sae_by_hook[hook_name] = sae
+    ref_owner = MultiHookSAE(hook_names, ref_base_sae_by_hook)
+    ref_cfg = _make_trainer_cfg(
+        total_training_samples=sum(
+            batch.shape[0] for batch in x_by_hook_per_rank[hook_names[0]]
+        ),
+        train_batch_size_samples=sum(
+            batch.shape[0] for batch in x_by_hook_per_rank[hook_names[0]]
+        ),
+    )
+    ref_cfg.multi_sae_distributed_architecture = "unified_multi_hook"
+    ref_trainer = MultiSAETrainer(
+        hook_names=hook_names,
+        sae_by_hook=ref_base_sae_by_hook,
+        base_sae_by_hook=ref_base_sae_by_hook,
+        multi_hook_sae=ref_owner,
+        data_provider=mock.MagicMock(),
+        save_checkpoint_fn=None,
+        cfg=ref_cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+    ref_trainer._train_step(
+        {
+            hook_name: torch.cat(x_by_hook_per_rank[hook_name], dim=0)
+            for hook_name in hook_names
+        },
+        local_n=sum(batch.shape[0] for batch in x_by_hook_per_rank[hook_names[0]]),
+    )
+    expected_params_by_hook = {
+        hook_name: {
+            name: param.detach().clone()
+            for name, param in ref_base_sae_by_hook[hook_name].named_parameters()
+        }
+        for hook_name in hook_names
+    }
+
+    manager = mp.Manager()
+    result_list = manager.list()
+    mp.spawn(
+        _unified_ddp_worker,
+        args=(
+            world_size,
+            hook_names,
+            d_in,
+            d_sae,
+            k,
+            state_dict_by_hook,
+            x_by_hook_per_rank,
+            result_list,
+            _find_free_port(),
+            str(tmp_path),
+        ),
+        nprocs=world_size,
+        join=True,
+    )
+    results = sorted(result_list, key=lambda item: item[0])
+    assert len(results) == world_size
+
+    expected_keys = {
+        hook_name: sorted(state_dict_by_hook[hook_name]) for hook_name in hook_names
+    }
+    for (
+        rank,
+        params_by_hook,
+        output_order,
+        ddp_module_count,
+        root_module_is_multi_hook,
+        per_hook_is_ddp,
+        saved_architecture,
+        saved_manifest_architecture,
+        saved_keys_by_hook,
+    ) in results:
+        assert output_order == hook_names
+        assert ddp_module_count == 1
+        assert root_module_is_multi_hook
+        assert per_hook_is_ddp == {hook_name: False for hook_name in hook_names}
+        for hook_name in hook_names:
+            for name, expected in expected_params_by_hook[hook_name].items():
+                torch.testing.assert_close(
+                    params_by_hook[hook_name][name],
+                    expected,
+                    atol=1e-5,
+                    rtol=1e-4,
+                    msg=(
+                        f"rank {rank} unified DDP param {hook_name}/{name} "
+                        "differs from full-batch reference"
+                    ),
+                )
+        if rank == 0:
+            assert saved_architecture == "unified_multi_hook"
+            assert saved_manifest_architecture == "unified_multi_hook"
+            assert saved_keys_by_hook == expected_keys
+
+
 @pytest.mark.skipif(
     torch.cuda.device_count() < 2,
     reason="FSDP resume integration test requires at least 2 CUDA devices",
@@ -1168,6 +1628,86 @@ def test_fsdp_saves_and_loads_sharded_optimizer_state(tmp_path: Path) -> None:
             assert saved_mode == "fsdp"
             assert saved_format == "fsdp_sharded"
             assert saved_dp_size == world_size
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="Unified multi-hook FSDP integration test requires at least 2 CUDA devices",
+)
+def test_unified_multi_hook_fsdp_uses_common_root_and_child_units(
+    tmp_path: Path,
+) -> None:
+    hook_names = ["blocks.20.hook_resid_post", "blocks.21.hook_resid_post"]
+    d_in, d_sae, k = 8, 16, 4
+    world_size = 2
+    state_dict_by_hook: dict[str, dict[str, torch.Tensor]] = {}
+    for hook_name in hook_names:
+        sae = _make_sae(d_in=d_in, d_sae=d_sae, k=k)
+        state_dict_by_hook[hook_name] = {
+            name: value.clone() for name, value in sae.state_dict().items()
+        }
+    x_by_hook_per_rank = {
+        hook_name: [torch.randn(4, d_in), torch.randn(4, d_in)]
+        for hook_name in hook_names
+    }
+
+    manager = mp.Manager()
+    result_list = manager.list()
+    mp.spawn(
+        _unified_fsdp_worker,
+        args=(
+            world_size,
+            hook_names,
+            d_in,
+            d_sae,
+            k,
+            state_dict_by_hook,
+            x_by_hook_per_rank,
+            result_list,
+            _find_free_port(),
+            str(tmp_path),
+        ),
+        nprocs=world_size,
+        join=True,
+    )
+    results = sorted(result_list, key=lambda item: item[0])
+    assert len(results) == world_size
+
+    expected_keys = {
+        hook_name: sorted(state_dict_by_hook[hook_name]) for hook_name in hook_names
+    }
+    for (
+        rank,
+        output_order,
+        fsdp_module_count,
+        child_modules_are_fsdp,
+        root_is_root,
+        child_root_flags,
+        has_exec_order_data,
+        exec_order_shared,
+        root_backward_prefetch,
+        root_forward_prefetch,
+        child_backward_prefetch,
+        child_forward_prefetch,
+        saved_architecture,
+        saved_keys_by_hook,
+    ) in results:
+        assert output_order == hook_names
+        assert fsdp_module_count == len(hook_names) + 1
+        assert child_modules_are_fsdp == [True for _ in hook_names]
+        assert root_is_root is True
+        assert child_root_flags == [False for _ in hook_names]
+        assert has_exec_order_data
+        assert exec_order_shared, f"rank {rank} FSDP units do not share exec order"
+        assert root_backward_prefetch == BackwardPrefetch.BACKWARD_POST
+        assert root_forward_prefetch is True
+        assert child_backward_prefetch == [
+            BackwardPrefetch.BACKWARD_POST for _ in hook_names
+        ]
+        assert child_forward_prefetch == [True for _ in hook_names]
+        if rank == 0:
+            assert saved_architecture == "unified_multi_hook"
+            assert saved_keys_by_hook == expected_keys
 
 
 # ---------------------------------------------------------------------------

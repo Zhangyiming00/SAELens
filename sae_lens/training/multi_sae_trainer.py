@@ -39,6 +39,7 @@ from sae_lens.constants import (
 from sae_lens.profiling import cuda_nvtx_range, nccl_nvtx_range
 from sae_lens.saes.sae import TrainingSAE, TrainStepInput, TrainStepOutput
 from sae_lens.training.activation_scaler import ActivationScaler
+from sae_lens.training.multi_hook_sae import MultiHookSAE
 from sae_lens.training.optim import get_lr_scheduler
 from sae_lens.training.sae_trainer import (
     SaveCheckpointFn,
@@ -85,8 +86,10 @@ class MultiSAETrainer:
         backward_mode: str = "combined",
         seed_mode: str = "same",
         append_logs: bool = False,
+        multi_hook_sae: Any | None = None,
     ) -> None:
         self.hook_names = hook_names
+        self.multi_hook_sae = multi_hook_sae
         self.sae_by_hook = sae_by_hook
         self.base_sae_by_hook = base_sae_by_hook
         self.data_provider = data_provider
@@ -97,6 +100,13 @@ class MultiSAETrainer:
         self.sae_dp_mode = sae_dp_mode
         self.backward_mode = backward_mode
         self.seed_mode = seed_mode
+        self.multi_sae_distributed_architecture: Literal[
+            "legacy_per_hook_wrapper", "unified_multi_hook"
+        ] = getattr(
+            cfg,
+            "multi_sae_distributed_architecture",
+            "legacy_per_hook_wrapper",
+        )
         self.backward_order: Literal["forward", "reverse", "largest_first"] = (
             getattr(cfg, "multi_sae_backward_order", "forward")
         )
@@ -114,6 +124,21 @@ class MultiSAETrainer:
             raise ValueError("MultiSAETrainer with FSDP requires a DP process group")
         if self.backward_mode not in ("combined", "sequential"):
             raise ValueError("backward_mode must be 'combined' or 'sequential'")
+        if self.multi_sae_distributed_architecture not in (
+            "legacy_per_hook_wrapper",
+            "unified_multi_hook",
+        ):
+            raise ValueError(
+                "multi_sae_distributed_architecture must be "
+                "'legacy_per_hook_wrapper' or 'unified_multi_hook'"
+            )
+        if self.multi_sae_distributed_architecture == "unified_multi_hook":
+            if self.multi_hook_sae is None:
+                raise ValueError("unified_multi_hook requires multi_hook_sae")
+            if self.backward_mode != "combined":
+                raise ValueError(
+                    "unified_multi_hook only supports combined multi-SAE backward"
+                )
         if self.backward_order not in ("forward", "reverse", "largest_first"):
             raise ValueError(
                 "multi_sae_backward_order must be 'forward', 'reverse', or 'largest_first'"
@@ -125,9 +150,13 @@ class MultiSAETrainer:
         if self.stats_sync_interval < 1:
             raise ValueError("multi_sae_stats_sync_interval must be >= 1")
 
-        params: list[torch.nn.Parameter] = []
-        for hook_name in self.hook_names:
-            params.extend(list(self.sae_by_hook[hook_name].parameters()))
+        if self.multi_sae_distributed_architecture == "unified_multi_hook":
+            assert self.multi_hook_sae is not None
+            params = list(self.multi_hook_sae.parameters())
+        else:
+            params: list[torch.nn.Parameter] = []
+            for hook_name in self.hook_names:
+                params.extend(list(self.sae_by_hook[hook_name].parameters()))
         _adam_kwargs: dict[str, Any] = {
             "lr": cfg.lr,
             "betas": (cfg.adam_beta1, cfg.adam_beta2),
@@ -506,6 +535,7 @@ class MultiSAETrainer:
                 raise TypeError(
                     "MultiSAETrainer expected data_provider to yield dict batches"
                 )
+            self._validate_unified_hook_set(batch_by_hook)
             local_ns = {hook: acts.shape[0] for hook, acts in batch_by_hook.items()}
             if len(set(local_ns.values())) != 1:
                 raise RuntimeError(f"Multi-layer activation sizes diverged: {local_ns}")
@@ -589,8 +619,13 @@ class MultiSAETrainer:
         batch_by_hook: dict[str, torch.Tensor],
         local_n: int,
     ) -> tuple[dict[str, TrainStepOutput], dict[str, float]]:
-        for sae in self.sae_by_hook.values():
-            sae.train()
+        self._validate_unified_hook_set(batch_by_hook)
+        if self.multi_sae_distributed_architecture == "unified_multi_hook":
+            assert self.multi_hook_sae is not None
+            self.multi_hook_sae.train()
+        else:
+            for sae in self.sae_by_hook.values():
+                sae.train()
 
         self.optimizer.zero_grad(set_to_none=True)
         self._record_memory_phase("after_zero_grad_start")
@@ -609,6 +644,9 @@ class MultiSAETrainer:
             self._all_reduce_sum(global_n_t)
             global_n = float(global_n_t.item())
             if global_n == 0:
+                if self.multi_sae_distributed_architecture == "unified_multi_hook":
+                    self._train_step_unified_zero_backward(batch_by_hook, phase_timing)
+                    return outputs, phase_timing
                 for hook_name in self.hook_names:
                     dummy = torch.zeros(
                         1,
@@ -630,6 +668,35 @@ class MultiSAETrainer:
         return self._train_step_sequential_backward(
             batch_by_hook, local_n, loss_scale, phase_timing
         )
+
+    def _train_step_unified_zero_backward(
+        self,
+        batch_by_hook: dict[str, torch.Tensor],
+        phase_timing: dict[str, float],
+    ) -> None:
+        assert self.multi_hook_sae is not None
+        step_inputs_by_hook: dict[str, TrainStepInput] = {}
+        for hook_name in self.hook_names:
+            acts = batch_by_hook[hook_name]
+            dummy = torch.zeros(
+                1,
+                self.base_sae_by_hook[hook_name].cfg.d_in,
+                device=self.cfg.device,
+                dtype=acts.dtype,
+            )
+            step_inputs_by_hook[hook_name] = self._build_step_input(hook_name, dummy)
+        t_fwd = time.perf_counter()
+        with cuda_nvtx_range("multi_sae:unified_forward"):
+            with self.autocast_if_enabled:
+                outputs = self.multi_hook_sae(step_inputs_by_hook)
+        phase_timing["sae_forward_time_s"] += time.perf_counter() - t_fwd
+        total_loss = sum(output.loss * 0.0 for output in outputs.values())
+        t_bwd = time.perf_counter()
+        with cuda_nvtx_range("multi_sae:combined_backward"):
+            self.grad_scaler.scale(total_loss).backward()
+        phase_timing["sae_backward_time_s"] += time.perf_counter() - t_bwd
+        self.grad_scaler.unscale_(self.optimizer)
+        self.optimizer.zero_grad(set_to_none=True)
 
     def _train_step_sequential_backward(
         self,
@@ -720,6 +787,11 @@ class MultiSAETrainer:
         loss_scale: float,
         phase_timing: dict[str, float],
     ) -> tuple[dict[str, TrainStepOutput], dict[str, float]]:
+        if self.multi_sae_distributed_architecture == "unified_multi_hook":
+            return self._train_step_unified_combined_backward(
+                batch_by_hook, local_n, loss_scale, phase_timing
+            )
+
         outputs: dict[str, TrainStepOutput] = {}
         scaled_losses: list[torch.Tensor] = []
         for hook_name in self.hook_names:
@@ -789,8 +861,129 @@ class MultiSAETrainer:
         self._record_memory_phase("after_stats_tail")
         return outputs, phase_timing
 
-    def _forward_one(self, hook_name: str, acts: torch.Tensor) -> TrainStepOutput:
-        step_input = TrainStepInput(
+    def _train_step_unified_combined_backward(
+        self,
+        batch_by_hook: dict[str, torch.Tensor],
+        local_n: int,
+        loss_scale: float,
+        phase_timing: dict[str, float],
+    ) -> tuple[dict[str, TrainStepOutput], dict[str, float]]:
+        assert self.multi_hook_sae is not None
+        step_inputs_by_hook: dict[str, TrainStepInput] = {}
+        for hook_name in self.hook_names:
+            acts = batch_by_hook[hook_name]
+            if local_n == 0:
+                acts = torch.zeros(
+                    1,
+                    self.base_sae_by_hook[hook_name].cfg.d_in,
+                    device=self.cfg.device,
+                    dtype=acts.dtype,
+                )
+            step_inputs_by_hook[hook_name] = self._build_step_input(hook_name, acts)
+
+        t_fwd = time.perf_counter()
+        with cuda_nvtx_range("multi_sae:unified_forward"):
+            context = (
+                nccl_nvtx_range(
+                    "nccl:multi_sae_fsdp_forward_param_all_gather", self.dp_group
+                )
+                if self._is_fsdp
+                else contextlib.nullcontext()
+            )
+            with context:
+                with self.autocast_if_enabled:
+                    outputs = self.multi_hook_sae(step_inputs_by_hook)
+        phase_timing["sae_forward_time_s"] += time.perf_counter() - t_fwd
+
+        scaled_losses: list[torch.Tensor] = []
+        for hook_name in self.hook_names:
+            output = outputs[hook_name]
+            if local_n == 0:
+                scaled_losses.append(output.loss * 0.0)
+                continue
+            t_stats = time.perf_counter()
+            with cuda_nvtx_range(f"multi_sae:{hook_name}:stats_sync"):
+                self._update_stats(hook_name, output, local_n)
+            phase_timing["sae_stats_sync_time_s"] += time.perf_counter() - t_stats
+            scaled_losses.append(output.loss * loss_scale)
+        self._memory_current_outputs = outputs
+        self._record_memory_phase("after_forward_all")
+
+        total_loss = sum(scaled_losses)
+        t_bwd = time.perf_counter()
+        with nccl_nvtx_range(
+            f"nccl:multi_sae_{self.sae_dp_mode}_combined_backward", self.dp_group
+        ):
+            with cuda_nvtx_range("multi_sae:combined_backward"):
+                self.grad_scaler.scale(total_loss).backward()
+        phase_timing["sae_backward_time_s"] += time.perf_counter() - t_bwd
+        self._record_memory_phase("after_combined_backward")
+
+        self._post_backward_and_optimizer_step(phase_timing)
+        return outputs, phase_timing
+
+    def _post_backward_and_optimizer_step(self, phase_timing: dict[str, float]) -> None:
+        t_post = time.perf_counter()
+        with cuda_nvtx_range("multi_sae:optimizer_unscale"):
+            self.grad_scaler.unscale_(self.optimizer)
+        for hook_name in self.hook_names:
+            base_sae = self.base_sae_by_hook[hook_name]
+            with cuda_nvtx_range(f"multi_sae:{hook_name}:tp_sync"):
+                base_sae.sync_tensor_parallel_gradients()
+            with cuda_nvtx_range(f"multi_sae:{hook_name}:clip_grad"):
+                self._clip_hook_grad_norm_(hook_name, max_norm=1.0)
+        phase_timing["sae_post_backward_time_s"] += time.perf_counter() - t_post
+        self._record_memory_phase("after_post_backward")
+        t_opt = time.perf_counter()
+        with cuda_nvtx_range("multi_sae:optimizer_step"):
+            self.grad_scaler.step(self.optimizer)
+        with cuda_nvtx_range("multi_sae:scaler_update"):
+            self.grad_scaler.update()
+        self._record_memory_phase("after_optimizer_step")
+        t_stats = time.perf_counter()
+        with cuda_nvtx_range("multi_sae:stats_sync_tail"):
+            self._sync_deferred_stats_if_needed(force=False)
+        phase_timing["sae_stats_sync_time_s"] += time.perf_counter() - t_stats
+        phase_timing["sae_optimizer_time_s"] += time.perf_counter() - t_opt
+        self._record_memory_phase("after_stats_tail")
+
+    def _clip_hook_grad_norm_(self, hook_name: str, max_norm: float) -> torch.Tensor:
+        base_sae = self.base_sae_by_hook[hook_name]
+        return base_sae.clip_grad_norm_(
+            max_norm,
+            dp_group=self.dp_group if self._is_fsdp else None,
+        )
+
+    def _validate_unified_hook_set(
+        self,
+        batch_by_hook: dict[str, torch.Tensor],
+    ) -> None:
+        if self.multi_sae_distributed_architecture != "unified_multi_hook":
+            return
+        actual_hooks = set(batch_by_hook)
+        expected_hooks = set(self.hook_names)
+        if actual_hooks != expected_hooks:
+            raise ValueError(
+                "unified_multi_hook requires every step to contain exactly "
+                f"{self.hook_names}; got {sorted(actual_hooks)}"
+            )
+
+    def _multi_hook_root_module(self) -> MultiHookSAE:
+        if self.multi_hook_sae is None:
+            raise ValueError("multi_hook_sae is not configured")
+        module = self.multi_hook_sae
+        if isinstance(module, DDP):
+            module = module.module
+        elif isinstance(module, FSDP):
+            module = module.module
+        if not isinstance(module, MultiHookSAE):
+            raise TypeError(
+                f"Expected MultiHookSAE owner, got {type(module).__name__}"
+            )
+        return module
+
+    def _build_step_input(self, hook_name: str, acts: torch.Tensor) -> TrainStepInput:
+        return TrainStepInput(
             sae_in=acts,
             dead_neuron_mask=(
                 self.n_forward_passes_since_fired_by_hook[hook_name]
@@ -800,6 +993,9 @@ class MultiSAETrainer:
             n_training_steps=self.n_training_steps,
             is_logging_step=False,
         )
+
+    def _forward_one(self, hook_name: str, acts: torch.Tensor) -> TrainStepOutput:
+        step_input = self._build_step_input(hook_name, acts)
         with self.autocast_if_enabled:
             context = (
                 nccl_nvtx_range(
@@ -937,6 +1133,10 @@ class MultiSAETrainer:
             with open(local_manifest_path, "w") as f:
                 json.dump(self._manifest(self.hook_names), f)
 
+        if self.multi_sae_distributed_architecture == "unified_multi_hook":
+            self._save_unified_models(base_output, inference=True)
+            return
+
         for hook_name in self.hook_names:
             self._save_one_final(base_output, hook_name)
 
@@ -956,7 +1156,61 @@ class MultiSAETrainer:
             "stats_sync_mode": self.stats_sync_mode,
             "stats_sync_interval": self.stats_sync_interval,
             "seed_mode": self.seed_mode,
+            "multi_sae_distributed_architecture": self.multi_sae_distributed_architecture,
         }
+
+    def _unified_state_dict_by_hook(
+        self,
+    ) -> dict[str, dict[str, Any]] | None:
+        if self.multi_hook_sae is None:
+            raise ValueError("unified_multi_hook requires multi_hook_sae")
+        root = self._multi_hook_root_module()
+        dp_rank = self._dp_rank()
+        if self._is_fsdp:
+            fsdp_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(
+                self.multi_hook_sae,
+                StateDictType.FULL_STATE_DICT,
+                fsdp_cfg,
+            ):
+                root_state_dict = self.multi_hook_sae.state_dict()
+            if dp_rank != 0:
+                return None
+        else:
+            if dp_rank != 0:
+                return None
+            root_state_dict = self.multi_hook_sae.state_dict()
+        return root.split_state_dict_by_hook(root_state_dict)
+
+    def _save_unified_models(self, base_path: Path, *, inference: bool) -> None:
+        state_dict_by_hook = self._unified_state_dict_by_hook()
+        if state_dict_by_hook is None:
+            return
+        tp_rank = self._tp_rank()
+        for hook_name in self.hook_names:
+            base_sae = self.base_sae_by_hook[hook_name]
+            state_dict = state_dict_by_hook[hook_name]
+            if inference:
+                base_sae.process_state_dict_for_saving_inference(state_dict)
+            else:
+                base_sae.process_state_dict_for_saving(state_dict)
+            out_dir = base_path / sanitize_hook_name_for_path(hook_name)
+            out_dir.mkdir(exist_ok=True, parents=True)
+            if tp_rank == 0:
+                save_file(state_dict, out_dir / SAE_WEIGHTS_FILENAME)
+                cfg_dict = (
+                    base_sae.cfg.get_inference_sae_cfg_dict()
+                    if inference
+                    else base_sae.cfg.to_dict()
+                )
+                with open(out_dir / SAE_CFG_FILENAME, "w") as f:
+                    json.dump(cfg_dict, f)
+                save_file(
+                    {"sparsity": self.log_feature_sparsity_by_hook[hook_name]},
+                    out_dir / SPARSITY_FILENAME,
+                )
+            if not self._is_fsdp:
+                self._tp_barrier()
 
     def _save_one_final(self, base_output: Path, hook_name: str) -> None:
         sae = self.sae_by_hook[hook_name]
@@ -1003,8 +1257,11 @@ class MultiSAETrainer:
             with open(checkpoint_path / MULTI_SAE_MANIFEST_FILENAME, "w") as f:
                 json.dump(self._manifest(), f)
 
-        for hook_name in self.hook_names:
-            self._save_one_checkpoint_model(checkpoint_path, hook_name)
+        if self.multi_sae_distributed_architecture == "unified_multi_hook":
+            self._save_unified_models(checkpoint_path, inference=False)
+        else:
+            for hook_name in self.hook_names:
+                self._save_one_checkpoint_model(checkpoint_path, hook_name)
 
         self.save_trainer_state(checkpoint_path)
         if self._is_metric_writer_rank():
@@ -1095,6 +1352,7 @@ class MultiSAETrainer:
             "stats_sync_mode": self.stats_sync_mode,
             "stats_sync_interval": self.stats_sync_interval,
             "seed_mode": self.seed_mode,
+            "multi_sae_distributed_architecture": self.multi_sae_distributed_architecture,
         }
         if not self._is_fsdp:
             for hook_name in self.hook_names:
@@ -1120,8 +1378,19 @@ class MultiSAETrainer:
 
     def load_trainer_state(self, checkpoint_path: Path | str) -> None:
         checkpoint_path = Path(checkpoint_path)
-        self._load_checkpoint_models(checkpoint_path)
         state = torch.load(checkpoint_path / TRAINER_STATE_FILENAME, map_location="cpu")
+        saved_architecture = state.get(
+            "multi_sae_distributed_architecture",
+            "legacy_per_hook_wrapper",
+        )
+        if saved_architecture != self.multi_sae_distributed_architecture:
+            raise ValueError(
+                "Cannot resume multi-SAE checkpoint saved with "
+                f"multi_sae_distributed_architecture='{saved_architecture}' "
+                "using current "
+                f"multi_sae_distributed_architecture='{self.multi_sae_distributed_architecture}'."
+            )
+        self._load_checkpoint_models(checkpoint_path)
         hook_state_paths = {
             hook_name: checkpoint_path
             / sanitize_hook_name_for_path(hook_name)
@@ -1298,8 +1567,46 @@ class MultiSAETrainer:
                 self.optimizer.state[param] = loaded_state
 
     def _load_checkpoint_models(self, checkpoint_path: Path) -> None:
+        if self.multi_sae_distributed_architecture == "unified_multi_hook":
+            self._load_unified_checkpoint_models(checkpoint_path)
+            return
         for hook_name in self.hook_names:
             self._load_one_checkpoint_model(checkpoint_path, hook_name)
+
+    def _load_unified_checkpoint_models(self, checkpoint_path: Path) -> None:
+        if self.multi_hook_sae is None:
+            raise ValueError("unified_multi_hook requires multi_hook_sae")
+        root = self._multi_hook_root_module()
+        state_dict_by_hook: dict[str, dict[str, Any]] = {}
+        for hook_name in self.hook_names:
+            base_sae = self.base_sae_by_hook[hook_name]
+            hook_dir = checkpoint_path / sanitize_hook_name_for_path(hook_name)
+            filepath = hook_dir / SAE_WEIGHTS_FILENAME
+            tp_group = getattr(base_sae, "_tp_group", None)
+            if tp_group is not None and dist.get_world_size(tp_group) > 1:
+                state_dict = _load_tp_sharded_state_dict(filepath, base_sae, tp_group)
+            else:
+                state_dict = load_file(filepath)
+                base_sae.process_state_dict_for_loading(state_dict)
+            state_dict_by_hook[hook_name] = state_dict
+
+        root_state_dict = root.merge_state_dict_by_hook(state_dict_by_hook)
+        if self._is_fsdp:
+            with FSDP.state_dict_type(
+                self.multi_hook_sae,
+                StateDictType.FULL_STATE_DICT,
+            ):
+                self.multi_hook_sae.load_state_dict(root_state_dict)
+        elif isinstance(self.multi_hook_sae, DDP):
+            self.multi_hook_sae.module.load_state_dict(root_state_dict)
+        else:
+            self.multi_hook_sae.load_state_dict(root_state_dict)
+        for hook_name in self.hook_names:
+            self._debug_log_loaded_model_state(
+                checkpoint_path,
+                hook_name,
+                self.base_sae_by_hook[hook_name],
+            )
 
     def _load_one_checkpoint_model(self, checkpoint_path: Path, hook_name: str) -> None:
         sae = self.sae_by_hook[hook_name]

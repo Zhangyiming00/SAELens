@@ -55,6 +55,7 @@ from sae_lens.saes.sae import (
 )
 from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.activations_store import ActivationsStore
+from sae_lens.training.multi_hook_sae import MultiHookSAE
 from sae_lens.training.multi_sae_trainer import MultiSAETrainer, sanitize_hook_name_for_path
 from sae_lens.training.sae_trainer import SAETrainer
 from sae_lens.training.types import DataProvider
@@ -1081,6 +1082,7 @@ class LanguageModelSAETrainingRunner:
 
         self.sae_by_hook: dict[str, Any] = {}
         self.base_sae_by_hook: dict[str, TrainingSAE[Any]] = {}
+        self.multi_hook_sae: Any | None = None
         if self.is_multi_sae:
             if self.sae_active:
                 self._init_multi_saes()
@@ -1174,7 +1176,7 @@ class LanguageModelSAETrainingRunner:
                     sharding_strategy=ShardingStrategy.FULL_SHARD,
                     use_orig_params=True,
                     backward_prefetch=self._resolve_fsdp_backward_prefetch(),
-                    forward_prefetch=False,
+                    forward_prefetch=self.cfg.fsdp_forward_prefetch,
                 )
             else:
                 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -1257,6 +1259,42 @@ class LanguageModelSAETrainingRunner:
 
         return sae
 
+    def _multi_sae_tp_group(self) -> "dist.ProcessGroup | None":
+        if self.sae_tp_size <= 1:
+            return None
+        if self.use_shard_routing:
+            import sae_lens.distributed_v2 as v2_mod
+
+            return v2_mod.get_sae_tp_group()
+        return get_tp_group()
+
+    def _create_multi_sae_for_hook(
+        self,
+        idx: int,
+        hook_name: str,
+    ) -> TrainingSAE[Any]:
+        seed = (
+            self.cfg.seed
+            if self.cfg.multi_sae_seed_mode == "same"
+            else self.cfg.seed + idx
+        )
+        return self._create_training_sae(
+            seed=seed,
+            tp_group=self._multi_sae_tp_group(),
+            device=self.cfg.device,
+            hook_metadata_overrides={
+                "hook_name": hook_name,
+                "hook_head_index": self.cfg.hook_head_index,
+                "dataset_path": self.cfg.dataset_path,
+                "model_name": self.cfg.model_name,
+                "model_class_name": self.cfg.model_class_name,
+                "context_size": self.cfg.context_size,
+                "seqpos_slice": self.cfg.seqpos_slice,
+                "prepend_bos": self.cfg.prepend_bos,
+                "exclude_special_tokens": self.cfg.exclude_special_tokens,
+            },
+        )
+
     def _init_multi_saes(self) -> None:
         if self.cfg.sae_dp_mode == "fsdp" and not dist.is_initialized():
             raise ValueError("Multi-layer SAE training with FSDP requires torch distributed.")
@@ -1300,37 +1338,12 @@ class LanguageModelSAETrainingRunner:
             self.activations_store.hook_names = list(self._pp_hook_names)
             self.activations_store.is_multi_hook = True
 
-        for idx, hook_name in enumerate(self._pp_hook_names):
-            seed = (
-                self.cfg.seed
-                if self.cfg.multi_sae_seed_mode == "same"
-                else self.cfg.seed + idx
-            )
-            if self.sae_tp_size > 1:
-                if self.use_shard_routing:
-                    import sae_lens.distributed_v2 as v2_mod
+        if self.cfg.multi_sae_distributed_architecture == "unified_multi_hook":
+            self._init_multi_saes_unified(sae_dp_group, sae_dp_world_size)
+            return
 
-                    tp_group = v2_mod.get_sae_tp_group()
-                else:
-                    tp_group = get_tp_group()
-            else:
-                tp_group = None
-            sae = self._create_training_sae(
-                seed=seed,
-                tp_group=tp_group,
-                device=self.cfg.device,
-                hook_metadata_overrides={
-                    "hook_name": hook_name,
-                    "hook_head_index": self.cfg.hook_head_index,
-                    "dataset_path": self.cfg.dataset_path,
-                    "model_name": self.cfg.model_name,
-                    "model_class_name": self.cfg.model_class_name,
-                    "context_size": self.cfg.context_size,
-                    "seqpos_slice": self.cfg.seqpos_slice,
-                    "prepend_bos": self.cfg.prepend_bos,
-                    "exclude_special_tokens": self.cfg.exclude_special_tokens,
-                },
-            )
+        for idx, hook_name in enumerate(self._pp_hook_names):
+            sae = self._create_multi_sae_for_hook(idx, hook_name)
             self.base_sae_by_hook[hook_name] = sae
 
             wrapped: Any
@@ -1344,7 +1357,7 @@ class LanguageModelSAETrainingRunner:
                     sharding_strategy=ShardingStrategy.FULL_SHARD,
                     use_orig_params=True,
                     backward_prefetch=self._resolve_fsdp_backward_prefetch(),
-                    forward_prefetch=False,
+                    forward_prefetch=self.cfg.fsdp_forward_prefetch,
                 )
             elif sae_dp_world_size > 1:
                 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -1370,6 +1383,57 @@ class LanguageModelSAETrainingRunner:
             else:
                 wrapped = sae
             self.sae_by_hook[hook_name] = wrapped
+
+    def _init_multi_saes_unified(
+        self,
+        sae_dp_group: "dist.ProcessGroup | None",
+        sae_dp_world_size: int,
+    ) -> None:
+        raw_sae_by_hook: dict[str, TrainingSAE[Any]] = {}
+        for idx, hook_name in enumerate(self._pp_hook_names):
+            sae = self._create_multi_sae_for_hook(idx, hook_name)
+            self.base_sae_by_hook[hook_name] = sae
+            raw_sae_by_hook[hook_name] = sae
+
+        raw_multi_hook_sae = MultiHookSAE(list(self._pp_hook_names), raw_sae_by_hook)
+        self.sae_by_hook = dict(raw_sae_by_hook)
+        self.multi_hook_sae = raw_multi_hook_sae
+
+        if self.cfg.sae_dp_mode == "fsdp":
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp.api import ShardingStrategy
+            from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+
+            self.multi_hook_sae = FSDP(
+                raw_multi_hook_sae,
+                process_group=sae_dp_group,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                auto_wrap_policy=ModuleWrapPolicy({TrainingSAE}),
+                use_orig_params=True,
+                backward_prefetch=self._resolve_fsdp_backward_prefetch(),
+                forward_prefetch=self.cfg.fsdp_forward_prefetch,
+            )
+        elif sae_dp_world_size > 1:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+
+            device_ids = None
+            output_device = None
+            device = torch.device(self.cfg.device)
+            if device.type == "cuda":
+                device_index = (
+                    device.index
+                    if device.index is not None
+                    else torch.cuda.current_device()
+                )
+                device_ids = [device_index]
+                output_device = device_index
+            self.multi_hook_sae = DDP(
+                raw_multi_hook_sae,
+                process_group=sae_dp_group,
+                device_ids=device_ids,
+                output_device=output_device,
+                **self._resolve_ddp_kwargs(),
+            )
 
     def _resolve_ddp_kwargs(self) -> dict[str, Any]:
         ddp_kwargs: dict[str, Any] = {}
@@ -1425,7 +1489,7 @@ class LanguageModelSAETrainingRunner:
         logger.info(
             "Effective FSDP config: "
             f"{{'backward_prefetch': {self.cfg.fsdp_backward_prefetch!r}, "
-            "'forward_prefetch': False}}"
+            f"'forward_prefetch': {self.cfg.fsdp_forward_prefetch!r}}}"
         )
         return value
 
@@ -1557,6 +1621,7 @@ class LanguageModelSAETrainingRunner:
             hook_names=pp_hooks,
             sae_by_hook=self.sae_by_hook,
             base_sae_by_hook=self.base_sae_by_hook,
+            multi_hook_sae=self.multi_hook_sae,
             data_provider=self.activations_store,
             save_checkpoint_fn=self.save_checkpoint,
             cfg=self.cfg.to_sae_trainer_config(),
@@ -2140,6 +2205,7 @@ class LanguageModelSAETrainingRunner:
 
         self.sae_by_hook: dict[str, Any] = {}
         self.base_sae_by_hook: dict[str, TrainingSAE[Any]] = {}
+        self.multi_hook_sae = None
         if self.sae_pp_size > 1 and dist.is_initialized():
             import sae_lens.distributed_v2 as v2_mod
             from sae_lens.distributed_v2 import hooks_for_pp_rank
@@ -2824,6 +2890,7 @@ class LanguageModelSAETrainingRunner:
             hook_names=local_hooks,
             sae_by_hook=self.sae_by_hook,
             base_sae_by_hook=self.base_sae_by_hook,
+            multi_hook_sae=None,
             data_provider=provider,
             save_checkpoint_fn=self._streaming_save_checkpoint,
             cfg=self.cfg.to_sae_trainer_config(),

@@ -8,6 +8,7 @@ hooks.  They require a GPU and the local model at /data/models/Llama-3.1-8B.
 
 from __future__ import annotations
 
+import math
 import os
 
 import pytest
@@ -336,6 +337,37 @@ def test_activation_capture_mode_reduces_kv_memory(vllm_model):
     assert cfg.num_gpu_blocks < 2000, (
         f"Expected minimal KV blocks (<2000), got {cfg.num_gpu_blocks}"
     )
+
+
+def test_capture_pool_sized_by_batch_times_context(tokenizer):
+    """capture_batch_size/context_size size the pool to batch*ctx, not mbt.
+
+    With capture params set the pool must hold ceil(batch*ctx/block_size)+1
+    blocks regardless of max_num_batched_tokens (which is deliberately set
+    larger here, so the old sizing would allocate a different, larger pool).
+    """
+    block_size = 16
+    batch, ctx = 2, 256  # batch*ctx = 512 -> ceil(512/16)+1 = 33 blocks
+    model = HookedVLLMModel(
+        MODEL_PATH,
+        tokenizer,
+        capture_batch_size=batch,
+        capture_context_size=ctx,
+        max_model_len=512,
+        max_num_batched_tokens=4096,  # old logic would size to this
+        block_size=block_size,
+        tensor_parallel_size=1,
+    )
+    engine = model.llm.llm_engine
+    cfg = engine.vllm_config.cache_config
+    expected = math.ceil(batch * ctx / block_size) + 1
+    old_logic = math.ceil(4096 / block_size) + 1
+    assert cfg.num_gpu_blocks == expected, (
+        f"pool should be sized by batch*ctx={batch * ctx} -> {expected} blocks, "
+        f"got {cfg.num_gpu_blocks} (old mbt logic would give {old_logic})"
+    )
+    assert engine.vllm_config.additional_config["sae_capture_batch_size"] == batch
+    assert engine.vllm_config.additional_config["sae_capture_context_size"] == ctx
 
 
 # ---------------------------------------------------------------------------

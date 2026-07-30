@@ -58,6 +58,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--d-sae", type=int, default=32768)
     parser.add_argument("--k", type=int, default=128)
+    parser.add_argument(
+        "--no-rescale-acts-by-decoder-norm",
+        dest="rescale_acts_by_decoder_norm",
+        action="store_false",
+        default=True,
+        help="Disable TopK rescale_acts_by_decoder_norm (default: enabled).",
+    )
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--vllm-tp-size", type=int, default=None)
     parser.add_argument("--sae-tp-size", type=int, default=None)
@@ -141,6 +148,16 @@ def parse_args() -> argparse.Namespace:
         "single training step and dump it to memory_timeline_rank{rank}.pickle "
         "in output_path. Open at https://pytorch.org/memory_viz. Profiling-only; "
         "-1 disables.",
+    )
+    parser.add_argument(
+        "--record-vllm-memory-timeline-step",
+        type=int,
+        default=-1,
+        help="When >= 0, record the full vLLM forward allocator history for that "
+        "single activation-generation step and dump it to "
+        "memory_timeline_vllm[_tp{rank}].pickle in output_path (one per TP rank). "
+        "Requires --save-vllm-memory-every-n-steps > 0 (live vLLM). "
+        "Open at https://pytorch.org/memory_viz. -1 disables.",
     )
     parser.add_argument(
         "--append-history-logs",
@@ -241,6 +258,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--multi-sae-distributed-architecture",
+        default="legacy_per_hook_wrapper",
+        choices=["legacy_per_hook_wrapper", "unified_multi_hook"],
+        help=(
+            "Multi-layer SAE distributed wrapper architecture. The default keeps "
+            "legacy per-hook DDP/FSDP wrappers; unified_multi_hook trains through "
+            "one MultiHookSAE owner."
+        ),
+    )
+    parser.add_argument(
         "--ddp-broadcast-buffers",
         dest="ddp_broadcast_buffers",
         action="store_true",
@@ -312,6 +339,19 @@ def parse_args() -> argparse.Namespace:
             "FSDP backward prefetch policy. Use 'none' to disable FSDP's default "
             "BACKWARD_PRE full-parameter prefetch/caching behavior."
         ),
+    )
+    parser.add_argument(
+        "--fsdp-forward-prefetch",
+        dest="fsdp_forward_prefetch",
+        action="store_true",
+        default=False,
+        help="Enable FSDP forward prefetch for unified multi-hook static execution order.",
+    )
+    parser.add_argument(
+        "--no-fsdp-forward-prefetch",
+        dest="fsdp_forward_prefetch",
+        action="store_false",
+        help="Disable FSDP forward prefetch.",
     )
     # Streaming mode (v1): vLLM and SAE processes on separate GPU sets via /dev/shm.
     # Requires sae_dp_size=1. World size = vllm_tp * vllm_dp + sae_tp * 1.
@@ -805,6 +845,19 @@ def main() -> None:
                 ),
             }
         )
+        if args.record_vllm_memory_timeline_step >= 0:
+            # Pickle allocator timeline for one vLLM forward. activations_store
+            # pops these kwargs. Under external_launcher TP>1 every torchrun rank
+            # runs generate() inline and would write the SAME file, so suffix the
+            # path by rank here (mirrors vllm_memory_history_path above).
+            model_kwargs.update(
+                {
+                    "vllm_memory_timeline_step": args.record_vllm_memory_timeline_step,
+                    "vllm_memory_timeline_path": str(
+                        Path(output_path) / f"memory_timeline_vllm_rank{rank}.pickle"
+                    ),
+                }
+            )
 
     device = _resolve_device()
     d_in = (
@@ -819,6 +872,7 @@ def main() -> None:
             k=args.k,
             device=device,
             dtype=args.dtype,
+            rescale_acts_by_decoder_norm=args.rescale_acts_by_decoder_norm,
         ),
         model_name=args.model_name,
         model_class_name="VLLMModel",
@@ -872,6 +926,7 @@ def main() -> None:
         multi_sae_stats_sync_mode=args.multi_sae_stats_sync_mode,
         multi_sae_stats_sync_interval=args.multi_sae_stats_sync_interval,
         multi_sae_seed_mode=args.multi_sae_seed_mode,
+        multi_sae_distributed_architecture=args.multi_sae_distributed_architecture,
         ddp_broadcast_buffers=args.ddp_broadcast_buffers,
         ddp_find_unused_parameters=args.ddp_find_unused_parameters,
         ddp_gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,
@@ -879,6 +934,7 @@ def main() -> None:
         ddp_bucket_cap_mb=args.ddp_bucket_cap_mb,
         ddp_config_strict=args.ddp_config_strict,
         fsdp_backward_prefetch=args.fsdp_backward_prefetch,
+        fsdp_forward_prefetch=args.fsdp_forward_prefetch,
         streaming_mode=args.streaming_mode,
         streaming_chunk_size_tokens=args.streaming_chunk_size_tokens,
         streaming_num_chunks=args.streaming_num_chunks,
@@ -920,6 +976,10 @@ def main() -> None:
         print(f"  multi_sae_stats_sync_mode={cfg.multi_sae_stats_sync_mode}")
         print(f"  multi_sae_stats_sync_interval={cfg.multi_sae_stats_sync_interval}")
         print(f"  multi_sae_seed_mode={cfg.multi_sae_seed_mode}")
+        print(
+            "  multi_sae_distributed_architecture="
+            f"{cfg.multi_sae_distributed_architecture}"
+        )
     if args.ddp_broadcast_buffers is not None:
         print(f"  ddp_broadcast_buffers={args.ddp_broadcast_buffers}")
     if args.ddp_find_unused_parameters is not None:
@@ -934,6 +994,7 @@ def main() -> None:
         print("  ddp_config_strict=True")
     if args.sae_dp_mode == "fsdp":
         print(f"  fsdp_backward_prefetch={args.fsdp_backward_prefetch}")
+        print(f"  fsdp_forward_prefetch={args.fsdp_forward_prefetch}")
     if args.save_mse_every_n_steps > 0:
         print(f"  save_mse_every_n_steps={args.save_mse_every_n_steps}")
     if args.save_timing_every_n_steps > 0:

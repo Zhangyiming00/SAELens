@@ -221,3 +221,5 @@ bash*.txt
 docs/foreach_bench/*
 docs/memory_model*.md
 
+sae_lens/autoconfig*/profile_results/*
+sae_lens/autoconfig/autoconfig*

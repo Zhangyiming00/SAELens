@@ -21,6 +21,7 @@ from sae_lens import __version__, logger
 
 # keeping this unused import since some SAELens deps import DTYPE_MAP from config
 from sae_lens.constants import (
+    DEFAULT_OVERLAP_TRACE_DIR,
     DTYPE_MAP,  # noqa: F401  # pyright: ignore[reportUnusedImport]
 )
 from sae_lens.registry import get_sae_training_class
@@ -207,6 +208,11 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         record_memory_empty_cache (bool): When memory profiling is enabled, call `torch.cuda.empty_cache()` before every per-phase snapshot so `reserved_mb`/`driver_used_mb` reflect current live tensors rather than the historical allocator watermark. This stalls the device and adds tens of ms per phase, so it is only for memory-profiling runs and should be left off for normal training. (default is False)
         record_memory_timeline_step (int): When set to a step index >= 0, capture the full PyTorch allocator history (every alloc/free event with its Python stack, plus the peak-moment snapshot) for that single training step and dump it to `memory_timeline_rank{rank}.pickle` in `output_path`. Open the file at https://pytorch.org/memory_viz to see the timeline and inspect what is resident at the peak. Recording carries noticeable overhead and unbounded memory growth if left on, so it is scoped to exactly one step. Set to -1 to disable. (default is -1)
         synchronize_timing (bool): If True, call `torch.cuda.synchronize()` around timed sections for accurate GPU timings. This changes observed runtime and should only be used for profiling. (default is False)
+        multi_sae_overlap_instrumentation (bool): Write per-hook DDP bucket / FSDP collective overlap events to `overlap_events_rank{rank}.jsonl` under `multi_sae_overlap_trace_dir`. Installs DDP/FSDP communication hooks that replicate the default reduction semantics, plus per-parameter gradient-ready timestamps. Never synchronizes and never reads device memory, but the extra Python callbacks add CPU overhead, so leave it off for throughput runs. (default is False)
+        multi_sae_nvtx_detailed (bool): Emit fine-grained NVTX ranges/marks for each hook's forward, stats, backward, clip and per-bucket communication. Independent of `multi_sae_overlap_instrumentation`: this writes no files. (default is False)
+        multi_sae_overlap_trace_dir (str): Directory for overlap event JSONL files. (default is "results/overlap_trace")
+        multi_sae_overlap_max_steps (int): Stop appending overlap events after this many steps. 0 records every step. (default is 0)
+        multi_sae_distributed_architecture (str): Multi-hook distributed wrapper architecture. "legacy_per_hook_wrapper" preserves the old per-hook DDP/FSDP wrapper behavior. "unified_multi_hook" trains through one MultiHookSAE owner, wrapping the root once for DDP and using one FSDP root with per-hook child units for FSDP. (default is "legacy_per_hook_wrapper")
         verbose (bool): Whether to print verbose output. (default is True)
         model_kwargs (dict[str, Any]): Keyword arguments for `model.run_with_cache`
         model_from_pretrained_kwargs (dict[str, Any], optional): Additional keyword arguments to pass to the model's `from_pretrained` method.
@@ -327,6 +333,13 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     )
     multi_sae_stats_sync_interval: int = 1
     multi_sae_seed_mode: Literal["same", "offset"] = "same"
+    multi_sae_overlap_instrumentation: bool = False
+    multi_sae_nvtx_detailed: bool = False
+    multi_sae_overlap_trace_dir: str = DEFAULT_OVERLAP_TRACE_DIR
+    multi_sae_overlap_max_steps: int = 0
+    multi_sae_distributed_architecture: Literal[
+        "legacy_per_hook_wrapper", "unified_multi_hook"
+    ] = "legacy_per_hook_wrapper"
     ddp_broadcast_buffers: bool | None = None
     ddp_find_unused_parameters: bool | None = None
     ddp_gradient_as_bucket_view: bool | None = None
@@ -336,6 +349,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     fsdp_backward_prefetch: Literal["backward_pre", "backward_post", "none"] = (
         "backward_pre"
     )
+    fsdp_forward_prefetch: bool = False
     sae_pp_size: int = 1
 
     # Streaming mode (v1): vLLM and SAE on separate GPU sets, communicate via /dev/shm.
@@ -367,6 +381,23 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             )
         if self.multi_sae_stats_sync_interval < 1:
             raise ValueError("multi_sae_stats_sync_interval must be >= 1")
+        if self.multi_sae_overlap_max_steps < 0:
+            raise ValueError("multi_sae_overlap_max_steps must be >= 0")
+        if self.multi_sae_distributed_architecture not in (
+            "legacy_per_hook_wrapper",
+            "unified_multi_hook",
+        ):
+            raise ValueError(
+                "multi_sae_distributed_architecture must be "
+                "'legacy_per_hook_wrapper' or 'unified_multi_hook'"
+            )
+        if (
+            self.multi_sae_distributed_architecture == "unified_multi_hook"
+            and self.multi_sae_backward_mode != "combined"
+        ):
+            raise ValueError(
+                "unified_multi_hook requires multi_sae_backward_mode='combined'"
+            )
         if self.ddp_bucket_cap_mb is not None and self.ddp_bucket_cap_mb <= 0:
             raise ValueError("ddp_bucket_cap_mb must be > 0 when set")
         if self.fsdp_backward_prefetch not in (
@@ -451,6 +482,17 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
                 self.model_from_pretrained_kwargs["max_num_batched_tokens"] = (
                     self.vllm_max_num_batched_tokens
                 )
+        # Size vLLM's minimal activation-capture KV pool to the actual per-batch
+        # workload (store_batch_size_prompts * context_size) instead of
+        # max_num_batched_tokens. HookedVLLMModel forwards these into vLLM's
+        # additional_config, which gpu_worker reads when sizing the pool.
+        if self.model_class_name == "VLLMModel" and self.context_size > 0:
+            self.model_from_pretrained_kwargs.setdefault(
+                "capture_batch_size", self.store_batch_size_prompts
+            )
+            self.model_from_pretrained_kwargs.setdefault(
+                "capture_context_size", self.context_size
+            )
 
         if self.act_store_device == "with_model":
             self.act_store_device = self.device
@@ -626,6 +668,11 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             multi_sae_backward_order=self.multi_sae_backward_order,
             multi_sae_stats_sync_mode=self.multi_sae_stats_sync_mode,
             multi_sae_stats_sync_interval=self.multi_sae_stats_sync_interval,
+            multi_sae_overlap_instrumentation=self.multi_sae_overlap_instrumentation,
+            multi_sae_nvtx_detailed=self.multi_sae_nvtx_detailed,
+            multi_sae_overlap_trace_dir=self.multi_sae_overlap_trace_dir,
+            multi_sae_overlap_max_steps=self.multi_sae_overlap_max_steps,
+            multi_sae_distributed_architecture=self.multi_sae_distributed_architecture,
             total_training_samples=self.total_training_tokens,
             device=self.device,
             autocast=self.autocast,
@@ -931,6 +978,13 @@ class SAETrainerConfig:
     feature_sampling_window: int
     logger: LoggingConfig
     append_history_logs: bool = False
+    multi_sae_overlap_instrumentation: bool = False
+    multi_sae_nvtx_detailed: bool = False
+    multi_sae_overlap_trace_dir: str = DEFAULT_OVERLAP_TRACE_DIR
+    multi_sae_overlap_max_steps: int = 0
+    multi_sae_distributed_architecture: Literal[
+        "legacy_per_hook_wrapper", "unified_multi_hook"
+    ] = "legacy_per_hook_wrapper"
 
     @property
     def total_training_steps(self) -> int:

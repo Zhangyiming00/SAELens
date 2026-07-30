@@ -14,11 +14,14 @@ import torch
 from safetensors.torch import save_file
 
 from sae_lens.config import LoggingConfig, SAETrainerConfig
+from sae_lens.saes.sae import TrainStepInput, TrainStepOutput
 from sae_lens.saes.topk_sae import TopKTrainingSAE
+from sae_lens.training.multi_hook_sae import MultiHookSAE
 from sae_lens.training.multi_sae_trainer import MultiSAETrainer
 from sae_lens.training.multi_sae_trainer import _load_hook_optimizer_state_safetensors
 from sae_lens.training.multi_sae_trainer import _load_tp_sharded_state_dict
 from sae_lens.training.multi_sae_trainer import _save_hook_optimizer_state_safetensors
+from sae_lens.training.multi_sae_trainer import sanitize_hook_name_for_path
 from sae_lens.training.shared_activation_buffer import SharedActivationBuffer
 from sae_lens.training.streaming_activation_provider import StreamingActivationProvider
 from tests.helpers import assert_close, build_topk_sae_training_cfg, random_params
@@ -85,6 +88,25 @@ def _make_data_provider(
         }
 
 
+def _make_step_input(sae: TopKTrainingSAE, batch: int = BATCH) -> TrainStepInput:
+    return TrainStepInput(
+        sae_in=torch.randn(batch, sae.cfg.d_in),
+        dead_neuron_mask=torch.zeros(sae.cfg.d_sae, dtype=torch.bool),
+        coefficients={},
+        n_training_steps=0,
+        is_logging_step=False,
+    )
+
+
+class _FailingLookup(torch.nn.Module):
+    def __init__(self, base_sae: TopKTrainingSAE) -> None:
+        super().__init__()
+        self.base_sae = base_sae
+
+    def forward(self, step_input: TrainStepInput) -> TrainStepOutput:
+        raise AssertionError("trainer must enter through MultiHookSAE owner")
+
+
 def _build_trainer(
     tmp_path: Path,
     total_samples: int,
@@ -110,6 +132,148 @@ def _build_trainer(
         token_count_weighted_dp=False,
         sae_dp_mode="ddp",
     )
+
+
+def test_multi_hook_sae_requires_exact_hook_set_and_splits_state_dict() -> None:
+    base_sae_by_hook = {hook: _make_sae() for hook in HOOK_NAMES}
+    owner = MultiHookSAE(HOOK_NAMES, base_sae_by_hook)
+    inputs = {
+        hook: _make_step_input(base_sae_by_hook[hook])
+        for hook in reversed(HOOK_NAMES)
+    }
+
+    outputs = owner(inputs)
+
+    assert list(outputs.keys()) == HOOK_NAMES
+    root_state = owner.state_dict()
+    split_state = owner.split_state_dict_by_hook(root_state)
+    assert set(split_state) == set(HOOK_NAMES)
+    for hook in HOOK_NAMES:
+        assert sorted(split_state[hook]) == sorted(base_sae_by_hook[hook].state_dict())
+    merged_state = owner.merge_state_dict_by_hook(split_state)
+    assert sorted(merged_state) == sorted(root_state)
+
+    with pytest.raises(ValueError, match="exact hook set"):
+        owner({HOOK_NAMES[0]: _make_step_input(base_sae_by_hook[HOOK_NAMES[0]])})
+
+
+def test_unified_trainer_enters_multi_hook_owner_not_compat_lookup(tmp_path: Path) -> None:
+    base_sae_by_hook = {hook: _make_sae() for hook in HOOK_NAMES}
+    owner = MultiHookSAE(HOOK_NAMES, base_sae_by_hook)
+    failing_lookup = {
+        hook: _FailingLookup(base_sae_by_hook[hook])
+        for hook in HOOK_NAMES
+    }
+    provider = _make_data_provider(1, seed=123)
+    cfg = _make_trainer_cfg(tmp_path, total_training_samples=BATCH)
+    cfg.multi_sae_distributed_architecture = "unified_multi_hook"
+    trainer = MultiSAETrainer(
+        hook_names=HOOK_NAMES,
+        sae_by_hook=failing_lookup,
+        base_sae_by_hook=base_sae_by_hook,
+        multi_hook_sae=owner,
+        data_provider=provider,
+        save_checkpoint_fn=None,
+        cfg=cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+    batch = next(_make_data_provider(1, seed=456))
+
+    outputs, _ = trainer._train_step(batch, BATCH)
+
+    assert list(outputs.keys()) == HOOK_NAMES
+
+
+def test_unified_trainer_requires_exact_hook_batch_set(tmp_path: Path) -> None:
+    base_sae_by_hook = {hook: _make_sae() for hook in HOOK_NAMES}
+    owner = MultiHookSAE(HOOK_NAMES, base_sae_by_hook)
+    cfg = _make_trainer_cfg(tmp_path, total_training_samples=BATCH)
+    cfg.multi_sae_distributed_architecture = "unified_multi_hook"
+    trainer = MultiSAETrainer(
+        hook_names=HOOK_NAMES,
+        sae_by_hook=base_sae_by_hook,
+        base_sae_by_hook=base_sae_by_hook,
+        multi_hook_sae=owner,
+        data_provider=iter(()),
+        save_checkpoint_fn=None,
+        cfg=cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+    valid_batch = next(_make_data_provider(1, seed=654))
+
+    with pytest.raises(ValueError, match="exactly"):
+        trainer._train_step({HOOK_NAMES[0]: valid_batch[HOOK_NAMES[0]]}, BATCH)
+    with pytest.raises(ValueError, match="exactly"):
+        trainer._train_step(
+            {
+                **valid_batch,
+                "blocks.2.hook_resid_post": torch.randn(BATCH, D_IN),
+            },
+            BATCH,
+        )
+
+
+def test_unified_checkpoint_round_trip_preserves_per_hook_files_and_architecture(
+    tmp_path: Path,
+) -> None:
+    base_sae_by_hook = {hook: _make_sae() for hook in HOOK_NAMES}
+    owner = MultiHookSAE(HOOK_NAMES, base_sae_by_hook)
+    cfg = _make_trainer_cfg(tmp_path, total_training_samples=1000)
+    cfg.checkpoint_path = str(tmp_path / "checkpoints")
+    cfg.multi_sae_distributed_architecture = "unified_multi_hook"
+    trainer = MultiSAETrainer(
+        hook_names=HOOK_NAMES,
+        sae_by_hook=base_sae_by_hook,
+        base_sae_by_hook=base_sae_by_hook,
+        multi_hook_sae=owner,
+        data_provider=iter(()),
+        save_checkpoint_fn=None,
+        cfg=cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+    batch = next(_make_data_provider(1, seed=987))
+    trainer._train_step(batch, BATCH)
+    trainer.n_training_samples = BATCH
+    trainer.n_training_steps = 1
+
+    trainer.save_checkpoint("4")
+
+    checkpoint_path = Path(cfg.checkpoint_path) / "4"
+    trainer_state = torch.load(checkpoint_path / "trainer_state.pt", map_location="cpu")
+    assert trainer_state["multi_sae_distributed_architecture"] == "unified_multi_hook"
+    for hook_name in HOOK_NAMES:
+        hook_dir = checkpoint_path / sanitize_hook_name_for_path(hook_name)
+        assert (hook_dir / "sae_weights.safetensors").exists()
+        assert (hook_dir / "cfg.json").exists()
+
+    fresh_base_sae_by_hook = {hook: _make_sae() for hook in HOOK_NAMES}
+    fresh_owner = MultiHookSAE(HOOK_NAMES, fresh_base_sae_by_hook)
+    fresh_trainer = MultiSAETrainer(
+        hook_names=HOOK_NAMES,
+        sae_by_hook=fresh_base_sae_by_hook,
+        base_sae_by_hook=fresh_base_sae_by_hook,
+        multi_hook_sae=fresh_owner,
+        data_provider=iter(()),
+        save_checkpoint_fn=None,
+        cfg=cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+
+    fresh_trainer.load_trainer_state(checkpoint_path)
+
+    for hook_name in HOOK_NAMES:
+        expected = dict(trainer.base_sae_by_hook[hook_name].named_parameters())
+        actual = dict(fresh_trainer.base_sae_by_hook[hook_name].named_parameters())
+        for name, expected_param in expected.items():
+            assert_close(actual[name], expected_param, msg=f"{hook_name}/{name}")
 
 
 def test_checkpoint_round_trip_preserves_all_state(tmp_path: Path) -> None:
@@ -1304,6 +1468,3 @@ def test_memory_timeline_dumps_pickle_for_target_step(tmp_path: Path) -> None:
     with open(expected, "rb") as f:
         snapshot = pickle.load(f)
     assert snapshot["device_traces"] or snapshot["segments"]
-
-
-

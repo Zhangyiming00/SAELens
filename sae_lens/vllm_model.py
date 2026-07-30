@@ -908,6 +908,8 @@ class HookedVLLMModel:
         model_name: str,
         tokenizer: PreTrainedTokenizerBase,
         dtype: torch.dtype = torch.bfloat16,
+        capture_batch_size: int | None = None,
+        capture_context_size: int | None = None,
         **llm_kwargs: Any,
     ) -> None:
         if LLM is None:
@@ -916,6 +918,21 @@ class HookedVLLMModel:
                 "Install with `pip install vllm`."
             )
         self.tokenizer = tokenizer
+        # In activation-capture mode, size the minimal KV cache pool to the
+        # actual per-batch workload (batch_size * context_size) rather than
+        # vLLM's max_num_batched_tokens, so the whole batch's KV can reside at
+        # once. These are read by gpu_worker.determine_available_memory via
+        # vllm_config.additional_config; if either is None the worker falls
+        # back to max_num_batched_tokens.
+        if capture_batch_size is not None and capture_context_size is not None:
+            additional_config = dict(llm_kwargs.get("additional_config") or {})
+            additional_config.setdefault(
+                "sae_capture_batch_size", int(capture_batch_size)
+            )
+            additional_config.setdefault(
+                "sae_capture_context_size", int(capture_context_size)
+            )
+            llm_kwargs["additional_config"] = additional_config
         # enforce_eager=True: disables CUDA graphs so per-layer hooks fire.
         # VLLM_ACTIVATION_CAPTURE_MODE=1 (set at module load above) ensures
         # vLLM allocates only the minimal KV cache needed for one batch.
