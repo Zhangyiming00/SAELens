@@ -727,13 +727,17 @@ class LanguageModelSAETrainingRunner:
             if cfg.hook_names is not None and len(cfg.hook_names) > 0
             else [cfg.hook_name]
         )
+        explicit_multi_hook_request = (
+            cfg.hook_names is not None and len(cfg.hook_names) > 0
+        )
         if resume_from_checkpoint is not None:
             self.cfg.resume_from_checkpoint = str(resume_from_checkpoint)
         self.sae_dp_size = sae_dp_size
         self.sae_pp_size = sae_pp_size
         self.cfg.sae_pp_size = sae_pp_size
         self.is_multi_sae = (
-            len(self.hook_names) > 1
+            explicit_multi_hook_request
+            or len(self.hook_names) > 1
             or self.sae_pp_size > 1
             or os.environ.get("SAELENS_FORCE_MULTI_SAE_TRAINER", "0") == "1"
         )
@@ -1169,11 +1173,10 @@ class LanguageModelSAETrainingRunner:
                     )
                 self._compile_sae_if_needed()
                 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                from torch.distributed.fsdp.api import ShardingStrategy
                 self.sae = FSDP(
                     self._base_sae,
                     process_group=sae_dp_group,
-                    sharding_strategy=ShardingStrategy.FULL_SHARD,
+                    sharding_strategy=self._resolve_fsdp_sharding_strategy(),
                     use_orig_params=True,
                     backward_prefetch=self._resolve_fsdp_backward_prefetch(),
                     forward_prefetch=self.cfg.fsdp_forward_prefetch,
@@ -1349,12 +1352,11 @@ class LanguageModelSAETrainingRunner:
             wrapped: Any
             if self.cfg.sae_dp_mode == "fsdp":
                 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                from torch.distributed.fsdp.api import ShardingStrategy
 
                 wrapped = FSDP(
                     sae,
                     process_group=sae_dp_group,
-                    sharding_strategy=ShardingStrategy.FULL_SHARD,
+                    sharding_strategy=self._resolve_fsdp_sharding_strategy(),
                     use_orig_params=True,
                     backward_prefetch=self._resolve_fsdp_backward_prefetch(),
                     forward_prefetch=self.cfg.fsdp_forward_prefetch,
@@ -1401,13 +1403,12 @@ class LanguageModelSAETrainingRunner:
 
         if self.cfg.sae_dp_mode == "fsdp":
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp.api import ShardingStrategy
             from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 
             self.multi_hook_sae = FSDP(
                 raw_multi_hook_sae,
                 process_group=sae_dp_group,
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                sharding_strategy=self._resolve_fsdp_sharding_strategy(),
                 auto_wrap_policy=ModuleWrapPolicy({TrainingSAE}),
                 use_orig_params=True,
                 backward_prefetch=self._resolve_fsdp_backward_prefetch(),
@@ -1492,6 +1493,19 @@ class LanguageModelSAETrainingRunner:
             f"'forward_prefetch': {self.cfg.fsdp_forward_prefetch!r}}}"
         )
         return value
+
+    def _resolve_fsdp_sharding_strategy(self) -> Any:
+        from torch.distributed.fsdp.api import ShardingStrategy
+
+        strategy_by_name = {
+            "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
+            "full_shard": ShardingStrategy.FULL_SHARD,
+            "no_shard": ShardingStrategy.NO_SHARD,
+        }
+        strategy_name = self.cfg.fsdp_sharding_strategy
+        strategy = strategy_by_name[strategy_name]
+        logger.info(f"Effective FSDP sharding_strategy: {strategy_name}")
+        return strategy
 
     def _sync_run_paths_across_ranks(self) -> None:
         if not dist.is_initialized() or dist.get_world_size() <= 1:

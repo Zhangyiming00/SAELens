@@ -81,8 +81,15 @@ def _write_checkpoint_complete_marker(checkpoint_path: Path) -> None:
 
 
 def _adam_optimizer_kwargs_from_env() -> dict[str, bool]:
-    if os.environ.get("SAE_FUSED_ADAM") == "1":
+    adam_impl = os.environ.get("SAE_ADAM_IMPL", "").lower()
+    if not adam_impl and os.environ.get("SAE_FUSED_ADAM") == "1":
+        adam_impl = "fused"
+    if adam_impl == "fused":
         return {"fused": True}
+    if adam_impl == "foreach":
+        return {"foreach": True}
+    if adam_impl == "forloop":
+        return {"foreach": False}
     return {}
 
 

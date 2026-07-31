@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """External profiler for NCCL TP collectives, keyed by buffer_size and tp.
 
-Profiles the tensor-parallel communication collectives the SAE training step uses
+Profiles the communication collectives the SAE training step uses
 (``dist.all_gather`` in encode, ``dist.all_reduce`` in decode / grad-sync /
 clip-norm; see ``sae_lens.distributed``), plus ``broadcast`` and
 ``reduce_scatter`` for completeness. Parameterized by:
 
   * buffer_bytes  local buffer bytes each rank contributes (NOT B/d_in/d_sae)
-  * tp            tensor-parallel size (== world_size for the run)
+  * tp/group_size process-group size (== world_size for the run; tp kept for CSV compatibility)
   * dtype         element type (buffer element count = buffer_bytes / itemsize)
   * collective    allgather | allreduce | broadcast | reduce_scatter
   * topology      NCCL_ALGO / NCCL_PROTO / NCCL_P2P_LEVEL (optional; recorded)
@@ -55,6 +55,7 @@ DEFAULT_BUFFER_BYTES: list[int] = [
     128 * _MIB,
     256 * _MIB,
     1024 * _MIB,
+    2048 * _MIB,
 ]
 DEFAULT_TP_VALUES: list[int] = [2]
 DEFAULT_COLLECTIVES: list[str] = ["allgather", "allreduce", "broadcast", "reduce_scatter"]
@@ -560,6 +561,7 @@ def _success_row(
         "buffer_bytes": case.buffer_bytes,
         "buffer_numel": case.buffer_numel,
         "tp": case.tp,
+        "group_size": case.tp,
         "dtype": case.dtype_name,
         "backend": config.backend,
         **_topo_fields(config),
@@ -593,6 +595,7 @@ def _error_row_from_status(
             "buffer_bytes": case.buffer_bytes,
             "buffer_numel": _safe_buffer_numel(case),
             "tp": case.tp,
+            "group_size": case.tp,
             "dtype": case.dtype_name,
             "backend": config.backend,
             **_topo_fields(config),
@@ -640,6 +643,7 @@ CSV_FIELDS: list[str] = [
     "buffer_bytes",
     "buffer_numel",
     "tp",
+    "group_size",
     "dtype",
     "backend",
     "nccl_algo",
@@ -830,7 +834,7 @@ def write_outputs(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Profile NCCL TP collectives by buffer_bytes and tp (+ topo)."
+        description="Profile NCCL collectives by payload bytes and process-group size (+ topo)."
     )
     parser.add_argument(
         "--buffer-bytes", dest="buffer_bytes_values", type=int, nargs="+",
@@ -838,8 +842,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Local buffer bytes per rank",
     )
     parser.add_argument(
-        "--tp", dest="tp_values", type=int, nargs="+", default=list(DEFAULT_TP_VALUES),
-        help="Tensor-parallel sizes; the run's world_size must equal one of these",
+        "--tp", "--group-size", dest="tp_values", type=int, nargs="+", default=list(DEFAULT_TP_VALUES),
+        help="Process-group sizes (legacy name: --tp); world_size must equal the selected size",
     )
     parser.add_argument(
         "--collectives", nargs="+", choices=list(COLLECTIVES),
@@ -861,7 +865,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "When invoked with plain python and exactly one --tp value, "
+            "When invoked with plain python and exactly one --tp/--group-size value, "
             "relaunch automatically through torch.distributed.run. "
             "Use --no-auto-launch inside an existing launcher/debug session."
         ),
@@ -906,7 +910,7 @@ def _auto_launch_if_needed(
         )
     if len(config.tp_values) != 1:
         raise RuntimeError(
-            "Plain-python auto-launch requires exactly one --tp value. "
+            "Plain-python auto-launch requires exactly one --tp/--group-size value. "
             "Run one profiler launch per TP degree so each world_size equals TP."
         )
     tp = int(config.tp_values[0])

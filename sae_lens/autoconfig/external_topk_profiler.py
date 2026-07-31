@@ -20,13 +20,13 @@ from __future__ import annotations
 # =============================================================================
 # USER-EDITABLE DEFAULT PARAMETERS
 # =============================================================================
-DEFAULT_BATCH_SIZES: list[int] = [512, 1024, 2048, 4096, 8192, 16384]
+DEFAULT_BATCH_SIZES: list[int] = [256, 512, 1024, 2048, 4096]
 # local d_sae: F_local = global d_sae / tp
 DEFAULT_LOCAL_D_SAE_VALUES: list[int] = [8192, 16384, 32768, 65536, 131072]
 # Optional direct global widths. Legacy F_local*tp inputs are canonicalized to these.
 DEFAULT_GLOBAL_D_SAE_VALUES: list[int] = []
 DEFAULT_TP_VALUES: list[int] = [1, 2]
-DEFAULT_K_VALUES: list[int] = [128]
+DEFAULT_K_VALUES: list[int] = [128,256,512]
 DEFAULT_ACTIVATION_TYPES: list[str] = ["topk"]
 DEFAULT_DEVICES: list[str] = ["cuda:0"]
 DEFAULT_DTYPES: list[str] = ["float32"]

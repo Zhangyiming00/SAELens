@@ -353,6 +353,16 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable FSDP forward prefetch.",
     )
+    parser.add_argument(
+        "--fsdp-sharding-strategy",
+        default="shard_grad_op",
+        choices=["shard_grad_op", "full_shard", "no_shard"],
+        help=(
+            "FSDP sharding strategy. 'shard_grad_op' keeps full parameters after "
+            "forward and shards gradients/optimizer state, avoiding a backward "
+            "parameter all-gather. 'full_shard' reshards parameters after forward."
+        ),
+    )
     # Streaming mode (v1): vLLM and SAE processes on separate GPU sets via /dev/shm.
     # Requires sae_dp_size=1. World size = vllm_tp * vllm_dp + sae_tp * 1.
     parser.add_argument(
@@ -617,6 +627,7 @@ def _append_total_runtime_record(
 
 def main() -> None:
     args = parse_args()
+    os.environ.setdefault("SAE_ADAM_IMPL", "fused")
 
     # Cached-mode validation must run before control-state processing so the
     # mutual-exclusion errors fire even if the user passes both.
@@ -741,8 +752,6 @@ def main() -> None:
         else None
     )
     if hook_names is not None and len(hook_names) == 0:
-        hook_names = None
-    if hook_names is not None and len(hook_names) == 1 and args.sae_pp_size <= 1:
         hook_names = None
     if args.streaming_mode:
         if args.sae_dp_size not in (0, 1):
@@ -935,6 +944,7 @@ def main() -> None:
         ddp_config_strict=args.ddp_config_strict,
         fsdp_backward_prefetch=args.fsdp_backward_prefetch,
         fsdp_forward_prefetch=args.fsdp_forward_prefetch,
+        fsdp_sharding_strategy=args.fsdp_sharding_strategy,
         streaming_mode=args.streaming_mode,
         streaming_chunk_size_tokens=args.streaming_chunk_size_tokens,
         streaming_num_chunks=args.streaming_num_chunks,
@@ -995,6 +1005,7 @@ def main() -> None:
     if args.sae_dp_mode == "fsdp":
         print(f"  fsdp_backward_prefetch={args.fsdp_backward_prefetch}")
         print(f"  fsdp_forward_prefetch={args.fsdp_forward_prefetch}")
+        print(f"  fsdp_sharding_strategy={args.fsdp_sharding_strategy}")
     if args.save_mse_every_n_steps > 0:
         print(f"  save_mse_every_n_steps={args.save_mse_every_n_steps}")
     if args.save_timing_every_n_steps > 0:

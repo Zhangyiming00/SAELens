@@ -652,6 +652,9 @@ def _unified_fsdp_worker(
         child_forward_prefetch = [
             getattr(module, "forward_prefetch", None) for module in child_modules
         ]
+        child_sharding_strategy = [
+            getattr(module, "sharding_strategy", None) for module in child_modules
+        ]
 
         checkpoint_path = Path(save_dir) / "step"
         saved_architecture = None
@@ -682,8 +685,10 @@ def _unified_fsdp_worker(
                 exec_order_shared,
                 getattr(fsdp_owner, "backward_prefetch", None),
                 getattr(fsdp_owner, "forward_prefetch", None),
+                getattr(fsdp_owner, "sharding_strategy", None),
                 child_backward_prefetch,
                 child_forward_prefetch,
+                child_sharding_strategy,
                 saved_architecture,
                 saved_keys_by_hook,
             )
@@ -724,6 +729,7 @@ def test_multi_sae_distributed_architecture_defaults_to_legacy() -> None:
 
     assert cfg.multi_sae_distributed_architecture == "legacy_per_hook_wrapper"
     assert cfg.fsdp_forward_prefetch is False
+    assert cfg.fsdp_sharding_strategy == "shard_grad_op"
 
 
 def test_multi_sae_distributed_architecture_rejects_invalid_value() -> None:
@@ -769,6 +775,44 @@ def test_runner_unified_multi_hook_builds_single_owner_without_dist(
     assert isinstance(runner.multi_hook_sae, MultiHookSAE)
     assert set(runner.sae_by_hook) == set(hook_names)
     assert runner.sae_by_hook == runner.base_sae_by_hook
+
+
+def test_runner_explicit_single_hook_uses_legacy_multi_sae_trainer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert not dist.is_initialized(), "dist must not be initialized for this test"
+    hook_names = ["blocks.20.hook_resid_post"]
+    cfg = LanguageModelSAERunnerConfig(
+        sae=build_topk_sae_training_cfg(),
+        hook_names=hook_names,
+        device="cpu",
+        n_eval_batches=0,
+        sae_dp_mode="ddp",
+        multi_sae_distributed_architecture="legacy_per_hook_wrapper",
+    )
+    monkeypatch.setattr(
+        "sae_lens.llm_sae_training_runner.ActivationsStore.from_config",
+        mock.Mock(return_value=mock.MagicMock()),
+    )
+
+    runner = LanguageModelSAETrainingRunner(cfg=cfg, override_model=mock.MagicMock())
+
+    assert runner.is_multi_sae
+    assert runner.sae is None
+    assert runner.multi_hook_sae is None
+    assert set(runner.sae_by_hook) == set(hook_names)
+    assert runner.sae_by_hook == runner.base_sae_by_hook
+
+
+def test_explicit_single_hook_manual_dp_defaults_to_ddp() -> None:
+    with pytest.warns(UserWarning, match="defaulting sae_dp_mode to 'ddp'"):
+        cfg = LanguageModelSAERunnerConfig(
+            sae=build_topk_sae_training_cfg(),
+            hook_names=["blocks.20.hook_resid_post"],
+            sae_dp_mode="manual",
+        )
+
+    assert cfg.sae_dp_mode == "ddp"
 
 
 def test_multi_sae_trainer_ddp_mode_allows_dp1_without_dist() -> None:
@@ -1123,6 +1167,24 @@ def test_sae_dp_mode_fsdp_rejects_invalid_backward_prefetch() -> None:
             sae=build_topk_sae_training_cfg(),
             sae_dp_mode="fsdp",
             fsdp_backward_prefetch="invalid",  # type: ignore[arg-type]
+        )
+
+
+def test_sae_dp_mode_fsdp_accepts_full_shard_strategy() -> None:
+    cfg = LanguageModelSAERunnerConfig(
+        sae=build_topk_sae_training_cfg(),
+        sae_dp_mode="fsdp",
+        fsdp_sharding_strategy="full_shard",
+    )
+    assert cfg.fsdp_sharding_strategy == "full_shard"
+
+
+def test_sae_dp_mode_fsdp_rejects_invalid_sharding_strategy() -> None:
+    with pytest.raises(ValueError, match="fsdp_sharding_strategy"):
+        LanguageModelSAERunnerConfig(
+            sae=build_topk_sae_training_cfg(),
+            sae_dp_mode="fsdp",
+            fsdp_sharding_strategy="invalid",  # type: ignore[arg-type]
         )
 
 
@@ -1687,8 +1749,10 @@ def test_unified_multi_hook_fsdp_uses_common_root_and_child_units(
         exec_order_shared,
         root_backward_prefetch,
         root_forward_prefetch,
+        root_sharding_strategy,
         child_backward_prefetch,
         child_forward_prefetch,
+        child_sharding_strategy,
         saved_architecture,
         saved_keys_by_hook,
     ) in results:
@@ -1701,10 +1765,14 @@ def test_unified_multi_hook_fsdp_uses_common_root_and_child_units(
         assert exec_order_shared, f"rank {rank} FSDP units do not share exec order"
         assert root_backward_prefetch == BackwardPrefetch.BACKWARD_POST
         assert root_forward_prefetch is True
+        assert root_sharding_strategy == ShardingStrategy.SHARD_GRAD_OP
         assert child_backward_prefetch == [
             BackwardPrefetch.BACKWARD_POST for _ in hook_names
         ]
         assert child_forward_prefetch == [True for _ in hook_names]
+        assert child_sharding_strategy == [
+            ShardingStrategy.SHARD_GRAD_OP for _ in hook_names
+        ]
         if rank == 0:
             assert saved_architecture == "unified_multi_hook"
             assert saved_keys_by_hook == expected_keys

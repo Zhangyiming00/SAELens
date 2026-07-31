@@ -213,6 +213,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         multi_sae_overlap_trace_dir (str): Directory for overlap event JSONL files. (default is "results/overlap_trace")
         multi_sae_overlap_max_steps (int): Stop appending overlap events after this many steps. 0 records every step. (default is 0)
         multi_sae_distributed_architecture (str): Multi-hook distributed wrapper architecture. "legacy_per_hook_wrapper" preserves the old per-hook DDP/FSDP wrapper behavior. "unified_multi_hook" trains through one MultiHookSAE owner, wrapping the root once for DDP and using one FSDP root with per-hook child units for FSDP. (default is "legacy_per_hook_wrapper")
+        fsdp_sharding_strategy (str): FSDP sharding strategy for single-SAE, legacy multi-SAE, and unified multi-hook FSDP wrappers. "shard_grad_op" keeps full parameters after forward and shards gradients/optimizer state, avoiding a second all-gather during backward. "full_shard" also reshards parameters after forward. "no_shard" keeps parameters replicated. (default is "shard_grad_op")
         verbose (bool): Whether to print verbose output. (default is True)
         model_kwargs (dict[str, Any]): Keyword arguments for `model.run_with_cache`
         model_from_pretrained_kwargs (dict[str, Any], optional): Additional keyword arguments to pass to the model's `from_pretrained` method.
@@ -350,6 +351,9 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         "backward_pre"
     )
     fsdp_forward_prefetch: bool = False
+    fsdp_sharding_strategy: Literal[
+        "shard_grad_op", "full_shard", "no_shard"
+    ] = "shard_grad_op"
     sae_pp_size: int = 1
 
     # Streaming mode (v1): vLLM and SAE on separate GPU sets, communicate via /dev/shm.
@@ -408,6 +412,15 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             raise ValueError(
                 "fsdp_backward_prefetch must be 'backward_pre', 'backward_post', or 'none'"
             )
+        if self.fsdp_sharding_strategy not in (
+            "shard_grad_op",
+            "full_shard",
+            "no_shard",
+        ):
+            raise ValueError(
+                "fsdp_sharding_strategy must be 'shard_grad_op', "
+                "'full_shard', or 'no_shard'"
+            )
         if self.sae_pp_size < 1:
             raise ValueError("sae_pp_size must be >= 1")
         if self.streaming_mode:
@@ -432,8 +445,9 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             if len(self.hook_names) == 1:
                 self.hook_name = self.hook_names[0]
 
+        explicit_multi_hook_request = self.hook_names is not None
         if (
-            (effective_num_hooks > 1 or self.sae_pp_size > 1)
+            (explicit_multi_hook_request or effective_num_hooks > 1 or self.sae_pp_size > 1)
             and self.sae_dp_mode == "manual"
         ):
             warnings.warn(
