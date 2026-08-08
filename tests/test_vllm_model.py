@@ -370,6 +370,127 @@ def test_capture_pool_sized_by_batch_times_context(tokenizer):
     assert engine.vllm_config.additional_config["sae_capture_context_size"] == ctx
 
 
+def test_cold_reconfigure_disabled_raises(monkeypatch):
+    import sae_lens.vllm_model as vllm_model_module
+
+    class FakeLLM:
+        def __init__(self, _model_name, **kwargs):
+            self.kwargs = kwargs
+
+        def apply_model(self, _func):
+            return ["LlamaForCausalLM"]
+
+    monkeypatch.setattr(vllm_model_module, "LLM", FakeLLM)
+
+    model = HookedVLLMModel(
+        "fake-model",
+        tokenizer=object(),
+        device="cpu",
+        max_num_batched_tokens=16384,
+    )
+
+    with pytest.raises(RuntimeError, match="allow_cold_reconfigure"):
+        model.cold_reconfigure(max_num_batched_tokens=8192)
+
+
+def test_cold_reconfigure_enabled_sets_capacity_and_updates(monkeypatch):
+    import sae_lens.vllm_model as vllm_model_module
+
+    instances = []
+
+    class FakeLLM:
+        def __init__(self, _model_name, **kwargs):
+            self.kwargs = kwargs
+            self.active = int(kwargs["max_num_batched_tokens"])
+            self.capacity = self.active
+            instances.append(self)
+
+        def apply_model(self, _func):
+            return ["LlamaForCausalLM"]
+
+        def get_cold_reconfigure_status(self):
+            additional_config = self.kwargs.get("additional_config") or {}
+            return {
+                "cold_reconfigure_enabled": True,
+                "max_num_batched_tokens_capacity": self.capacity,
+                "active_max_num_batched_tokens": self.active,
+                "kv_pool_capacity_tokens": int(
+                    additional_config["sae_capture_kv_pool_capacity_tokens"]
+                ),
+                "engine_idle": True,
+            }
+
+        def set_active_max_num_batched_tokens(self, value):
+            old = self.active
+            self.active = int(value)
+            return {
+                "cold_reconfigure_enabled": True,
+                "old_active_max_num_batched_tokens": old,
+                "active_max_num_batched_tokens": self.active,
+                "max_num_batched_tokens_capacity": self.capacity,
+                "kv_pool_capacity_tokens": int(
+                    self.kwargs["additional_config"][
+                        "sae_capture_kv_pool_capacity_tokens"
+                    ]
+                ),
+                "engine_idle": True,
+            }
+
+    monkeypatch.setattr(vllm_model_module, "LLM", FakeLLM)
+
+    model = HookedVLLMModel(
+        "fake-model",
+        tokenizer=object(),
+        device="cpu",
+        max_num_batched_tokens=4096,
+        allow_cold_reconfigure=True,
+        cold_reconfigure_mbt_capacity=16384,
+        cold_reconfigure_kv_pool_capacity_tokens=32768,
+    )
+
+    fake = instances[0]
+    assert fake.kwargs["max_num_batched_tokens"] == 16384
+    assert (
+        fake.kwargs["additional_config"]["sae_capture_kv_pool_capacity_tokens"]
+        == 32768
+    )
+
+    result = model.cold_reconfigure(max_num_batched_tokens=8192)
+    assert result["old_active_max_num_batched_tokens"] == 16384
+    assert result["active_max_num_batched_tokens"] == 8192
+    assert result["max_num_batched_tokens_capacity"] == 16384
+
+
+def test_explicit_vllm_mp_backend_preserved_for_tp2(monkeypatch):
+    import sae_lens.vllm_model as vllm_model_module
+
+    instances = []
+
+    class FakeLLM:
+        def __init__(self, _model_name, **kwargs):
+            self.kwargs = kwargs
+            instances.append(self)
+
+        def apply_model(self, _func):
+            return ["LlamaForCausalLM"]
+
+    monkeypatch.setattr(vllm_model_module, "LLM", FakeLLM)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+
+    HookedVLLMModel(
+        "fake-model",
+        tokenizer=object(),
+        device="cpu",
+        tensor_parallel_size=2,
+        distributed_executor_backend="mp",
+    )
+
+    assert instances[0].kwargs["distributed_executor_backend"] == "mp"
+
+
 # ---------------------------------------------------------------------------
 # Integration tests: new hook points
 # ---------------------------------------------------------------------------

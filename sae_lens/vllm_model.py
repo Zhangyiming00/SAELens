@@ -46,6 +46,7 @@ import logging
 import os
 import pickle
 import re
+import threading
 from contextlib import contextmanager
 from functools import partial
 from multiprocessing.reduction import ForkingPickler
@@ -910,6 +911,9 @@ class HookedVLLMModel:
         dtype: torch.dtype = torch.bfloat16,
         capture_batch_size: int | None = None,
         capture_context_size: int | None = None,
+        allow_cold_reconfigure: bool = False,
+        cold_reconfigure_mbt_capacity: int | None = None,
+        cold_reconfigure_kv_pool_capacity_tokens: int | None = None,
         **llm_kwargs: Any,
     ) -> None:
         if LLM is None:
@@ -918,13 +922,69 @@ class HookedVLLMModel:
                 "Install with `pip install vllm`."
             )
         self.tokenizer = tokenizer
+        self.model_name = model_name
+        self._generation_lock = threading.RLock()
+        self.allow_cold_reconfigure = bool(allow_cold_reconfigure)
+        self._cold_reconfigure_mbt_capacity: int | None = None
+        self._cold_reconfigure_kv_pool_capacity_tokens: int | None = None
+
         # In activation-capture mode, size the minimal KV cache pool to the
         # actual per-batch workload (batch_size * context_size) rather than
         # vLLM's max_num_batched_tokens, so the whole batch's KV can reside at
         # once. These are read by gpu_worker.determine_available_memory via
         # vllm_config.additional_config; if either is None the worker falls
         # back to max_num_batched_tokens.
-        if capture_batch_size is not None and capture_context_size is not None:
+        if self.allow_cold_reconfigure:
+            mbt_capacity = (
+                cold_reconfigure_mbt_capacity
+                if cold_reconfigure_mbt_capacity is not None
+                else llm_kwargs.get("max_num_batched_tokens")
+            )
+            if mbt_capacity is None:
+                raise ValueError(
+                    "allow_cold_reconfigure=True requires "
+                    "cold_reconfigure_mbt_capacity or max_num_batched_tokens."
+                )
+            mbt_capacity = int(mbt_capacity)
+            if mbt_capacity < 1:
+                raise ValueError(
+                    "cold_reconfigure_mbt_capacity must be >= 1; "
+                    f"got {mbt_capacity}."
+                )
+
+            if cold_reconfigure_kv_pool_capacity_tokens is not None:
+                kv_pool_capacity_tokens = int(
+                    cold_reconfigure_kv_pool_capacity_tokens
+                )
+            elif capture_batch_size is not None and capture_context_size is not None:
+                kv_pool_capacity_tokens = int(capture_batch_size) * int(
+                    capture_context_size
+                )
+            else:
+                kv_pool_capacity_tokens = mbt_capacity
+            if kv_pool_capacity_tokens < 1:
+                raise ValueError(
+                    "cold_reconfigure_kv_pool_capacity_tokens must be >= 1; "
+                    f"got {kv_pool_capacity_tokens}."
+                )
+
+            llm_kwargs["max_num_batched_tokens"] = mbt_capacity
+            additional_config = dict(llm_kwargs.get("additional_config") or {})
+            additional_config["sae_allow_cold_reconfigure"] = True
+            additional_config["sae_capture_kv_pool_capacity_tokens"] = (
+                kv_pool_capacity_tokens
+            )
+            if capture_batch_size is not None and capture_context_size is not None:
+                additional_config.setdefault(
+                    "sae_capture_batch_size", int(capture_batch_size)
+                )
+                additional_config.setdefault(
+                    "sae_capture_context_size", int(capture_context_size)
+                )
+            llm_kwargs["additional_config"] = additional_config
+            self._cold_reconfigure_mbt_capacity = mbt_capacity
+            self._cold_reconfigure_kv_pool_capacity_tokens = kv_pool_capacity_tokens
+        elif capture_batch_size is not None and capture_context_size is not None:
             additional_config = dict(llm_kwargs.get("additional_config") or {})
             additional_config.setdefault(
                 "sae_capture_batch_size", int(capture_batch_size)
@@ -933,6 +993,7 @@ class HookedVLLMModel:
                 "sae_capture_context_size", int(capture_context_size)
             )
             llm_kwargs["additional_config"] = additional_config
+
         # enforce_eager=True: disables CUDA graphs so per-layer hooks fire.
         # VLLM_ACTIVATION_CAPTURE_MODE=1 (set at module load above) ensures
         # vLLM allocates only the minimal KV cache needed for one batch.
@@ -958,10 +1019,41 @@ class HookedVLLMModel:
         if tp > 1 and _in_torchrun():
             llm_kwargs.setdefault("distributed_executor_backend", "external_launcher")
 
+        self._normalized_llm_kwargs = dict(llm_kwargs)
         self.llm = LLM(model_name, **llm_kwargs)
         self._is_external_launcher = (
             llm_kwargs.get("distributed_executor_backend") == "external_launcher"
         )
+
+        if self.allow_cold_reconfigure:
+            status = self.get_cold_reconfigure_status()
+            if (
+                int(status["max_num_batched_tokens_capacity"])
+                != self._cold_reconfigure_mbt_capacity
+            ):
+                raise RuntimeError(
+                    "vLLM reported max_num_batched_tokens_capacity="
+                    f"{status['max_num_batched_tokens_capacity']}, expected "
+                    f"{self._cold_reconfigure_mbt_capacity}."
+                )
+            if (
+                int(status["active_max_num_batched_tokens"])
+                != self._cold_reconfigure_mbt_capacity
+            ):
+                raise RuntimeError(
+                    "vLLM initial active_max_num_batched_tokens="
+                    f"{status['active_max_num_batched_tokens']}, expected "
+                    f"{self._cold_reconfigure_mbt_capacity}."
+                )
+            if (
+                int(status["kv_pool_capacity_tokens"])
+                != self._cold_reconfigure_kv_pool_capacity_tokens
+            ):
+                raise RuntimeError(
+                    "vLLM reported kv_pool_capacity_tokens="
+                    f"{status['kv_pool_capacity_tokens']}, expected "
+                    f"{self._cold_reconfigure_kv_pool_capacity_tokens}."
+                )
 
         arch: str = self.llm.apply_model(_get_arch_name)[0]
         if arch not in ARCH_CONFIGS:
@@ -982,6 +1074,155 @@ class HookedVLLMModel:
             else torch.device("cuda")
         )
 
+    def _external_reconfigure_group(self) -> dist.ProcessGroup | None:
+        if not self._is_external_launcher:
+            return None
+        if not dist.is_available() or not dist.is_initialized():
+            if self._tp > 1:
+                raise RuntimeError(
+                    "vLLM external_launcher cold reconfigure requires an "
+                    "initialized torch.distributed process group."
+                )
+            return None
+        tp_group = _get_vllm_tp_device_group()
+        if tp_group is None and self._tp > 1:
+            raise RuntimeError(
+                "vLLM TP group is not initialized under external_launcher."
+            )
+        return tp_group
+
+    def _external_reconfigure_device(self) -> torch.device:
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            return self.device
+        return torch.device("cpu")
+
+    def _check_external_reconfigure_value(self, value: int) -> None:
+        group = self._external_reconfigure_group()
+        if group is None:
+            return
+        device = self._external_reconfigure_device()
+        min_value = torch.tensor([value], device=device, dtype=torch.int64)
+        max_value = torch.tensor([value], device=device, dtype=torch.int64)
+        dist.all_reduce(min_value, op=dist.ReduceOp.MIN, group=group)
+        dist.all_reduce(max_value, op=dist.ReduceOp.MAX, group=group)
+        if int(min_value.item()) != int(max_value.item()):
+            raise RuntimeError(
+                "All vLLM external_launcher ranks must request the same "
+                "active max_num_batched_tokens; got distributed min/max "
+                f"{int(min_value.item())}/{int(max_value.item())}."
+            )
+        dist.barrier(group=group)
+
+    def _external_reconfigure_success_allreduce(self, success: bool) -> bool:
+        group = self._external_reconfigure_group()
+        if group is None:
+            return success
+        device = self._external_reconfigure_device()
+        success_tensor = torch.tensor(
+            [1 if success else 0], device=device, dtype=torch.int64
+        )
+        dist.all_reduce(success_tensor, op=dist.ReduceOp.MIN, group=group)
+        return bool(success_tensor.item())
+
+    def _external_reconfigure_barrier(self) -> None:
+        group = self._external_reconfigure_group()
+        if group is not None:
+            dist.barrier(group=group)
+
+    def get_cold_reconfigure_status(self) -> dict[str, Any]:
+        if not hasattr(self.llm, "get_cold_reconfigure_status"):
+            raise RuntimeError(
+                "The installed vLLM LLM object does not expose "
+                "get_cold_reconfigure_status()."
+            )
+        return dict(self.llm.get_cold_reconfigure_status())
+
+    def cold_reconfigure(
+        self,
+        *,
+        max_num_batched_tokens: int,
+    ) -> dict[str, Any]:
+        if not self.allow_cold_reconfigure:
+            raise RuntimeError(
+                "cold_reconfigure() requires allow_cold_reconfigure=True."
+            )
+
+        value = int(max_num_batched_tokens)
+
+        with self._generation_lock:
+            self._check_external_reconfigure_value(value)
+
+            local_updated = False
+            local_error: BaseException | None = None
+            old_value: int | None = None
+            result: dict[str, Any] | None = None
+            try:
+                capacity = self._cold_reconfigure_mbt_capacity
+                if capacity is None:
+                    raise RuntimeError(
+                        "Cold reconfigure capacity was not initialized."
+                    )
+                if value < 1 or value > capacity:
+                    raise ValueError(
+                        "Requested active max_num_batched_tokens must satisfy "
+                        f"1 <= value <= capacity ({capacity}); got {value}."
+                    )
+
+                before = self.get_cold_reconfigure_status()
+                old_value = int(before["active_max_num_batched_tokens"])
+                result = dict(self.llm.set_active_max_num_batched_tokens(value))
+                local_updated = True
+                after = self.get_cold_reconfigure_status()
+                if int(after["active_max_num_batched_tokens"]) != value:
+                    raise RuntimeError(
+                        "vLLM cold reconfigure did not take effect: "
+                        f"requested {value}, status={after}."
+                    )
+                result.update(after)
+                result.setdefault("old_active_max_num_batched_tokens", old_value)
+            except BaseException as exc:
+                local_error = exc
+
+            globally_successful = self._external_reconfigure_success_allreduce(
+                local_error is None
+            )
+            if not globally_successful:
+                if local_updated and old_value is not None and old_value != value:
+                    try:
+                        self.llm.set_active_max_num_batched_tokens(old_value)
+                    except BaseException as rollback_exc:
+                        logger.error(
+                            "Failed to roll back active MBT after distributed "
+                            "cold reconfigure failure: %s",
+                            rollback_exc,
+                        )
+                self._external_reconfigure_barrier()
+                if local_error is not None:
+                    if self._external_reconfigure_group() is None:
+                        raise local_error
+                    raise RuntimeError(
+                        "Cold reconfigure failed on this rank; all ranks "
+                        "aborted the update."
+                    ) from local_error
+                raise RuntimeError(
+                    "Cold reconfigure failed on another external_launcher "
+                    "rank; this rank rolled back to the previous active MBT."
+                )
+
+            self._external_reconfigure_barrier()
+            assert result is not None
+            tp_rank = _get_vllm_tp_rank()
+            if tp_rank in (None, 0):
+                logger.info(
+                    "[COLD RECONFIGURE] active MBT %s -> %s, capacity=%s, "
+                    "pool_capacity=%s",
+                    result["old_active_max_num_batched_tokens"],
+                    result["active_max_num_batched_tokens"],
+                    result["max_num_batched_tokens_capacity"],
+                    result["kv_pool_capacity_tokens"],
+                )
+            return result
+
     def run_with_cache(
         self,
         batch_tokens: torch.Tensor,  # (B, S)
@@ -999,6 +1240,15 @@ class HookedVLLMModel:
         Returns:
             (None, {hook_name: tensor of shape (B, S, d)})
         """
+        with self._generation_lock:
+            return self._run_with_cache_unlocked(batch_tokens, names_filter, **kwargs)
+
+    def _run_with_cache_unlocked(
+        self,
+        batch_tokens: torch.Tensor,
+        names_filter: list[str],
+        **kwargs: Any,
+    ) -> tuple[None, dict[str, torch.Tensor]]:
         B, S = batch_tokens.shape
         arch_config = ARCH_CONFIGS[self._arch]
         total_tokens = B * S
