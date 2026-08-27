@@ -177,6 +177,56 @@ def parse_args() -> argparse.Namespace:
             "This can perturb runtime; keep disabled for throughput/overlap runs."
         ),
     )
+    parser.add_argument(
+        "--step-window-profile-start-step",
+        type=int,
+        default=0,
+        help=(
+            "First step of the first step-window profiling window (1-based). "
+            "Windows are contiguous, so --step-window-profile-start-step 11 with "
+            "--step-window-profile-window-steps 20 --step-window-profile-window-count 4 "
+            "measures steps 11-30, 31-50, 51-70 and 71-90. The device is "
+            "synchronized only at each window's two boundaries, so overlap inside "
+            "a window is preserved and the recorded interval is a true end-to-end "
+            "wall time. Pick a start step past warmup (step 1 is far slower). "
+            "0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--step-window-profile-window-steps",
+        type=int,
+        default=0,
+        help="Steps per step-window profiling window.",
+    )
+    parser.add_argument(
+        "--step-window-profile-window-count",
+        type=int,
+        default=0,
+        help="Number of consecutive step-window profiling windows to record.",
+    )
+    parser.add_argument(
+        "--step-window-profile-vllm-start-step",
+        type=int,
+        default=0,
+        help=(
+            "Override --step-window-profile-start-step on vLLM producer ranks in "
+            "streaming/split-role modes, where a step is one produced chunk or "
+            "batch rather than an SAE step. In co-located mode vLLM runs inside "
+            "the SAE step and needs no separate setting. 0 reuses the shared value."
+        ),
+    )
+    parser.add_argument(
+        "--step-window-profile-vllm-window-steps",
+        type=int,
+        default=0,
+        help="Override --step-window-profile-window-steps on vLLM producer ranks.",
+    )
+    parser.add_argument(
+        "--step-window-profile-vllm-window-count",
+        type=int,
+        default=0,
+        help="Override --step-window-profile-window-count on vLLM producer ranks.",
+    )
     parser.add_argument("--checkpoint-path", default="checkpoints/1.60/")
     parser.add_argument(
         "--checkpoint-storage",
@@ -926,6 +976,12 @@ def main() -> None:
         record_memory_timeline_step=args.record_memory_timeline_step,
         append_history_logs=args.append_history_logs,
         synchronize_timing=args.synchronize_timing,
+        step_window_profile_start_step=args.step_window_profile_start_step,
+        step_window_profile_window_steps=args.step_window_profile_window_steps,
+        step_window_profile_window_count=args.step_window_profile_window_count,
+        step_window_profile_vllm_start_step=args.step_window_profile_vllm_start_step,
+        step_window_profile_vllm_window_steps=args.step_window_profile_vllm_window_steps,
+        step_window_profile_vllm_window_count=args.step_window_profile_vllm_window_count,
         seed=args.seed,
         verbose=True,
         sae_dp_mode=args.sae_dp_mode,
@@ -1015,6 +1071,33 @@ def main() -> None:
         print(f"  vllm_memory_probe_layer={vllm_memory_probe_layer}")
     if args.synchronize_timing:
         print("  synchronize_timing=True")
+    if args.step_window_profile_start_step > 0:
+        sae_start, sae_steps, sae_count = cfg.resolved_step_window_profile(role="sae")
+        vllm_start, vllm_steps, vllm_count = cfg.resolved_step_window_profile(
+            role="vllm"
+        )
+        sae_last = sae_start + sae_steps * sae_count - 1
+        vllm_last = vllm_start + vllm_steps * vllm_count - 1
+        print(
+            f"  step_window_profile(sae)=start{sae_start} x{sae_steps}steps "
+            f"x{sae_count}windows (through step {sae_last})"
+        )
+        print(
+            f"  step_window_profile(vllm)=start{vllm_start} x{vllm_steps}steps "
+            f"x{vllm_count}windows (through step {vllm_last}); "
+            "only used by streaming/split-role vLLM ranks"
+        )
+        if args.save_memory_every_n_steps > 0:
+            print(
+                "  WARNING: save_memory_every_n_steps > 0 syncs the device at every "
+                "memory phase, which inflates step-window times. Pass "
+                "--save-memory-every-n-steps 0 for throughput measurements."
+            )
+        if args.synchronize_timing:
+            print(
+                "  WARNING: --synchronize-timing syncs inside each step, which "
+                "inflates step-window times. Drop it for throughput measurements."
+            )
     if args.max_num_batched_tokens is not None:
         print(f"  max_num_batched_tokens={args.max_num_batched_tokens}")
     if args.checkpoint_path is not None:

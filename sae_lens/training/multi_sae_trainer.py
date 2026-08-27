@@ -47,6 +47,7 @@ from sae_lens.training.sae_trainer import (
     _unwrap_item,
     _write_checkpoint_complete_marker,
 )
+from sae_lens.training.step_window_profiler import StepWindowProfiler
 from sae_lens.training.types import DataProvider
 
 MULTI_SAE_MANIFEST_FILENAME = "multi_sae_manifest.json"
@@ -369,6 +370,29 @@ class MultiSAETrainer:
                 output_path / f"memory_timeline_rank{_global_rank}.pickle"
             )
 
+        # Fixed-window end-to-end step timing. Every rank writes its own file:
+        # with TP/PP the ranks do different work, so a single writer would hide
+        # skew. See StepWindowProfiler for the sync placement.
+        self.step_window_profiler = StepWindowProfiler.maybe_create(
+            start_step=getattr(cfg, "step_window_profile_start_step", 0),
+            window_steps=getattr(cfg, "step_window_profile_window_steps", 0),
+            window_count=getattr(cfg, "step_window_profile_window_count", 0),
+            output_dir=cfg.output_path,
+            role="sae",
+            step_unit="sae_step",
+            rank=_global_rank,
+            device=cfg.device,
+            context={
+                "num_hooks": len(self.hook_names),
+                "train_batch_size_samples": cfg.train_batch_size_samples,
+                "dp_world_size": self._dp_world_size(),
+                "synchronize_timing": cfg.synchronize_timing,
+                "save_memory_every_n_steps": getattr(
+                    cfg, "save_memory_every_n_steps", 0
+                ),
+            },
+        )
+
     def _dp_world_size(self) -> int:
         if (
             self.dp_group is None
@@ -519,6 +543,9 @@ class MultiSAETrainer:
                 _ack_drain_done()
                 _save_quiesce_checkpoint()
                 break
+            step_number = self.n_training_steps + 1
+            if self.step_window_profiler is not None:
+                self.step_window_profiler.on_step_start(step_number)
             step_wall_t0 = time.perf_counter()
             self._start_memory_phase_step()
             self._reset_memory_phase_peak()
@@ -597,12 +624,23 @@ class MultiSAETrainer:
                     f"{self.n_training_steps}| avg_loss: {avg_loss:.5f}"
                 )
 
+            # Closed after per-step logging/checkpointing so the window covers
+            # everything a real step costs, not just the compute.
+            if self.step_window_profiler is not None:
+                self.step_window_profiler.on_step_end(
+                    step_number,
+                    samples=local_n,
+                    components={**timing, **sae_phase_timing},
+                )
+
             _maybe_start_quiesce_drain()
             if quiesce_checkpoint_now:
                 _ack_drain_done()
                 _save_quiesce_checkpoint()
                 break
 
+        if self.step_window_profiler is not None:
+            self.step_window_profiler.close()
         pbar.close()
         self._stop_device_sampler()
         # Ensure periodic/deferred stats are flushed before final save/logging.

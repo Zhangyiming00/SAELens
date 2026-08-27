@@ -51,6 +51,7 @@ from sae_lens.saes.sae import SAE, T_SAE_CONFIG, T_TRAINING_SAE_CONFIG
 from sae_lens.tokenization_and_batching import concat_and_batch_sequences
 from sae_lens.training.mixing_buffer import mixing_buffer
 from sae_lens.training.multi_sae_trainer import sanitize_hook_name_for_path
+from sae_lens.training.routing_phase_probe import RoutingPhaseProbe, routing_phase
 from sae_lens.util import (
     extract_layer_from_tlens_hook_name,
     extract_stop_at_layer_from_tlens_hook_name,
@@ -405,6 +406,9 @@ class ActivationsStore:
             "vllm_step_time_s": 0.0,
             "transfer_time_s": 0.0,
         }
+        # Set by profile_routing_real to time individual routing phases. None in
+        # normal training runs.
+        self._routing_probe: RoutingPhaseProbe | None = None
 
         self.n_dataset_processed = 0
 
@@ -1756,28 +1760,66 @@ class ActivationsStore:
                     buf_map[p] = remote_slices[p]
 
             first_buf = next(iter(buf_map.values()))
-            if isinstance(first_buf, dict):
-                payload_hook_names = self._v2_payload_hook_names()
-                assembled_payload = {
-                    hook_name: torch.cat(
-                        [buf_map[r.producer_idx][hook_name] for r in c_routes],
-                        dim=0,
+            with routing_phase(getattr(self, "_routing_probe", None), "consumer_assemble"):
+                if isinstance(first_buf, dict):
+                    payload_hook_names = self._v2_payload_hook_names()
+                    assembled_payload = {
+                        hook_name: torch.cat(
+                            [buf_map[r.producer_idx][hook_name] for r in c_routes],
+                            dim=0,
+                        )
+                        for hook_name in payload_hook_names
+                    }
+                    assembled = {
+                        hook_name: assembled_payload[hook_name]
+                        for hook_name in self.hook_names
+                    }
+                else:
+                    assembled = torch.cat(
+                        [buf_map[r.producer_idx] for r in c_routes], dim=0
                     )
-                    for hook_name in payload_hook_names
-                }
-                assembled = {
-                    hook_name: assembled_payload[hook_name]
-                    for hook_name in self.hook_names
-                }
-            else:
-                assembled = torch.cat(
-                    [buf_map[r.producer_idx] for r in c_routes], dim=0
-                )
 
             sae_tp_group = v2.get_sae_tp_group()
             sae_tp_size = v2.get_sae_tp_size()
             if sae_tp_size > 1 and sae_tp_group is not None:
                 with nccl_nvtx_range("nccl:shard_routing_sae_tp_broadcast", sae_tp_group):
+                    with routing_phase(getattr(self, "_routing_probe", None), "sae_tp_broadcast"):
+                        if isinstance(assembled, dict):
+                            for hook_acts in assembled.values():
+                                dist.broadcast(
+                                    hook_acts,
+                                    src=endpoint_root,
+                                    group=sae_tp_group,
+                                )
+                        else:
+                            dist.broadcast(
+                                assembled,
+                                src=endpoint_root,
+                                group=sae_tp_group,
+                            )
+        elif i_am_consumer and v2.get_sae_tp_size() > 1:
+            sae_tp_group = v2.get_sae_tp_group()
+            routing_c = v2.get_consumer_idx()
+            endpoint_idx = v2.get_sae_endpoint_idx()
+            endpoint_root = v2.get_consumer_tp_root(endpoint_idx)
+            n_rows = sum(
+                r.row_end - r.row_start for r in routes_for_consumer(routing, routing_c)
+            )
+            with routing_phase(getattr(self, "_routing_probe", None), "consumer_assemble"):
+                if self.is_multi_hook:
+                    assembled = {
+                        hook_name: torch.empty(
+                            n_rows,
+                            self.d_in,
+                            dtype=self.dtype,
+                            device=self.device,
+                        )
+                        for hook_name in self.hook_names
+                    }
+                else:
+                    assembled = torch.empty(n_rows, self.d_in, dtype=self.dtype, device=self.device)
+            with nccl_nvtx_range("nccl:shard_routing_sae_tp_broadcast", sae_tp_group):
+                with routing_phase(getattr(self, "_routing_probe", None), "sae_tp_broadcast"):
                     if isinstance(assembled, dict):
                         for hook_acts in assembled.values():
                             dist.broadcast(
@@ -1791,40 +1833,6 @@ class ActivationsStore:
                             src=endpoint_root,
                             group=sae_tp_group,
                         )
-        elif i_am_consumer and v2.get_sae_tp_size() > 1:
-            sae_tp_group = v2.get_sae_tp_group()
-            routing_c = v2.get_consumer_idx()
-            endpoint_idx = v2.get_sae_endpoint_idx()
-            endpoint_root = v2.get_consumer_tp_root(endpoint_idx)
-            n_rows = sum(
-                r.row_end - r.row_start for r in routes_for_consumer(routing, routing_c)
-            )
-            if self.is_multi_hook:
-                assembled = {
-                    hook_name: torch.empty(
-                        n_rows,
-                        self.d_in,
-                        dtype=self.dtype,
-                        device=self.device,
-                    )
-                    for hook_name in self.hook_names
-                }
-            else:
-                assembled = torch.empty(n_rows, self.d_in, dtype=self.dtype, device=self.device)
-            with nccl_nvtx_range("nccl:shard_routing_sae_tp_broadcast", sae_tp_group):
-                if isinstance(assembled, dict):
-                    for hook_acts in assembled.values():
-                        dist.broadcast(
-                            hook_acts,
-                            src=endpoint_root,
-                            group=sae_tp_group,
-                        )
-                else:
-                    dist.broadcast(
-                        assembled,
-                        src=endpoint_root,
-                        group=sae_tp_group,
-                    )
 
         if assembled is not None:
             self._add_data_timing(transfer_time_s=time.perf_counter() - transfer_t0)
@@ -1910,14 +1918,17 @@ class ActivationsStore:
             if torch.cuda.is_available():
                 barrier_kwargs["device_ids"] = [torch.cuda.current_device()]
             with nccl_nvtx_range("nccl:vllm_tp_step_barrier", vllm_tp_group):
-                dist.barrier(**barrier_kwargs)
+                with routing_phase(getattr(self, "_routing_probe", None), "vllm_tp_barrier"):
+                    dist.barrier(**barrier_kwargs)
 
         if v2.get_vllm_tp_rank() != 0:
-            self._get_raw_llm_batch_with_epoch_restart()
+            with routing_phase(getattr(self, "_routing_probe", None), "vllm_generate"):
+                self._get_raw_llm_batch_with_epoch_restart()
             return local_slices, outgoing
 
         p = v2.get_producer_idx()
-        raw_acts, _ = self._get_raw_llm_batch_with_epoch_restart()
+        with routing_phase(getattr(self, "_routing_probe", None), "vllm_generate"):
+            raw_acts, _ = self._get_raw_llm_batch_with_epoch_restart()
         p_routes = routes_for_producer(v2.get_routing_table(), p)
         payload_hook_names = self._v2_payload_hook_names()
         local_consumer_idx = v2.get_consumer_idx() if v2.is_consumer() else -1
@@ -1927,22 +1938,25 @@ class ActivationsStore:
             else -1
         )
 
-        for route in p_routes:
-            cc = route.consumer_idx
-            if isinstance(raw_acts, dict):
-                sl = {
-                    hook_name: raw_acts[hook_name][route.row_start:route.row_end].contiguous()
-                    for hook_name in payload_hook_names
-                }
-            else:
-                sl = raw_acts[route.row_start:route.row_end].contiguous()
-            if (
-                cc == local_consumer_idx
-                and v2.get_producer_tp_root(p) == local_endpoint_root
-            ):
-                # Local route: slice stays on the original device.
-                local_slices[route.producer_idx] = sl
-            outgoing[cc] = sl
+        # Row slicing is routing work, not vLLM work: it exists only because the
+        # raw batch has to be partitioned across consumers.
+        with routing_phase(getattr(self, "_routing_probe", None), "producer_slice"):
+            for route in p_routes:
+                cc = route.consumer_idx
+                if isinstance(raw_acts, dict):
+                    sl = {
+                        hook_name: raw_acts[hook_name][route.row_start:route.row_end].contiguous()
+                        for hook_name in payload_hook_names
+                    }
+                else:
+                    sl = raw_acts[route.row_start:route.row_end].contiguous()
+                if (
+                    cc == local_consumer_idx
+                    and v2.get_producer_tp_root(p) == local_endpoint_root
+                ):
+                    # Local route: slice stays on the original device.
+                    local_slices[route.producer_idx] = sl
+                outgoing[cc] = sl
 
         return local_slices, outgoing
 
@@ -2000,60 +2014,64 @@ class ActivationsStore:
             if torch.cuda.is_available():
                 barrier_kwargs["device_ids"] = [torch.cuda.current_device()]
             with nccl_nvtx_range("nccl:shard_routing_p2p_barrier", p2p_group):
-                dist.barrier(**barrier_kwargs)
+                with routing_phase(getattr(self, "_routing_probe", None), "p2p_barrier"):
+                    dist.barrier(**barrier_kwargs)
 
             ops: list[dist.P2POp] = []
-            if should_recv:
-                for route in remote_routes:
-                    n_rows = route.row_end - route.row_start
-                    if self.is_multi_hook:
-                        recv_buf = torch.empty(
-                            n_rows * len(payload_hook_names),
-                            self.d_in,
-                            dtype=self.dtype,
-                            device=self.device,
+            with routing_phase(getattr(self, "_routing_probe", None), "p2p_setup"):
+                if should_recv:
+                    for route in remote_routes:
+                        n_rows = route.row_end - route.row_start
+                        if self.is_multi_hook:
+                            recv_buf = torch.empty(
+                                n_rows * len(payload_hook_names),
+                                self.d_in,
+                                dtype=self.dtype,
+                                device=self.device,
+                            )
+                        else:
+                            recv_buf = torch.empty(
+                                n_rows,
+                                self.d_in,
+                                dtype=self.dtype,
+                                device=self.device,
+                            )
+                        recv_slices[route.producer_idx] = (recv_buf, n_rows)
+                        ops.append(
+                            dist.P2POp(
+                                dist.irecv,
+                                recv_buf,
+                                v2.get_producer_tp_root(route.producer_idx),
+                                group=p2p_group,
+                            )
                         )
-                    else:
-                        recv_buf = torch.empty(
-                            n_rows,
-                            self.d_in,
-                            dtype=self.dtype,
-                            device=self.device,
-                        )
-                    recv_slices[route.producer_idx] = (recv_buf, n_rows)
+
+                if should_send:
+                    send_buf = self._pack_v2_payload(outgoing[c], payload_hook_names)
                     ops.append(
                         dist.P2POp(
-                            dist.irecv,
-                            recv_buf,
-                            v2.get_producer_tp_root(route.producer_idx),
+                            dist.isend,
+                            send_buf,
+                            consumer_root,
                             group=p2p_group,
                         )
                     )
 
-            if should_send:
-                send_buf = self._pack_v2_payload(outgoing[c], payload_hook_names)
-                ops.append(
-                    dist.P2POp(
-                        dist.isend,
-                        send_buf,
-                        consumer_root,
-                        group=p2p_group,
-                    )
-                )
-
             with nccl_nvtx_range("nccl:shard_routing_p2p_exchange", p2p_group):
-                for work in dist.batch_isend_irecv(ops):
-                    work.wait()
+                with routing_phase(getattr(self, "_routing_probe", None), "p2p_exchange"):
+                    for work in dist.batch_isend_irecv(ops):
+                        work.wait()
 
-        return {
-            producer_idx: self._unpack_v2_payload(
-                recv_buf,
-                n_rows=n_rows,
-                hook_names=payload_hook_names,
-                is_multi_hook=self.is_multi_hook,
-            )
-            for producer_idx, (recv_buf, n_rows) in recv_slices.items()
-        }
+        with routing_phase(getattr(self, "_routing_probe", None), "p2p_unpack"):
+            return {
+                producer_idx: self._unpack_v2_payload(
+                    recv_buf,
+                    n_rows=n_rows,
+                    hook_names=payload_hook_names,
+                    is_multi_hook=self.is_multi_hook,
+                )
+                for producer_idx, (recv_buf, n_rows) in recv_slices.items()
+            }
 
     def get_data_loader(
         self,

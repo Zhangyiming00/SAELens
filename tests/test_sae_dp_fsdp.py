@@ -1281,6 +1281,78 @@ def test_resume_limits_producer_helper_loop_to_remaining_steps(tmp_path: Path) -
     assert runner.activations_store._run_nccl_p2p_exchange_v2.call_count == 2
 
 
+def test_legacy_prefix_helper_does_not_create_independent_window_profiler(
+    tmp_path: Path,
+) -> None:
+    """Legacy vLLM-only TP ranks must not sync CUDA at a separate window edge.
+
+    In vLLM TP2 + SAE TP1, rank 0 owns the SAE loop and rank 1 is a vLLM-only
+    helper.  The helper's independent ``cuda.synchronize`` can race the
+    external-launcher vLLM collective that rank 0 is about to enter.
+    """
+    runner = object.__new__(LanguageModelSAETrainingRunner)
+    runner.cfg = mock.MagicMock()
+    runner.cfg.resolved_step_window_profile.return_value = (1, 2, 1)
+    runner.cfg.output_path = tmp_path
+    runner.cfg.streaming_chunk_size_tokens = 1
+    runner.cfg.store_batch_size_prompts = 1
+    runner.device = "cpu"
+    runner.vllm_tp_size = 2
+    runner.vllm_dp_size = 1
+    runner.use_shard_routing = False
+    runner.uses_split_roles = True
+
+    assert runner._make_vllm_window_profiler(step_unit="vllm_helper_batch") is None
+
+
+def test_streaming_vllm_root_creates_root_window_profiler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = object.__new__(LanguageModelSAETrainingRunner)
+    runner.cfg = mock.MagicMock()
+    runner.cfg.resolved_step_window_profile.return_value = (1, 2, 1)
+    runner.cfg.output_path = tmp_path
+    runner.cfg.streaming_chunk_size_tokens = 1
+    runner.cfg.store_batch_size_prompts = 1
+    runner.device = "cpu"
+    runner.vllm_tp_size = 2
+    runner.vllm_dp_size = 1
+    runner.streaming_mode = True
+    runner.uses_split_roles = True
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 7)
+    monkeypatch.setattr(
+        "sae_lens.distributed_streaming.is_vllm_tp_root",
+        lambda: True,
+    )
+
+    profiler = runner._make_vllm_window_profiler(step_unit="vllm_chunk")
+
+    assert profiler is not None
+    assert profiler.role == "vllm_root"
+    assert profiler.output_path == tmp_path / "step_window_profile_vllm_root_rank7.jsonl"
+
+
+def test_streaming_vllm_non_root_skips_window_profiler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = object.__new__(LanguageModelSAETrainingRunner)
+    runner.cfg = mock.MagicMock()
+    runner.cfg.resolved_step_window_profile.return_value = (1, 2, 1)
+    runner.cfg.output_path = tmp_path
+    runner.device = "cpu"
+    runner.streaming_mode = True
+    runner.uses_split_roles = True
+
+    monkeypatch.setattr(
+        "sae_lens.distributed_streaming.is_vllm_tp_root",
+        lambda: False,
+    )
+
+    assert runner._make_vllm_window_profiler(step_unit="vllm_chunk") is None
+
+
 def test_producer_helper_loop_accounts_for_mixing_buffer_retained_samples() -> None:
     cfg = LanguageModelSAERunnerConfig(
         sae=build_topk_sae_training_cfg(),
@@ -1303,6 +1375,66 @@ def test_producer_helper_loop_accounts_for_mixing_buffer_retained_samples() -> N
 
     assert runner.activations_store._run_producer_phase2_v2.call_count == 25
     assert runner.activations_store._run_nccl_p2p_exchange_v2.call_count == 25
+
+
+def test_producer_helper_loop_counts_short_mixing_batches() -> None:
+    cfg = LanguageModelSAERunnerConfig(
+        sae=build_topk_sae_training_cfg(),
+        training_tokens=28672,
+        context_size=2048,
+        store_batch_size_prompts=1,
+        train_batch_size_tokens=4096,
+        n_batches_in_buffer=2,
+        activations_mixing_fraction=0.5,
+    )
+    runner = object.__new__(LanguageModelSAETrainingRunner)
+    runner.cfg = cfg
+    runner.vllm_dp_size = 1
+    runner.sae_dp_size = 1
+    runner.activations_store = mock.MagicMock()
+    runner.activations_store.training_context_size = 2048
+    runner.activations_store._run_producer_phase2_v2.return_value = ({}, {})
+
+    runner._run_producer_helper_loop_v2()
+
+    # Each pair of producer batches fills the mixing buffer with 4096 rows,
+    # retains 2048 rows, and yields one 4096-row training batch. The producer
+    # must therefore run 14 cycles for 28672 training rows.
+    assert runner.activations_store._run_producer_phase2_v2.call_count == 14
+    assert runner.activations_store._run_nccl_p2p_exchange_v2.call_count == 14
+
+
+@pytest.mark.parametrize("source_batch_size, expected_steps", [(2048, 14), (4096, 7)])
+def test_producer_only_helper_step_count_matches_consumer_drain(
+    source_batch_size: int, expected_steps: int
+) -> None:
+    """Producer-only ranks use the same mixing-buffer accounting as consumers."""
+    cfg = LanguageModelSAERunnerConfig(
+        sae=build_topk_sae_training_cfg(),
+        training_tokens=28672,
+        context_size=2048,
+        store_batch_size_prompts=1,
+        train_batch_size_tokens=4096,
+        n_batches_in_buffer=2,
+        activations_mixing_fraction=0.5,
+    )
+    runner = object.__new__(LanguageModelSAETrainingRunner)
+    runner.cfg = cfg
+    runner.vllm_dp_size = 2 if source_batch_size == 4096 else 1
+    runner.sae_dp_size = 1
+    runner.activations_store = mock.MagicMock()
+    runner.activations_store.training_context_size = 2048
+    runner.activations_store._run_producer_phase2_v2.return_value = ({}, {})
+
+    actual_steps = runner._mixing_buffer_source_steps_needed(
+        target_samples=cfg.total_training_tokens,
+        source_batch_size=source_batch_size,
+        buffer_size=cfg.n_batches_in_buffer * cfg.context_size,
+        train_batch_size=cfg.train_batch_size_tokens,
+        mix_fraction=cfg.activations_mixing_fraction,
+    )
+
+    assert actual_steps == expected_steps
 
 
 def test_train_step_enters_wrapped_sae_not_base_training_forward_pass() -> None:

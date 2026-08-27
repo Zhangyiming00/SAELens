@@ -2,6 +2,8 @@ from collections.abc import Iterator
 
 import torch
 
+from sae_lens.profiling import cuda_nvtx_range
+
 ActivationBatch = torch.Tensor | dict[str, torch.Tensor]
 
 
@@ -63,24 +65,33 @@ def mixing_buffer(
     storage_buffer: ActivationBatch | None = None
 
     for new_activations in activations_loader:
-        storage_buffer = (
-            new_activations
-            if storage_buffer is None
-            else _cat_batches(storage_buffer, new_activations)
-        )
+        # The concat, shuffle and slicing below are the buffer's own GPU work.
+        # They run inside the caller's data-fetch range, so without a range of
+        # their own a timeline cannot tell them apart from the model's prefill.
+        with cuda_nvtx_range("mixing_buffer:append"):
+            storage_buffer = (
+                new_activations
+                if storage_buffer is None
+                else _cat_batches(storage_buffer, new_activations)
+            )
 
         if _batch_len(storage_buffer) >= buffer_size:
-            if mix_fraction > 0:
-                perm = torch.randperm(_batch_len(storage_buffer), generator=generator)
-                storage_buffer = _index_batch(storage_buffer, perm)
+            with cuda_nvtx_range("mixing_buffer:shuffle"):
+                if mix_fraction > 0:
+                    perm = torch.randperm(
+                        _batch_len(storage_buffer), generator=generator
+                    )
+                    storage_buffer = _index_batch(storage_buffer, perm)
 
-            # Keep a fixed amount for mixing, serve the rest
-            keep_for_mixing = int(buffer_size * mix_fraction)
-            num_to_serve = _batch_len(storage_buffer) - keep_for_mixing
-            num_serving_batches = max(1, num_to_serve // batch_size)
-            serving_cutoff = num_serving_batches * batch_size
-            serving_buffer = _index_batch(storage_buffer, slice(0, serving_cutoff))
-            storage_buffer = _index_batch(storage_buffer, slice(serving_cutoff, None))
+                # Keep a fixed amount for mixing, serve the rest
+                keep_for_mixing = int(buffer_size * mix_fraction)
+                num_to_serve = _batch_len(storage_buffer) - keep_for_mixing
+                num_serving_batches = max(1, num_to_serve // batch_size)
+                serving_cutoff = num_serving_batches * batch_size
+                serving_buffer = _index_batch(storage_buffer, slice(0, serving_cutoff))
+                storage_buffer = _index_batch(
+                    storage_buffer, slice(serving_cutoff, None)
+                )
 
             # Yield batches from the serving_buffer
             for batch_idx in range(num_serving_batches):

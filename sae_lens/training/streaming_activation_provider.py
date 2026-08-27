@@ -111,7 +111,7 @@ class StreamingActivationProvider:
 
         self._hook_names = hook_names
         self._num_hooks = len(hook_names) if hook_names else 1
-        self._is_multi_hook = self._num_hooks > 1
+        self._is_multi_hook = self._num_hooks >= 1
         self._tokens_per_hook = train_batch_size_tokens
 
         # PP-stage hook subset (None == train all hooks the buffer carries)

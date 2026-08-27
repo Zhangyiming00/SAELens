@@ -58,6 +58,7 @@ from sae_lens.training.activations_store import ActivationsStore
 from sae_lens.training.multi_hook_sae import MultiHookSAE
 from sae_lens.training.multi_sae_trainer import MultiSAETrainer, sanitize_hook_name_for_path
 from sae_lens.training.sae_trainer import SAETrainer
+from sae_lens.training.step_window_profiler import StepWindowProfiler
 from sae_lens.training.types import DataProvider
 from sae_lens.util import temporary_seed
 
@@ -721,6 +722,7 @@ class LanguageModelSAETrainingRunner:
             )
 
         self.cfg = cfg
+        effective_streaming_mode = streaming_mode or cfg.streaming_mode
         self.cached_activations_only = bool(cfg.use_cached_activations)
         self.hook_names = (
             list(cfg.hook_names)
@@ -739,6 +741,7 @@ class LanguageModelSAETrainingRunner:
             explicit_multi_hook_request
             or len(self.hook_names) > 1
             or self.sae_pp_size > 1
+            or effective_streaming_mode
             or os.environ.get("SAELENS_FORCE_MULTI_SAE_TRAINER", "0") == "1"
         )
         if self.is_multi_sae and self.cfg.sae_dp_mode == "manual":
@@ -798,7 +801,7 @@ class LanguageModelSAETrainingRunner:
                 )
 
         self._quiesce_dir = quiesce_dir
-        self.streaming_mode = streaming_mode or cfg.streaming_mode
+        self.streaming_mode = effective_streaming_mode
 
         # GPU direct streaming validation (must run before _streaming_init)
         one_side_absent = vllm_dp_size == 0 or sae_dp_size == 0
@@ -1548,12 +1551,6 @@ class LanguageModelSAETrainingRunner:
             self._run_vllm_helper_loop()
             return None
 
-        if self.is_multi_sae and len(getattr(self, "_pp_hook_names", [])) == 0:
-            if self.use_shard_routing and dist.is_initialized():
-                self._load_producer_resume_state_if_needed()
-                self._run_producer_helper_loop_v2()
-            return {}
-
         if self.is_multi_sae:
             return self._run_multi_sae()
 
@@ -1687,11 +1684,20 @@ class LanguageModelSAETrainingRunner:
 
         n_batches_done = 0
         n_training_samples = 0
+        helper_step = 0
+        window_profiler = self._make_vllm_window_profiler(
+            step_unit="vllm_helper_batch",
+            context={"uses_vllm_dp_fan_in": self.uses_vllm_dp_fan_in},
+        )
         while True:
             if target_batches is not None and n_batches_done >= target_batches:
                 break
             if target_batches is None and n_training_samples >= self.cfg.total_training_tokens:
                 break
+
+            helper_step += 1
+            if window_profiler is not None:
+                window_profiler.on_step_start(helper_step)
 
             if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
                 rank = dist.get_rank() if dist.is_initialized() else -1
@@ -1725,11 +1731,13 @@ class LanguageModelSAETrainingRunner:
                     if raw_tokens is not None:
                         raw_tokens = raw_tokens.to("cpu").contiguous()
                         dist.send(raw_tokens, dst=cluster_sae_root, group=p2p_group)
+                step_samples = 0
             else:
                 # Legacy: go through mixing buffer to stay in sync with
                 # existing split-role broadcasts.
                 batch = next(self.activations_store)
                 n_training_samples += batch.shape[0]
+                step_samples = batch.shape[0]
 
             if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
                 rank = dist.get_rank() if dist.is_initialized() else -1
@@ -1739,6 +1747,12 @@ class LanguageModelSAETrainingRunner:
                 with open(f"/tmp/saelens_debug_rank{rank}.log", "a") as f:
                     f.write(line)
                 print(line, end="", flush=True)
+
+            if window_profiler is not None:
+                window_profiler.on_step_end(helper_step, samples=step_samples)
+
+        if window_profiler is not None:
+            window_profiler.close()
 
     def _run_producer_helper_loop_v2(self) -> None:
         """Producer-only loop for shard-routing mode (use_shard_routing=True).
@@ -1766,9 +1780,19 @@ class LanguageModelSAETrainingRunner:
             for rows_per_step in rows_per_consumer_step
         )
 
-        for _ in range(total_producer_steps):
+        window_profiler = self._make_vllm_window_profiler(
+            step_unit="vllm_producer_step",
+            context={"total_producer_steps": total_producer_steps},
+        )
+        for producer_step in range(1, total_producer_steps + 1):
+            if window_profiler is not None:
+                window_profiler.on_step_start(producer_step)
             _local_slices, outgoing = self.activations_store._run_producer_phase2_v2()
             self.activations_store._run_nccl_p2p_exchange_v2(outgoing)
+            if window_profiler is not None:
+                window_profiler.on_step_end(producer_step)
+        if window_profiler is not None:
+            window_profiler.close()
 
     def _v2_rows_per_consumer_step(self, ctx_size: int) -> list[int]:
         try:
@@ -1824,8 +1848,14 @@ class LanguageModelSAETrainingRunner:
             num_to_serve = storage_samples - keep_for_mixing
             num_serving_batches = max(1, num_to_serve // train_batch_size)
             serving_cutoff = num_serving_batches * train_batch_size
-            yielded_samples += serving_cutoff
-            storage_samples -= serving_cutoff
+            # ``mixing_buffer`` slices ``storage_buffer[:serving_cutoff]`` and
+            # then iterates full batch-sized slices over that tensor. When
+            # ``serving_cutoff`` is larger than the actual buffer (the short
+            # final batch case), Python slicing returns only the rows present.
+            # Mirror that exact row count so producer-only ranks stop when the
+            # consumer has drained the same number of source batches.
+            yielded_samples += min(storage_samples, serving_cutoff)
+            storage_samples = max(0, storage_samples - serving_cutoff)
 
         return source_steps
 
@@ -2267,6 +2297,61 @@ class LanguageModelSAETrainingRunner:
         self._logger.addHandler(logging.NullHandler())
         self._logger.propagate = False
 
+    def _make_vllm_window_profiler(
+        self,
+        *,
+        step_unit: str,
+        context: dict[str, Any] | None = None,
+    ) -> StepWindowProfiler | None:
+        """Build the step-window profiler for a vLLM producer loop.
+
+        vLLM ranks count produced chunks/batches, not SAE optimizer steps, so
+        they read the `_vllm_` window overrides. Dedicated streaming writes one
+        producer file from each vLLM TP root; co-located helper ranks stay
+        disabled to avoid adding syncs into shared collectives.
+        """
+        # In co-located split-role mode, a producer-only rank participates in
+        # the same vLLM TP/P2P protocol as the SAE rank.  Its work is already
+        # inside the SAE rank's end-to-end window, so an independent profiler
+        # would insert CUDA synchronizations at different protocol points and
+        # can deadlock the next collective.  Dedicated streaming producers do
+        # not share that protocol and still need their own profiler.
+        if getattr(self, "uses_split_roles", False) and not getattr(
+            self, "streaming_mode", False
+        ):
+            return None
+        role = "vllm"
+        if getattr(self, "streaming_mode", False):
+            import sae_lens.distributed_streaming as ds
+
+            if not ds.is_vllm_tp_root():
+                return None
+            role = "vllm_root"
+
+        start, steps, count = self.cfg.resolved_step_window_profile(role="vllm")
+        # Resolve first and bail out before reading any other runner state, so
+        # the disabled path stays free of attribute requirements.
+        if start < 1 or steps < 1 or count < 1:
+            return None
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        return StepWindowProfiler.maybe_create(
+            start_step=start,
+            window_steps=steps,
+            window_count=count,
+            output_dir=self.cfg.output_path,
+            role=role,
+            step_unit=step_unit,
+            rank=rank,
+            device=self.device,
+            context={
+                "vllm_tp_size": self.vllm_tp_size,
+                "vllm_dp_size": self.vllm_dp_size,
+                "streaming_chunk_size_tokens": self.cfg.streaming_chunk_size_tokens,
+                "store_batch_size_prompts": self.cfg.store_batch_size_prompts,
+                **(context or {}),
+            },
+        )
+
     def _run_streaming_producer_loop(self) -> None:
         import sae_lens.distributed_streaming as ds
 
@@ -2303,6 +2388,10 @@ class LanguageModelSAETrainingRunner:
         chunk_idx = -1
         seq_no = -1
         chunk_step = 0
+        # chunk_step only advances on the TP root; every rank needs its own
+        # counter so the window boundaries line up across the TP group.
+        producer_step = 0
+        window_profiler = self._make_vllm_window_profiler(step_unit="vllm_chunk")
 
         # Quiesce signal paths — use quiesce_dir if provided (supervisor mode),
         # otherwise fall back to checkpoint_path (standalone mode).
@@ -2339,6 +2428,10 @@ class LanguageModelSAETrainingRunner:
                 vllm_stopped_ack_path.touch()
 
         while True:
+            producer_step += 1
+            if window_profiler is not None:
+                window_profiler.on_step_start(producer_step)
+            step_write_time_s = 0.0
             # Quiesce check: after at least one chunk written, check for stop signal.
             # Root checks the file; result is broadcast to all TP ranks.
             if chunk_step > 0:
@@ -2408,6 +2501,7 @@ class LanguageModelSAETrainingRunner:
                 chunk_step += 1
                 inference_time_s = t_infer_end - t_infer_start
                 write_time_s = t_write_end - t_write_start
+                step_write_time_s = write_time_s
                 _shm_log({
                     "event": "chunk_written",
                     "chunk_idx": chunk_idx,
@@ -2434,6 +2528,20 @@ class LanguageModelSAETrainingRunner:
                         json.dump(record, f)
                         f.write("\n")
 
+            if window_profiler is not None:
+                # Non-root TP ranks only run inference, so their write time
+                # stays 0.
+                window_profiler.on_step_end(
+                    producer_step,
+                    samples=valid_tokens if is_tp_root else 0,
+                    components={
+                        "inference_time_s": t_infer_end - t_infer_start,
+                        "write_time_s": step_write_time_s,
+                    },
+                )
+
+        if window_profiler is not None:
+            window_profiler.close()
         if is_tp_root:
             buf.signal_done()
             _shm_log({"event": "producer_done", "total_chunks": chunk_step})
@@ -2467,6 +2575,18 @@ class LanguageModelSAETrainingRunner:
         )
         dataset_exhausted = False
         chunks_sent = 0
+        # One step is one request-response round with the consumer, which may
+        # carry several chunks. chunks_sent only advances on the TP root, so each
+        # rank keeps its own counter to stay aligned across the TP group.
+        producer_step = 0
+        window_profiler = self._make_vllm_window_profiler(
+            step_unit="vllm_request",
+            context={
+                "streaming_staging_queue_capacity": (
+                    self.cfg.streaming_staging_queue_capacity
+                ),
+            },
+        )
         cuda_log_path: Path | None = None
         t_ready = time.time()
         if is_tp_root and self.cfg.output_path is not None:
@@ -2520,6 +2640,13 @@ class LanguageModelSAETrainingRunner:
 
         # Main request-response loop
         while True:
+            producer_step += 1
+            if window_profiler is not None:
+                window_profiler.on_step_start(producer_step)
+            step_request_wait_s = 0.0
+            step_ready_wait_s = 0.0
+            step_nccl_s = 0.0
+            step_valid_tph = 0
             # TP root: block waiting for REQUEST_DATA
             requested_chunks = 1
             if is_tp_root:
@@ -2538,6 +2665,7 @@ class LanguageModelSAETrainingRunner:
                     assert msg_type == _MSG_REQUEST_DATA
                     ctrl[0] = 0
                     requested_chunks = max(1, int(ctrl_msg[1]))
+                step_request_wait_s = request_wait_s
                 _cuda_log({
                     "event": "request_received",
                     "consumer_rank": consumer_global_rank,
@@ -2651,6 +2779,9 @@ class LanguageModelSAETrainingRunner:
                     dist.broadcast(chunk_tensor, src=dist.get_rank(), group=nccl_group)
                     nccl_time_s = time.perf_counter() - t_nccl
                     chunks_sent += 1
+                    step_ready_wait_s += ready_wait_s
+                    step_nccl_s += nccl_time_s
+                    step_valid_tph += valid_tph
                     _cuda_log({
                         "event": "chunk_sent",
                         "chunk": chunks_sent,
@@ -2670,6 +2801,22 @@ class LanguageModelSAETrainingRunner:
             if action == 2:
                 break
 
+            if window_profiler is not None:
+                # Only reached when the request round completed; the EOF and
+                # consumer-done paths break out above and leave the step (and
+                # its window) to be flushed by close().
+                window_profiler.on_step_end(
+                    producer_step,
+                    samples=step_valid_tph,
+                    components={
+                        "request_wait_s": step_request_wait_s,
+                        "ready_wait_s": step_ready_wait_s,
+                        "nccl_time_s": step_nccl_s,
+                    },
+                )
+
+        if window_profiler is not None:
+            window_profiler.close()
         logger.info("[gpu-direct-producer] Done: sent %d chunks", chunks_sent)
 
     @staticmethod
@@ -2755,6 +2902,7 @@ class LanguageModelSAETrainingRunner:
             ),
             buffer_monitor_path=buffer_monitor_path,
             hook_names=self.hook_names if self.is_multi_sae else None,
+            force_multi_hook=self.is_multi_sae,
             select_hook_names=pp_hook_names,
             dp_replica_group=dp_replica_group if self.sae_pp_size > 1 else None,
             dp_replica_root_global_rank=dp_replica_root if self.sae_pp_size > 1 else None,
@@ -2762,9 +2910,7 @@ class LanguageModelSAETrainingRunner:
             pp_rank=pp_rank,
         )
 
-        if self.is_multi_sae:
-            return self._run_streaming_consumer_multi(provider, ds)
-        return self._run_streaming_consumer_single(provider, ds)
+        return self._run_streaming_consumer_multi(provider, ds)
 
     def _run_gpu_direct_consumer_loop(self) -> TrainingSAE[Any]:
         import sae_lens.distributed_streaming as ds
@@ -2833,9 +2979,7 @@ class LanguageModelSAETrainingRunner:
             receiver=receiver,
         )
 
-        if self.is_multi_sae:
-            return self._run_streaming_consumer_multi(provider, ds)
-        return self._run_streaming_consumer_single(provider, ds)
+        return self._run_streaming_consumer_multi(provider, ds)
 
     def _run_streaming_consumer_single(self, provider: Any, ds: Any) -> TrainingSAE[Any]:
         trainer = SAETrainer(

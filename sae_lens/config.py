@@ -208,6 +208,12 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         record_memory_empty_cache (bool): When memory profiling is enabled, call `torch.cuda.empty_cache()` before every per-phase snapshot so `reserved_mb`/`driver_used_mb` reflect current live tensors rather than the historical allocator watermark. This stalls the device and adds tens of ms per phase, so it is only for memory-profiling runs and should be left off for normal training. (default is False)
         record_memory_timeline_step (int): When set to a step index >= 0, capture the full PyTorch allocator history (every alloc/free event with its Python stack, plus the peak-moment snapshot) for that single training step and dump it to `memory_timeline_rank{rank}.pickle` in `output_path`. Open the file at https://pytorch.org/memory_viz to see the timeline and inspect what is resident at the peak. Recording carries noticeable overhead and unbounded memory growth if left on, so it is scoped to exactly one step. Set to -1 to disable. (default is -1)
         synchronize_timing (bool): If True, call `torch.cuda.synchronize()` around timed sections for accurate GPU timings. This changes observed runtime and should only be used for profiling. (default is False)
+        step_window_profile_start_step (int): First step of the first step-window profiling window (1-based). Windows are contiguous, so window i covers steps `[start + i * window_steps, start + i * window_steps + window_steps - 1]`. The device is synchronized only at each window's two boundaries, so overlap inside a window is preserved and the recorded interval is a true end-to-end wall time for those steps. Records go to `step_window_profile_{role}_rank{rank}.jsonl` in `output_path`. Choose the start step past warmup (step 1 is always far slower). 0 disables it. (default is 0)
+        step_window_profile_window_steps (int): Number of steps per profiling window. A step is one step of the loop being profiled, which differs per role: an SAE optimizer step for SAE ranks, one produced chunk or batch for vLLM ranks. Since vLLM and SAE steps have no fixed ratio, set each role's window parameters so the window spans enough work to be representative. (default is 0)
+        step_window_profile_window_count (int): Number of consecutive windows to record. Profiling goes inert after the last window closes. (default is 0)
+        step_window_profile_vllm_start_step (int): Overrides `step_window_profile_start_step` on vLLM producer ranks. Set to 0 to reuse the shared value. (default is 0)
+        step_window_profile_vllm_window_steps (int): Overrides `step_window_profile_window_steps` on vLLM producer ranks. Set to 0 to reuse the shared value. (default is 0)
+        step_window_profile_vllm_window_count (int): Overrides `step_window_profile_window_count` on vLLM producer ranks. Set to 0 to reuse the shared value. (default is 0)
         multi_sae_overlap_instrumentation (bool): Write per-hook DDP bucket / FSDP collective overlap events to `overlap_events_rank{rank}.jsonl` under `multi_sae_overlap_trace_dir`. Installs DDP/FSDP communication hooks that replicate the default reduction semantics, plus per-parameter gradient-ready timestamps. Never synchronizes and never reads device memory, but the extra Python callbacks add CPU overhead, so leave it off for throughput runs. (default is False)
         multi_sae_nvtx_detailed (bool): Emit fine-grained NVTX ranges/marks for each hook's forward, stats, backward, clip and per-bucket communication. Independent of `multi_sae_overlap_instrumentation`: this writes no files. (default is False)
         multi_sae_overlap_trace_dir (str): Directory for overlap event JSONL files. (default is "results/overlap_trace")
@@ -314,6 +320,12 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     record_memory_timeline_step: int = -1
     append_history_logs: bool = False
     synchronize_timing: bool = False
+    step_window_profile_start_step: int = 0
+    step_window_profile_window_steps: int = 0
+    step_window_profile_window_count: int = 0
+    step_window_profile_vllm_start_step: int = 0
+    step_window_profile_vllm_window_steps: int = 0
+    step_window_profile_vllm_window_count: int = 0
     resume_from_checkpoint: str | None = None
 
     # Misc
@@ -532,6 +544,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             raise ValueError(
                 "save_memory_every_n_steps requires output_path to be set"
             )
+        self._validate_step_window_profile()
 
         unique_id = self.logger.wandb_id
         if unique_id is None:
@@ -606,6 +619,68 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         ):
             raise ValueError("exclude_special_tokens list must contain only integers")
 
+    def _validate_step_window_profile(self) -> None:
+        shared = (
+            ("step_window_profile_start_step", self.step_window_profile_start_step),
+            (
+                "step_window_profile_window_steps",
+                self.step_window_profile_window_steps,
+            ),
+            (
+                "step_window_profile_window_count",
+                self.step_window_profile_window_count,
+            ),
+        )
+        vllm = (
+            (
+                "step_window_profile_vllm_start_step",
+                self.step_window_profile_vllm_start_step,
+            ),
+            (
+                "step_window_profile_vllm_window_steps",
+                self.step_window_profile_vllm_window_steps,
+            ),
+            (
+                "step_window_profile_vllm_window_count",
+                self.step_window_profile_vllm_window_count,
+            ),
+        )
+        for name, value in shared + vllm:
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0")
+        set_names = [name for name, value in shared if value > 0]
+        if set_names and len(set_names) != len(shared):
+            raise ValueError(
+                "step_window_profile_start_step, step_window_profile_window_steps "
+                "and step_window_profile_window_count must all be set together; "
+                f"got only {sorted(set_names)}"
+            )
+        if set_names and self.output_path is None:
+            raise ValueError("step-window profiling requires output_path to be set")
+        if not set_names and any(value > 0 for _, value in vllm):
+            raise ValueError(
+                "the step_window_profile_vllm_* overrides require the shared "
+                "step_window_profile_* values to be set"
+            )
+
+    def resolved_step_window_profile(
+        self, *, role: str
+    ) -> tuple[int, int, int]:
+        """Return (start_step, window_steps, window_count) for a profiling role.
+
+        vLLM producer ranks count produced chunks/batches rather than SAE
+        optimizer steps, so they take the `_vllm_` overrides when those are set
+        and fall back to the shared values otherwise.
+        """
+        start = self.step_window_profile_start_step
+        steps = self.step_window_profile_window_steps
+        count = self.step_window_profile_window_count
+        if role == "vllm":
+            start = self.step_window_profile_vllm_start_step or start
+            steps = self.step_window_profile_vllm_window_steps or steps
+            count = self.step_window_profile_vllm_window_count or count
+        return start, steps, count
+
     @property
     def total_training_tokens(self) -> int:
         return self.training_tokens
@@ -679,6 +754,10 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             record_memory_timeline_step=self.record_memory_timeline_step,
             append_history_logs=self.append_history_logs,
             synchronize_timing=self.synchronize_timing,
+            streaming_mode=self.streaming_mode,
+            step_window_profile_start_step=self.step_window_profile_start_step,
+            step_window_profile_window_steps=self.step_window_profile_window_steps,
+            step_window_profile_window_count=self.step_window_profile_window_count,
             multi_sae_backward_order=self.multi_sae_backward_order,
             multi_sae_stats_sync_mode=self.multi_sae_stats_sync_mode,
             multi_sae_stats_sync_interval=self.multi_sae_stats_sync_interval,
@@ -991,7 +1070,11 @@ class SAETrainerConfig:
     dead_feature_window: int
     feature_sampling_window: int
     logger: LoggingConfig
+    streaming_mode: bool = False
     append_history_logs: bool = False
+    step_window_profile_start_step: int = 0
+    step_window_profile_window_steps: int = 0
+    step_window_profile_window_count: int = 0
     multi_sae_overlap_instrumentation: bool = False
     multi_sae_nvtx_detailed: bool = False
     multi_sae_overlap_trace_dir: str = DEFAULT_OVERLAP_TRACE_DIR

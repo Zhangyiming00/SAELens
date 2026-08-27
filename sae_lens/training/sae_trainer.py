@@ -46,6 +46,7 @@ from sae_lens.saes.sae import (
 )
 from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.optim import CoefficientScheduler, get_lr_scheduler
+from sae_lens.training.step_window_profiler import StepWindowProfiler
 from sae_lens.training.types import DataProvider
 from sae_lens.util import path_or_tmp_dir
 
@@ -78,6 +79,15 @@ def _update_sae_lens_training_version(sae: TrainingSAE[Any]) -> None:
 
 def _write_checkpoint_complete_marker(checkpoint_path: Path) -> None:
     (checkpoint_path / "COMPLETED").write_text("ok\n")
+
+
+def _step_window_profile_sae_role(cfg: Any) -> str | None:
+    """Return the SAE profiling role, or None for non-writing streaming ranks."""
+    if not getattr(cfg, "streaming_mode", False):
+        return "sae"
+    import sae_lens.distributed_streaming as ds
+
+    return "sae_root" if ds.is_sae_tp_root() else None
 
 
 def _adam_optimizer_kwargs_from_env() -> dict[str, bool]:
@@ -198,6 +208,36 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             self.memory_timeline_path = (
                 output_path / f"memory_timeline_rank{_global_rank}.pickle"
             )
+
+        # Fixed-window end-to-end step timing. Ordinary training keeps per-rank
+        # SAE files; streaming keeps only the SAE TP root so it can be paired
+        # with the independent vLLM root file.
+        sae_profile_role = _step_window_profile_sae_role(cfg)
+        self.step_window_profiler = (
+            StepWindowProfiler.maybe_create(
+                start_step=getattr(cfg, "step_window_profile_start_step", 0),
+                window_steps=getattr(cfg, "step_window_profile_window_steps", 0),
+                window_count=getattr(cfg, "step_window_profile_window_count", 0),
+                output_dir=cfg.output_path,
+                role=sae_profile_role,
+                step_unit="sae_step",
+                rank=_global_rank,
+                device=cfg.device,
+                context={
+                    "num_hooks": 1,
+                    "train_batch_size_samples": cfg.train_batch_size_samples,
+                    "dp_world_size": dist.get_world_size(dp_group)
+                    if dp_group is not None
+                    else 1,
+                    "synchronize_timing": cfg.synchronize_timing,
+                    "save_memory_every_n_steps": getattr(
+                        cfg, "save_memory_every_n_steps", 0
+                    ),
+                },
+            )
+            if sae_profile_role is not None
+            else None
+        )
 
         self.checkpoint_thresholds = []
         if self.cfg.n_checkpoints > 0:
@@ -355,6 +395,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 _ack_drain_done()
                 _save_quiesce_checkpoint()
                 break
+            step_number = self.n_training_steps + 1
+            if self.step_window_profiler is not None:
+                self.step_window_profiler.on_step_start(step_number)
             step_wall_t0 = time.perf_counter()
             self._maybe_start_memory_timeline()
             # Do a training step.
@@ -410,12 +453,29 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             self.n_training_steps += 1
             self._update_pbar(step_output, pbar)
 
+            # Closed after per-step logging/checkpointing so the window covers
+            # everything a real step costs, not just the compute.
+            if self.step_window_profiler is not None:
+                self.step_window_profiler.on_step_end(
+                    step_number,
+                    samples=batch.shape[0],
+                    components={
+                        "vllm_step_time_s": vllm_step_time_s,
+                        "transfer_time_s": transfer_time_s,
+                        "data_time_s": vllm_step_time_s + transfer_time_s,
+                        "sae_time_s": sae_time_s,
+                        "dp_allreduce_time_s": _dp_allreduce_time_s,
+                    },
+                )
+
             _maybe_start_quiesce_drain()
             if quiesce_checkpoint_now:
                 _ack_drain_done()
                 _save_quiesce_checkpoint()
                 break
 
+        if self.step_window_profiler is not None:
+            self.step_window_profiler.close()
         if quiesce_draining:
             _ack_drain_done()
             _save_quiesce_checkpoint()
