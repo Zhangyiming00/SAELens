@@ -47,6 +47,10 @@ from sae_lens.saes.sae import (
 from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.optim import CoefficientScheduler, get_lr_scheduler
 from sae_lens.training.step_window_profiler import StepWindowProfiler
+from sae_lens.training.tp_checkpoint import (
+    gather_tp_state_dict_to_root_cpu,
+    get_current_sae_tp_cpu_group,
+)
 from sae_lens.training.types import DataProvider
 from sae_lens.util import path_or_tmp_dir
 
@@ -544,32 +548,51 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         return self.cfg.checkpoint_path
 
     def _save_model(self, checkpoint_path: Path) -> tuple[Path, Path]:
-        """Save SAE weights, handling FSDP gather before the existing TP-aware export."""
+        """Save SAE weights, using CPU/Gloo to merge TP shards after FSDP."""
         if not self._is_fsdp:
             return self._base_sae.save_model(str(checkpoint_path))
 
-        # FSDP: gather full local-TP-shard state from DP replicas, then reuse
-        # the existing TP-aware gather path in process_state_dict_for_saving().
         fsdp_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with FSDP.state_dict_type(self.sae, StateDictType.FULL_STATE_DICT, fsdp_cfg):
-            state_dict = self.sae.state_dict()
-        # state_dict is populated only on dp_rank==0 (rank0_only=True).
-        # process_state_dict_for_saving gathers TP shards via all_gather.
-        self._base_sae.process_state_dict_for_saving(state_dict)
+            local_tp_state = self.sae.state_dict()
 
         model_weights_path = checkpoint_path / SAE_WEIGHTS_FILENAME
         cfg_path = checkpoint_path / SAE_CFG_FILENAME
         tp_group = getattr(self._base_sae, "_tp_group", None)
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
+        tp_cpu_group = get_current_sae_tp_cpu_group()
+
+        # FSDP rank0_only leaves one CPU local-TP shard for each DP-rank-0 TP
+        # coordinate. Only those ranks enter the Gloo gather; TP-rank 0 receives
+        # the full logical model.
+        state_dict = (
+            gather_tp_state_dict_to_root_cpu(
+                local_tp_state, self._base_sae, tp_cpu_group
+            )
+            if dp_rank == 0
+            else None
+        )
+
         if dp_rank == 0 and tp_rank == 0:
+            assert state_dict is not None
             save_file(state_dict, model_weights_path)
             with open(cfg_path, "w") as f:
                 json.dump(self._base_sae.cfg.to_dict(), f)
-        del state_dict
+
+        del local_tp_state
+        if state_dict is not None:
+            del state_dict
         torch.cuda.empty_cache()
-        if tp_group is not None:
-            dist.barrier(group=tp_group)
+
+        # Keep the DP0 TP ranks together through the file write so a non-root
+        # rank cannot tear down the export communicator while TP0 is still saving.
+        if (
+            dp_rank == 0
+            and tp_cpu_group is not None
+            and dist.get_world_size(tp_cpu_group) > 1
+        ):
+            dist.barrier(group=tp_cpu_group)
         return model_weights_path, cfg_path
 
     def save_trainer_state(self, checkpoint_path: Path) -> None:

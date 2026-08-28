@@ -125,10 +125,10 @@ class BatchTopKTrainingSAE(TopKTrainingSAE):
                 self.topk_threshold = (1 - lr) * self.topk_threshold + lr * min_positive
 
     @override
-    def process_state_dict_for_saving_inference(
+    def postprocess_full_state_dict_for_inference(
         self, state_dict: dict[str, Any]
     ) -> None:
-        super().process_state_dict_for_saving_inference(state_dict)
+        super().postprocess_full_state_dict_for_inference(state_dict)
         # turn the topk threshold into jumprelu threshold
         topk_threshold = state_dict.pop("topk_threshold").item()
         state_dict["threshold"] = torch.ones_like(self.b_enc) * topk_threshold

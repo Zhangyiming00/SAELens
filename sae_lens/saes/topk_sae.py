@@ -806,10 +806,10 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
         return self.cfg.aux_loss_coefficient * scale * auxk_loss
 
     @override
-    def process_state_dict_for_saving_inference(
+    def postprocess_full_state_dict_for_inference(
         self, state_dict: dict[str, Any]
     ) -> None:
-        super().process_state_dict_for_saving_inference(state_dict)
+        super().postprocess_full_state_dict_for_inference(state_dict)
         if self.cfg.rescale_acts_by_decoder_norm:
             _fold_norm_topk(
                 W_enc=state_dict["W_enc"],

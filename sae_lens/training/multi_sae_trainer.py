@@ -48,6 +48,10 @@ from sae_lens.training.sae_trainer import (
     _write_checkpoint_complete_marker,
 )
 from sae_lens.training.step_window_profiler import StepWindowProfiler
+from sae_lens.training.tp_checkpoint import (
+    gather_tp_state_dict_to_root_cpu,
+    get_current_sae_tp_cpu_group,
+)
 from sae_lens.training.types import DataProvider
 
 MULTI_SAE_MANIFEST_FILENAME = "multi_sae_manifest.json"
@@ -1225,10 +1229,18 @@ class MultiSAETrainer:
         if state_dict_by_hook is None:
             return
         tp_rank = self._tp_rank()
+        tp_cpu_group = get_current_sae_tp_cpu_group() if self._is_fsdp else None
         for hook_name in self.hook_names:
             base_sae = self.base_sae_by_hook[hook_name]
             state_dict = state_dict_by_hook[hook_name]
-            if inference:
+            if self._is_fsdp:
+                state_dict = gather_tp_state_dict_to_root_cpu(
+                    state_dict, base_sae, tp_cpu_group
+                )
+                if inference and tp_rank == 0:
+                    assert state_dict is not None
+                    base_sae.postprocess_full_state_dict_for_inference(state_dict)
+            elif inference:
                 base_sae.process_state_dict_for_saving_inference(state_dict)
             else:
                 base_sae.process_state_dict_for_saving(state_dict)
@@ -1247,7 +1259,10 @@ class MultiSAETrainer:
                     {"sparsity": self.log_feature_sparsity_by_hook[hook_name]},
                     out_dir / SPARSITY_FILENAME,
                 )
-            if not self._is_fsdp:
+            if self._is_fsdp:
+                if tp_cpu_group is not None and dist.get_world_size(tp_cpu_group) > 1:
+                    dist.barrier(group=tp_cpu_group)
+            else:
                 self._tp_barrier()
 
     def _save_one_final(self, base_output: Path, hook_name: str) -> None:
@@ -1261,10 +1276,16 @@ class MultiSAETrainer:
         if self._is_fsdp:
             fsdp_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
             with FSDP.state_dict_type(sae, StateDictType.FULL_STATE_DICT, fsdp_cfg):
-                state_dict = sae.state_dict()
+                local_tp_state = sae.state_dict()
             if dp_rank != 0:
                 return
-            base_sae.process_state_dict_for_saving_inference(state_dict)
+            tp_cpu_group = get_current_sae_tp_cpu_group()
+            state_dict = gather_tp_state_dict_to_root_cpu(
+                local_tp_state, base_sae, tp_cpu_group
+            )
+            if tp_rank == 0:
+                assert state_dict is not None
+                base_sae.postprocess_full_state_dict_for_inference(state_dict)
         else:
             if dp_rank != 0:
                 return
@@ -1274,14 +1295,19 @@ class MultiSAETrainer:
                 self._tp_barrier()
                 return
 
-        save_file(state_dict, out_dir / SAE_WEIGHTS_FILENAME)
-        with open(out_dir / SAE_CFG_FILENAME, "w") as f:
-            json.dump(base_sae.cfg.get_inference_sae_cfg_dict(), f)
-        save_file(
-            {"sparsity": self.log_feature_sparsity_by_hook[hook_name]},
-            out_dir / SPARSITY_FILENAME,
-        )
-        if not self._is_fsdp:
+        if tp_rank == 0:
+            assert state_dict is not None
+            save_file(state_dict, out_dir / SAE_WEIGHTS_FILENAME)
+            with open(out_dir / SAE_CFG_FILENAME, "w") as f:
+                json.dump(base_sae.cfg.get_inference_sae_cfg_dict(), f)
+            save_file(
+                {"sparsity": self.log_feature_sparsity_by_hook[hook_name]},
+                out_dir / SPARSITY_FILENAME,
+            )
+        if self._is_fsdp:
+            if tp_cpu_group is not None and dist.get_world_size(tp_cpu_group) > 1:
+                dist.barrier(group=tp_cpu_group)
+        else:
             self._tp_barrier()
 
     def save_checkpoint(self, checkpoint_name: str) -> None:
@@ -1324,13 +1350,17 @@ class MultiSAETrainer:
 
         dp_rank = self._dp_rank()
         tp_rank = self._tp_rank()
+        tp_cpu_group = None
         if self._is_fsdp:
             fsdp_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
             with FSDP.state_dict_type(sae, StateDictType.FULL_STATE_DICT, fsdp_cfg):
-                state_dict = sae.state_dict()
+                local_tp_state = sae.state_dict()
             if dp_rank != 0:
                 return
-            base_sae.process_state_dict_for_saving(state_dict)
+            tp_cpu_group = get_current_sae_tp_cpu_group()
+            state_dict = gather_tp_state_dict_to_root_cpu(
+                local_tp_state, base_sae, tp_cpu_group
+            )
         else:
             if dp_rank != 0:
                 return
@@ -1340,16 +1370,22 @@ class MultiSAETrainer:
                 self._tp_barrier()
                 return
 
-        save_file(state_dict, out_dir / SAE_WEIGHTS_FILENAME)
-        with open(out_dir / SAE_CFG_FILENAME, "w") as f:
-            json.dump(base_sae.cfg.to_dict(), f)
-        save_file(
-            {"sparsity": self.log_feature_sparsity_by_hook[hook_name]},
-            out_dir / SPARSITY_FILENAME,
-        )
-        del state_dict
+        if tp_rank == 0:
+            assert state_dict is not None
+            save_file(state_dict, out_dir / SAE_WEIGHTS_FILENAME)
+            with open(out_dir / SAE_CFG_FILENAME, "w") as f:
+                json.dump(base_sae.cfg.to_dict(), f)
+            save_file(
+                {"sparsity": self.log_feature_sparsity_by_hook[hook_name]},
+                out_dir / SPARSITY_FILENAME,
+            )
+        if state_dict is not None:
+            del state_dict
         torch.cuda.empty_cache()
-        if not self._is_fsdp:
+        if self._is_fsdp:
+            if tp_cpu_group is not None and dist.get_world_size(tp_cpu_group) > 1:
+                dist.barrier(group=tp_cpu_group)
+        else:
             self._tp_barrier()
 
     def save_trainer_state(self, checkpoint_path: Path) -> None:

@@ -57,6 +57,7 @@ is_consumer = _v2.is_consumer
 get_producer_idx = _v2.get_producer_idx
 get_vllm_tp_group = _v2.get_vllm_tp_group
 get_sae_tp_group = _v2.get_sae_tp_group
+get_sae_tp_cpu_group = _v2.get_sae_tp_cpu_group
 get_sae_tp_rank = _v2.get_sae_tp_rank
 get_sae_tp_size = _v2.get_sae_tp_size
 get_vllm_tp_size = _v2.get_vllm_tp_size

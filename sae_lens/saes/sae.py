@@ -1055,11 +1055,19 @@ class TrainingSAE(SAE[T_TRAINING_SAE_CONFIG], ABC):
     def process_state_dict_for_saving_inference(
         self, state_dict: dict[str, Any]
     ) -> None:
+        """Process a local/training state dict into a full inference state dict."""
+        self.process_state_dict_for_saving(state_dict)
+        self.postprocess_full_state_dict_for_inference(state_dict)
+
+    def postprocess_full_state_dict_for_inference(
+        self, state_dict: dict[str, Any]
+    ) -> None:
+        """Inference-only transform for an already-full logical state dict.
+
+        FSDP x TP export first reconstructs the full logical SAE with a CPU/Gloo
+        gather and calls this hook directly so it does not trigger a second TP gather.
         """
-        Process the state dict for saving the inference model.
-        This is a hook that can be overridden to change how the state dict is processed for the inference model.
-        """
-        return self.process_state_dict_for_saving(state_dict)
+        return None
 
     @torch.no_grad()
     def log_histograms(self) -> dict[str, NDArray[Any]]:

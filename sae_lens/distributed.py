@@ -25,6 +25,7 @@ from sae_lens.profiling import nccl_nvtx_range
 
 # Module-level state for prefix-overlap training.
 _sae_tp_group: dist.ProcessGroup | None = None
+_sae_tp_cpu_group: dist.ProcessGroup | None = None  # Gloo twin used only for CPU checkpoint/export
 _sae_dp_group: dist.ProcessGroup | None = None
 _vllm_tp_group: dist.ProcessGroup | None = None
 _worker_group: dist.ProcessGroup | None = None
@@ -65,7 +66,7 @@ def init_distributed(
 
     Must be called after torch.distributed.init_process_group().
     """
-    global _sae_tp_group, _sae_dp_group, _vllm_tp_group, _worker_group, _worker_cpu_group
+    global _sae_tp_group, _sae_tp_cpu_group, _sae_dp_group, _vllm_tp_group, _worker_group, _worker_cpu_group
     global _vllm_dp_p2p_group
     global _sae_tp_rank, _sae_tp_size, _sae_dp_rank, _sae_dp_size
     global _worker_rank, _worker_size, _cluster_block, _vllm_tp_rank, _vllm_tp_size
@@ -145,6 +146,7 @@ def init_distributed(
     _sae_dp_size = sae_dp_size
     _vllm_tp_size = vllm_tp_size
     _vllm_dp_size = vllm_dp_size
+    _sae_tp_cpu_group = None
     _vllm_dp_p2p_group = None
 
     if fan_in_topology:
@@ -186,12 +188,16 @@ def init_distributed(
                 _worker_cpu_group = cpu_group
 
         # SAE TP group for each SAE replica (cluster).
+        # Create a same-membership Gloo twin for CPU checkpoint/export. All
+        # global ranks must call new_group() in the same order.
         for cc in range(sae_dp_size):
             base = cc * block
             sae_ranks = list(range(base, base + sae_tp_size))
             group = dist.new_group(sae_ranks)
+            cpu_group = dist.new_group(sae_ranks, backend="gloo")
             if _sae_active and _sae_dp_rank == cc:
                 _sae_tp_group = group
+                _sae_tp_cpu_group = cpu_group
 
         # SAE DP group: same sae_tp_rank across all clusters.
         for sae_tp_r in range(sae_tp_size):
@@ -230,12 +236,15 @@ def init_distributed(
                 _worker_cpu_group = cpu_group
 
         # SAE TP group: prefix [0, sae_tp_size) inside each replica.
+        # Keep the NCCL training group and a same-membership Gloo export group.
         for replica_r in range(sae_dp_size):
             base = replica_r * replica_size
             ranks = list(range(base, base + sae_tp_size))
             group = dist.new_group(ranks)
+            cpu_group = dist.new_group(ranks, backend="gloo")
             if _sae_dp_rank == replica_r and _sae_active:
                 _sae_tp_group = group
+                _sae_tp_cpu_group = cpu_group
 
         # vLLM TP group: prefix [0, vllm_tp_size) inside each replica.
         for replica_r in range(sae_dp_size):
@@ -304,6 +313,11 @@ def get_vllm_world_ranks() -> list[int]:
 
 def get_sae_tp_group() -> dist.ProcessGroup | None:
     return _sae_tp_group
+
+
+def get_sae_tp_cpu_group() -> dist.ProcessGroup | None:
+    """Gloo process group with exactly the same members as the SAE TP group."""
+    return _sae_tp_cpu_group
 
 
 def get_tp_group() -> dist.ProcessGroup | None:

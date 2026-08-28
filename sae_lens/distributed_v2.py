@@ -73,6 +73,7 @@ _sae_endpoint_tp_root: dict[int, int] = {}        # e -> world rank of TP root (
 # Process groups
 _vllm_tp_group: dist.ProcessGroup | None = None
 _sae_tp_group: dist.ProcessGroup | None = None
+_sae_tp_cpu_group: dist.ProcessGroup | None = None  # same SAE TP members, Gloo, checkpoint/export only
 _sae_dp_group: dist.ProcessGroup | None = None
 _sae_endpoint_p2p_groups: dict[int, dist.ProcessGroup] = {}  # endpoint_idx -> NCCL P2P group
 _sae_dp_replica_group: dist.ProcessGroup | None = None  # all PP*TP ranks of this DP replica
@@ -99,7 +100,7 @@ def _reset() -> None:
     global _vllm_tp_rank, _sae_tp_rank, _sae_pp_rank, _sae_dp_idx
     global _producer_world_ranks, _sae_endpoint_world_ranks, _consumer_world_ranks
     global _producer_tp_root, _sae_endpoint_tp_root, _consumer_tp_root
-    global _vllm_tp_group, _sae_tp_group, _sae_dp_group
+    global _vllm_tp_group, _sae_tp_group, _sae_tp_cpu_group, _sae_dp_group
     global _sae_endpoint_p2p_groups, _consumer_p2p_groups, _routing_table
     global _sae_dp_replica_group, _sae_dp_replica_root
     global _streaming_nccl_groups, _gloo_ctrl_group, _pp_coord_groups
@@ -118,6 +119,7 @@ def _reset() -> None:
     _consumer_tp_root = _sae_endpoint_tp_root
     _vllm_tp_group = None
     _sae_tp_group = None
+    _sae_tp_cpu_group = None
     _sae_dp_group = None
     _sae_endpoint_p2p_groups = {}
     _consumer_p2p_groups = _sae_endpoint_p2p_groups
@@ -182,7 +184,7 @@ def init_distributed_v2(
     global _vllm_tp_rank, _sae_tp_rank, _sae_pp_rank, _sae_dp_idx
     global _producer_world_ranks, _sae_endpoint_world_ranks, _consumer_world_ranks
     global _producer_tp_root, _sae_endpoint_tp_root, _consumer_tp_root
-    global _vllm_tp_group, _sae_tp_group, _sae_dp_group
+    global _vllm_tp_group, _sae_tp_group, _sae_tp_cpu_group, _sae_dp_group
     global _sae_endpoint_p2p_groups, _consumer_p2p_groups, _routing_table
     global _sae_dp_replica_group, _sae_dp_replica_root
     global _streaming_nccl_groups, _gloo_ctrl_group, _pp_coord_groups
@@ -260,11 +262,15 @@ def init_distributed_v2(
             _vllm_tp_group = grp
 
     # --- Create one SAE TP group per physical endpoint (DP replica x PP stage) ---
+    # The Gloo twin has exactly the same membership and is used only after FSDP
+    # has offloaded a local TP shard to CPU for checkpoint/final export.
     for endpoint_idx in range(num_sae_stage_endpoints):
         ranks = _sae_endpoint_world_ranks[endpoint_idx]
         grp = dist.new_group(ranks, backend="nccl")
+        cpu_grp = dist.new_group(ranks, backend="gloo")
         if _is_consumer and _sae_endpoint_idx == endpoint_idx:
             _sae_tp_group = grp
+            _sae_tp_cpu_group = cpu_grp
 
     # --- Create SAE DP groups (NCCL): one per (pp_stage, tp_rank) position ---
     # Ranks at the same PP stage and TP position across DP replicas.
@@ -445,6 +451,11 @@ def get_vllm_tp_group() -> dist.ProcessGroup | None:
 
 def get_sae_tp_group() -> dist.ProcessGroup | None:
     return _sae_tp_group
+
+
+def get_sae_tp_cpu_group() -> dist.ProcessGroup | None:
+    """Gloo process group with exactly the same members as this SAE TP endpoint."""
+    return _sae_tp_cpu_group
 
 
 def get_sae_dp_group() -> dist.ProcessGroup | None:

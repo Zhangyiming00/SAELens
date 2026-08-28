@@ -59,6 +59,10 @@ from sae_lens.training.multi_hook_sae import MultiHookSAE
 from sae_lens.training.multi_sae_trainer import MultiSAETrainer, sanitize_hook_name_for_path
 from sae_lens.training.sae_trainer import SAETrainer
 from sae_lens.training.step_window_profiler import StepWindowProfiler
+from sae_lens.training.tp_checkpoint import (
+    gather_tp_state_dict_to_root_cpu,
+    get_current_sae_tp_cpu_group,
+)
 from sae_lens.training.types import DataProvider
 from sae_lens.util import temporary_seed
 
@@ -1315,11 +1319,6 @@ class LanguageModelSAETrainingRunner:
             if sae_dp_group is not None and dist.is_initialized()
             else 1
         )
-        if self.cfg.sae_dp_mode == "fsdp" and self.sae_tp_size > 1:
-            raise ValueError(
-                "sae_dp_mode='fsdp' with sae_tp_size > 1 is not supported. "
-                "Use sae_tp_size=1 with FSDP."
-            )
         if self.cfg.sae_dp_mode == "fsdp" and sae_dp_group is None:
             raise ValueError("Multi-layer SAE training with FSDP requires an SAE DP group.")
         ddp_kwargs_multi = (
@@ -1902,27 +1901,37 @@ class LanguageModelSAETrainingRunner:
         base_output_path.mkdir(exist_ok=True, parents=True)
 
         if self.cfg.sae_dp_mode == "fsdp":
-            # FSDP state dict gather is a collective — all DP ranks must call it.
-            # rank0_only=True means only dp_rank 0 receives a non-empty result.
+            # First reconstruct each TP coordinate across the FSDP/DP dimension.
+            # offload_to_cpu=True intentionally leaves a CPU local-TP shard on
+            # every DP-rank-0 TP coordinate.
             from torch.distributed.fsdp import FullStateDictConfig, StateDictType
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
             fsdp_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
             with FSDP.state_dict_type(self.sae, StateDictType.FULL_STATE_DICT, fsdp_cfg):
-                state_dict = self.sae.state_dict()
-            # Non-rank-0 processes have an empty dict; nothing to save.
+                local_tp_state = self.sae.state_dict()
             if dp_rank != 0:
                 return
-            sae.process_state_dict_for_saving_inference(state_dict)
+
+            tp_cpu_group = get_current_sae_tp_cpu_group()
+            state_dict = gather_tp_state_dict_to_root_cpu(
+                local_tp_state, sae, tp_cpu_group
+            )
             weights_path = base_output_path / SAE_WEIGHTS_FILENAME
             cfg_path = base_output_path / SAE_CFG_FILENAME
             if tp_rank == 0:
+                assert state_dict is not None
+                # The logical TP model is already reconstructed. Do not invoke
+                # the NCCL TP gather again.
+                sae.postprocess_full_state_dict_for_inference(state_dict)
                 save_file(state_dict, weights_path)
                 config = sae.cfg.get_inference_sae_cfg_dict()
                 with open(cfg_path, "w") as f:
                     json.dump(config, f)
-            if tp_group is not None:
-                dist.barrier(group=tp_group)
+            if tp_cpu_group is not None and dist.get_world_size(tp_cpu_group) > 1:
+                dist.barrier(group=tp_cpu_group)
+            if tp_rank != 0:
+                return
         else:
             if dp_rank != 0:
                 return
