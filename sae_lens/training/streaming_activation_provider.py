@@ -5,16 +5,16 @@ StreamingActivationProvider implements Iterator[torch.Tensor] (the DataProvider
 protocol expected by SAETrainer). It:
   1. Acquires activation chunks from SharedActivationBuffer (any READY chunks
      immediately, up to prefetch_chunks at a time).
-  2. Carries over leftover rows from the previous pool to avoid dropping data.
-  3. Shuffles each newly acquired batch before merging.
-  4. Yields batches of exactly train_batch_size_tokens (final batch may be smaller).
-  5. For sae_tp > 1, TP root broadcasts new data to followers via NCCL (CUDA tensor).
-  6. For sae_pp_size > 1, the DP-replica root (PP-0 + TP-0) acquires chunks and
-     broadcasts the chunk-index list (NOT the data) to its sibling PP stages via
-     ``dp_replica_group``. Sibling PP stages then read the same chunks directly
-     from the shared mmap and slice out only the rows for their own hooks. Every
-     PP stage's TP-root calls ``release_chunk`` once; the buffer's refcount
-     ensures the chunk only returns to FREE after all siblings have released.
+  2. For sae_dp > 1, only PP-0 + TP-0 of each DP replica participates in the
+     equal-cohort SHM allocator.
+  3. Carries over leftover rows from the previous pool to avoid dropping data.
+  4. Shuffles each newly acquired batch before merging.
+  5. Yields batches of exactly train_batch_size_tokens (final batch may be smaller).
+  6. For sae_tp > 1, TP root broadcasts new data to followers via NCCL (CUDA tensor).
+  7. For sae_pp_size > 1, the DP-replica root (PP-0 + TP-0) broadcasts only the
+     chunk-index list to TP-0 roots of sibling PP stages. Sibling PP roots read
+     the same mmap chunks directly and then broadcast activations inside their
+     own TP groups. Buffer refcount is the number of PP-stage TP roots.
 """
 
 from __future__ import annotations
@@ -48,13 +48,16 @@ class StreamingActivationProvider:
         select_hook_names: optional subset of ``hook_names`` to return from ``_take``.
             Used by PP stages that only train on a subset of hooks. ``None`` returns
             all hooks (single-PP behaviour).
-        dp_replica_group: NCCL process group spanning all PP*TP ranks of this DP
-            replica. Used by PP-0 + TP-0 to broadcast claimed chunk indices to
-            sibling PP stages. ``None`` falls back to single-PP behaviour.
-        dp_replica_root_global_rank: world rank of PP-0 + TP-0 in this DP replica.
+        force_multi_hook: force multi-hook parsing even when only one hook is present.
+        pp_root_group: NCCL process group containing PP-stage TP roots in this DP
+            replica. Used by PP-0 + TP-0 to broadcast claimed chunk indices.
+        pp_root_global_rank: world rank of PP-0 + TP-0 in this DP replica.
+        sae_dp_size / sae_dp_idx: SAE-DP topology for equal-cohort SHM allocation.
         sae_pp_size: number of PP stages within this DP replica. Used as the buffer
             refcount on acquire. Defaults to 1 (single-PP).
         pp_rank: this rank's PP stage index. 0 == DP root.
+        dp_replica_group / dp_replica_root_global_rank: deprecated compatibility
+            aliases for pp_root_group / pp_root_global_rank.
     """
 
     def __init__(
@@ -79,10 +82,16 @@ class StreamingActivationProvider:
         buffer_monitor_path: Path | None = None,
         hook_names: list[str] | None = None,
         select_hook_names: list[str] | None = None,
-        dp_replica_group: dist.ProcessGroup | None = None,
-        dp_replica_root_global_rank: int | None = None,
+        force_multi_hook: bool = False,
+        pp_root_group: dist.ProcessGroup | None = None,
+        pp_root_global_rank: int | None = None,
+        sae_dp_size: int = 1,
+        sae_dp_idx: int = 0,
         sae_pp_size: int = 1,
         pp_rank: int = 0,
+        # Deprecated compatibility aliases. New code should pass pp_root_*.
+        dp_replica_group: dist.ProcessGroup | None = None,
+        dp_replica_root_global_rank: int | None = None,
     ) -> None:
         self._buffer = buffer
         self._batch_size = train_batch_size_tokens
@@ -111,7 +120,7 @@ class StreamingActivationProvider:
 
         self._hook_names = hook_names
         self._num_hooks = len(hook_names) if hook_names else 1
-        self._is_multi_hook = self._num_hooks >= 1
+        self._is_multi_hook = force_multi_hook or self._num_hooks > 1
         self._tokens_per_hook = train_batch_size_tokens
 
         # PP-stage hook subset (None == train all hooks the buffer carries)
@@ -124,17 +133,23 @@ class StreamingActivationProvider:
                     )
         self._select_hook_names = select_hook_names
 
-        # Per-DP-replica coordination for sae_pp_size > 1
-        self._dp_replica_group = dp_replica_group
-        self._dp_replica_root_global = dp_replica_root_global_rank
+        # Per-DP-replica PP coordination. Only PP-stage TP roots participate.
+        self._pp_root_group = pp_root_group if pp_root_group is not None else dp_replica_group
+        self._pp_root_global = (
+            pp_root_global_rank
+            if pp_root_global_rank is not None
+            else dp_replica_root_global_rank
+        )
+        self._sae_dp_size = sae_dp_size
+        self._sae_dp_idx = sae_dp_idx
         self._sae_pp_size = sae_pp_size
         self._pp_rank = pp_rank
-        # PP-0 + TP-0 is the DP replica root that calls acquire_up_to.
+        # PP-0 + TP-0 is the DP replica root that calls the SHM allocator.
         self._is_dp_root = pp_rank == 0 and sae_tp_rank == 0
-        if sae_pp_size > 1 and dp_replica_group is None:
+        if sae_pp_size > 1 and sae_tp_rank == 0 and self._pp_root_group is None:
             raise ValueError(
-                "sae_pp_size>1 requires dp_replica_group to coordinate chunk "
-                "claiming across PP stages"
+                "sae_pp_size>1 requires pp_root_group on PP-stage TP roots to "
+                "coordinate chunk claiming"
             )
 
         self._pool: torch.Tensor | None = None
@@ -218,6 +233,11 @@ class StreamingActivationProvider:
         if self._drain_local_pool:
             return
         if self._external_stop_requested():
+            if self._sae_dp_size > 1:
+                # Do not let one DP replica drain while another already owns a
+                # reservation from the current cohort.
+                self._buffer.request_consumer_stop()
+                return
             self.request_drain_local_pool()
 
     def _external_stop_requested(self) -> bool:
@@ -227,6 +247,8 @@ class StreamingActivationProvider:
         )
 
     def _should_stop_acquiring(self) -> bool:
+        if self._sae_dp_size > 1:
+            return self._drain_local_pool
         return self._drain_local_pool or self._external_stop_requested()
 
     def consume_last_data_timing(self) -> dict[str, float]:
@@ -273,10 +295,9 @@ class StreamingActivationProvider:
         """Acquire chunks from the buffer, merge with leftover, shuffle.
 
         Three roles:
-        - DP-replica root (PP-0 + TP-0): acquires from the buffer, broadcasts
-          chunk indices to PP siblings via ``dp_replica_group``, then reads its
-          own copy of those chunks and broadcasts the resulting tensor to its
-          TP followers.
+        - DP-replica root (PP-0 + TP-0): acquires its SAE-DP cohort from the
+          buffer, broadcasts chunk indices to sibling PP-stage TP roots, then
+          reads its own copy and broadcasts the resulting tensor to TP followers.
         - PP-sibling TP root (PP-rank>0, TP-rank=0): receives chunk indices from
           the DP root, reads the same chunks directly from /dev/shm, slices its
           own hook subset, then broadcasts to its TP followers. Calls
@@ -304,12 +325,22 @@ class StreamingActivationProvider:
         self._write_buffer_monitor()
         t0 = time.perf_counter()
         try:
-            indices, vllm_wait_s = self._buffer.acquire_up_to(
-                self._prefetch_chunks,
-                random=self._random_chunks,
-                refcount=self._sae_pp_size,
-                stop_check=self._should_stop_acquiring,
-            )
+            if self._sae_dp_size > 1:
+                indices, vllm_wait_s = self._buffer.acquire_dp_up_to(
+                    self._prefetch_chunks,
+                    dp_idx=self._sae_dp_idx,
+                    dp_size=self._sae_dp_size,
+                    random=self._random_chunks,
+                    refcount=self._sae_pp_size,
+                    stop_check=self._should_stop_acquiring,
+                )
+            else:
+                indices, vllm_wait_s = self._buffer.acquire_up_to(
+                    self._prefetch_chunks,
+                    random=self._random_chunks,
+                    refcount=self._sae_pp_size,
+                    stop_check=self._should_stop_acquiring,
+                )
         except StopIteration:
             self._make_all_local_pool_servable()
             self._shm_log({"event": "refill_exhausted", "wait_time_s": time.perf_counter() - t0})
@@ -432,41 +463,36 @@ class StreamingActivationProvider:
         """DP root → PP siblings: send (count, [indices..., valid_rows...]).
 
         When ``end_of_stream`` is True, count is encoded as -1.
-        No-op when ``sae_pp_size == 1`` or ``dp_replica_group`` is None.
         """
-        if self._sae_pp_size <= 1 or self._dp_replica_group is None:
+        if self._sae_pp_size <= 1 or self._pp_root_group is None:
             return
-        assert self._dp_replica_root_global is not None
+        assert self._pp_root_global is not None
         if end_of_stream:
             meta = torch.tensor([-1], dtype=torch.int64, device=self._device)
-            dist.broadcast(meta, src=self._dp_replica_root_global, group=self._dp_replica_group)
+            dist.broadcast(meta, src=self._pp_root_global, group=self._pp_root_group)
             return
         n = len(indices)
         meta = torch.tensor([n], dtype=torch.int64, device=self._device)
-        dist.broadcast(meta, src=self._dp_replica_root_global, group=self._dp_replica_group)
+        dist.broadcast(meta, src=self._pp_root_global, group=self._pp_root_group)
         if n == 0:
             return
         assert valid_rows is not None and len(valid_rows) == n
         payload = torch.tensor(indices + valid_rows, dtype=torch.int64, device=self._device)
-        dist.broadcast(payload, src=self._dp_replica_root_global, group=self._dp_replica_group)
+        dist.broadcast(payload, src=self._pp_root_global, group=self._pp_root_group)
 
     def _receive_indices_from_dp_root(self) -> tuple[list[int] | None, list[int]]:
-        """PP sibling: receive (indices, valid_rows) from the DP root.
-
-        Returns (None, []) on end-of-stream, ([], []) on empty refill (impossible
-        in the current design but handled for safety), otherwise (indices, valid_rows).
-        """
-        assert self._dp_replica_group is not None
-        assert self._dp_replica_root_global is not None
+        """PP sibling TP root: receive (indices, valid_rows) from PP-0 + TP-0."""
+        assert self._pp_root_group is not None
+        assert self._pp_root_global is not None
         meta = torch.zeros(1, dtype=torch.int64, device=self._device)
-        dist.broadcast(meta, src=self._dp_replica_root_global, group=self._dp_replica_group)
+        dist.broadcast(meta, src=self._pp_root_global, group=self._pp_root_group)
         n = int(meta[0])
         if n < 0:
             return None, []
         if n == 0:
             return [], []
         payload = torch.zeros(2 * n, dtype=torch.int64, device=self._device)
-        dist.broadcast(payload, src=self._dp_replica_root_global, group=self._dp_replica_group)
+        dist.broadcast(payload, src=self._pp_root_global, group=self._pp_root_group)
         flat = payload.tolist()
         return flat[:n], flat[n:]
 

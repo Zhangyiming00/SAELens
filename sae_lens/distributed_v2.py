@@ -78,6 +78,8 @@ _sae_dp_group: dist.ProcessGroup | None = None
 _sae_endpoint_p2p_groups: dict[int, dist.ProcessGroup] = {}  # endpoint_idx -> NCCL P2P group
 _sae_dp_replica_group: dist.ProcessGroup | None = None  # all PP*TP ranks of this DP replica
 _sae_dp_replica_root: int = -1  # world rank of the DP replica's PP-0 + TP-0
+_sae_pp_root_group: dist.ProcessGroup | None = None  # TP-0 of every PP stage in this DP replica
+_sae_pp_root_global: int = -1  # world rank of this DP replica's PP-0 + TP-0
 
 # GPU direct streaming groups (created only when use_gpu_direct=True)
 _streaming_nccl_groups: list[dist.ProcessGroup] = []  # indexed by pp_stage
@@ -103,6 +105,7 @@ def _reset() -> None:
     global _vllm_tp_group, _sae_tp_group, _sae_tp_cpu_group, _sae_dp_group
     global _sae_endpoint_p2p_groups, _consumer_p2p_groups, _routing_table
     global _sae_dp_replica_group, _sae_dp_replica_root
+    global _sae_pp_root_group, _sae_pp_root_global
     global _streaming_nccl_groups, _gloo_ctrl_group, _pp_coord_groups
 
     _initialized = False
@@ -126,6 +129,8 @@ def _reset() -> None:
     _routing_table = []
     _sae_dp_replica_group = None
     _sae_dp_replica_root = -1
+    _sae_pp_root_group = None
+    _sae_pp_root_global = -1
     _streaming_nccl_groups = []
     _gloo_ctrl_group = None
     _pp_coord_groups = []
@@ -144,6 +149,7 @@ def init_distributed_v2(
     disjoint: bool = False,
     sae_pp_size: int = 1,
     use_gpu_direct: bool = False,
+    build_routing_table: bool = True,
 ) -> None:
     """Initialize all process groups for the unified shard-routing path.
 
@@ -177,6 +183,9 @@ def init_distributed_v2(
     use_gpu_direct:
         When True, create GPU direct streaming process groups (streaming_nccl_groups,
         gloo_ctrl_group, pp_coord_groups). Only applies when both P > 0 and Q > 0.
+    build_routing_table:
+        When False, skip shard-routing table and P2P route construction. SHM
+        streaming uses its shared buffer protocol instead of shard routing.
     """
     global _initialized, _P, _Q, _vllm_tp_size, _sae_tp_size, _sae_pp_size
     global _num_sae_stage_endpoints
@@ -187,6 +196,7 @@ def init_distributed_v2(
     global _vllm_tp_group, _sae_tp_group, _sae_tp_cpu_group, _sae_dp_group
     global _sae_endpoint_p2p_groups, _consumer_p2p_groups, _routing_table
     global _sae_dp_replica_group, _sae_dp_replica_root
+    global _sae_pp_root_group, _sae_pp_root_global
     global _streaming_nccl_groups, _gloo_ctrl_group, _pp_coord_groups
 
     assert dist.is_initialized(), "Call dist.init_process_group() before init_distributed_v2()"
@@ -286,10 +296,7 @@ def init_distributed_v2(
                     _sae_dp_group = grp
 
     # --- Create per-DP-replica groups: all PP*TP ranks of one DP replica ---
-    # PP-0 + TP-0 of each replica is the root that claims chunks and broadcasts
-    # the chunk-index list to its sibling PP stages (which read the same chunks
-    # from the shared mmap).  Created even when sae_pp_size == 1 so call sites
-    # can use it uniformly.
+    # Kept for existing callers that need the full replica group.
     if Q > 0:
         for d in range(Q):
             members = [
@@ -302,21 +309,43 @@ def init_distributed_v2(
                 _sae_dp_replica_group = grp
                 _sae_dp_replica_root = members[0]
 
+    # --- PP-root groups: TP-0 of every PP stage in one DP replica ---
+    # Chunk-index broadcasts must not include TP followers: followers take a
+    # different provider path and only participate in their SAE-TP broadcast.
+    if Q > 0 and sae_pp_size > 1:
+        for d in range(Q):
+            members = [
+                _sae_endpoint_world_ranks[d * sae_pp_size + s][0]
+                for s in range(sae_pp_size)
+            ]
+            grp = dist.new_group(members, backend="nccl")
+            if _is_consumer and _sae_dp_idx == d and _sae_tp_rank == 0:
+                _sae_pp_root_group = grp
+                _sae_pp_root_global = members[0]
+
     # --- Compute routing table: partition rows across DP replicas only ---
-    _routing_table = compute_routing_table(P, Q, batch_size) if P > 0 and Q > 0 else []
+    # SHM streaming has its own shared-buffer allocation protocol; it still
+    # needs the process groups above for role/TP coordination, but no row routes.
+    _routing_table = (
+        compute_routing_table(P, Q, batch_size)
+        if build_routing_table and P > 0 and Q > 0
+        else []
+    )
 
     # --- Create one P2P group per physical SAE endpoint ---
     # Each endpoint (d*sae_pp+s) gets its TP root and all producer TP roots
     # connected to its DP consumer. PP stages in the same DP replica share routes.
-    for endpoint_idx in range(num_sae_stage_endpoints):
-        d = endpoint_idx // sae_pp_size
-        sources = {r.producer_idx for r in _routing_table if r.consumer_idx == d}
-        p2p_members = sorted(
-            {_sae_endpoint_tp_root[endpoint_idx]} | {_producer_tp_root[p] for p in sources}
-        )
-        grp = dist.new_group(p2p_members, backend="nccl")
-        if rank in p2p_members:
-            _sae_endpoint_p2p_groups[endpoint_idx] = grp
+    if build_routing_table:
+        for endpoint_idx in range(num_sae_stage_endpoints):
+            d = endpoint_idx // sae_pp_size
+            sources = {r.producer_idx for r in _routing_table if r.consumer_idx == d}
+            p2p_members = sorted(
+                {_sae_endpoint_tp_root[endpoint_idx]}
+                | {_producer_tp_root[p] for p in sources}
+            )
+            grp = dist.new_group(p2p_members, backend="nccl")
+            if rank in p2p_members:
+                _sae_endpoint_p2p_groups[endpoint_idx] = grp
 
     # --- GPU direct streaming groups (created only when use_gpu_direct=True) ---
     if use_gpu_direct and P > 0 and Q > 0:
@@ -478,6 +507,16 @@ def get_sae_dp_replica_root_global_rank() -> int:
     Returns -1 if this rank is not a consumer.
     """
     return _sae_dp_replica_root
+
+
+def get_sae_pp_root_group() -> dist.ProcessGroup | None:
+    """TP-0-only group spanning PP stages inside this SAE-DP replica."""
+    return _sae_pp_root_group
+
+
+def get_sae_pp_root_global_rank() -> int:
+    """World rank of PP-0 + TP-0 for the TP-0-only PP coordination group."""
+    return _sae_pp_root_global
 
 
 def get_p2p_group(endpoint_idx: int) -> dist.ProcessGroup:

@@ -294,6 +294,6 @@ def test_preflight_estimate_matches_backing_file_sizes():
     )
 
     assert estimate["data"] == 3 * 5 * 7 * 2
-    assert estimate["metadata"] == 3 * np.dtype(np.int8).itemsize + 3 * 4 * np.dtype(np.int32).itemsize + 8 * np.dtype(np.int32).itemsize
+    assert estimate["metadata"] == 3 * np.dtype(np.int8).itemsize + 3 * 6 * np.dtype(np.int32).itemsize + 8 * np.dtype(np.int32).itemsize
     assert estimate["headroom"] == 1024 * 1024
     assert estimate["required"] == estimate["data"] + estimate["metadata"] + estimate["headroom"]

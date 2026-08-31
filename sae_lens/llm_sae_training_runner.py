@@ -2047,7 +2047,7 @@ class LanguageModelSAETrainingRunner:
             raise
 
     # ------------------------------------------------------------------
-    # Streaming mode (v1) — sae_dp=1 only
+    # Streaming mode (SHM supports SAE DP; GPU-direct remains its MVP topology)
     # ------------------------------------------------------------------
 
     def _streaming_init(self, cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG]) -> None:
@@ -2086,10 +2086,23 @@ class LanguageModelSAETrainingRunner:
 
         self._streaming_buffer_name = buffer_name
         self._streaming_num_hooks = len(self.hook_names)
-        target_chunks = math.ceil(cfg.training_tokens / cfg.streaming_chunk_size_tokens)
+        chunks_per_sae_replica = math.ceil(
+            cfg.training_tokens / cfg.streaming_chunk_size_tokens
+        )
+        target_chunks = chunks_per_sae_replica * max(1, self.sae_dp_size)
+        self._streaming_target_chunks = target_chunks
 
         # Multi-hook: each chunk stores all hooks' activations concatenated.
         buf_chunk_size = cfg.streaming_chunk_size_tokens * self._streaming_num_hooks
+        if (
+            not getattr(self, "_use_gpu_direct", False)
+            and self.sae_dp_size > 1
+            and cfg.streaming_num_chunks < self.sae_dp_size
+        ):
+            raise ValueError(
+                "streaming_num_chunks must be >= sae_dp_size for equal-cohort "
+                f"allocation (got {cfg.streaming_num_chunks} < {self.sae_dp_size})"
+            )
 
         if getattr(self, "_use_gpu_direct", False):
             self._streaming_buffer = None
@@ -2249,7 +2262,59 @@ class LanguageModelSAETrainingRunner:
         )
 
         self._base_sae = sae
-        self.sae = sae
+        self.sae = self._streaming_wrap_sae_dp(sae, ds)
+
+    def _streaming_wrap_sae_dp(self, sae: TrainingSAE[Any], ds: Any) -> Any:
+        """Apply the configured SAE-DP wrapper on the current (PP, TP) shard."""
+        if self.sae_dp_size <= 1:
+            return sae
+        sae_dp_group = ds.get_sae_dp_group()
+        if sae_dp_group is None or dist.get_world_size(sae_dp_group) != self.sae_dp_size:
+            raise RuntimeError(
+                "Streaming SAE-DP group is missing or has the wrong size: "
+                f"expected {self.sae_dp_size}"
+            )
+        if self.cfg.sae_dp_mode == "fsdp":
+            if self.sae_tp_size > 1:
+                raise ValueError(
+                    "sae_dp_mode='fsdp' with sae_tp_size > 1 is not supported. "
+                    "The streaming allocator supports the topology, but the SAE "
+                    "model wrapper still requires sae_tp_size=1 with FSDP."
+                )
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+            return FSDP(
+                sae,
+                process_group=sae_dp_group,
+                sharding_strategy=self._resolve_fsdp_sharding_strategy(),
+                use_orig_params=True,
+                backward_prefetch=self._resolve_fsdp_backward_prefetch(),
+                forward_prefetch=self.cfg.fsdp_forward_prefetch,
+            )
+        if self.cfg.sae_dp_mode != "ddp":
+            raise ValueError(
+                f"Streaming sae_dp_size>1 requires sae_dp_mode='ddp' or 'fsdp', "
+                f"got {self.cfg.sae_dp_mode!r}"
+            )
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        device_ids = None
+        output_device = None
+        if self.device.type == "cuda":
+            device_index = (
+                self.device.index
+                if self.device.index is not None
+                else torch.cuda.current_device()
+            )
+            device_ids = [device_index]
+            output_device = device_index
+        return DDP(
+            sae,
+            process_group=sae_dp_group,
+            device_ids=device_ids,
+            output_device=output_device,
+            **self._resolve_ddp_kwargs(),
+        )
 
     def _streaming_init_consumer_multi(
         self, cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG]
@@ -2295,7 +2360,7 @@ class LanguageModelSAETrainingRunner:
             )
 
             self.base_sae_by_hook[hook_name] = sae
-            self.sae_by_hook[hook_name] = sae
+            self.sae_by_hook[hook_name] = self._streaming_wrap_sae_dp(sae, ds)
 
         self._base_sae = None  # type: ignore[assignment]
         self.sae = None
@@ -2368,7 +2433,15 @@ class LanguageModelSAETrainingRunner:
         is_tp_root = ds.is_vllm_tp_root()
         tp_root_world = ds.get_producer_tp_root()
         chunk_size = self.cfg.streaming_chunk_size_tokens
-        total_tokens = self.cfg.training_tokens
+        # SHM SAE-DP allocation only consumes full chunks. The quota was rounded
+        # to a per-DP full-chunk budget in _streaming_init.
+        target_chunks = getattr(self, "_streaming_target_chunks", None)
+        if target_chunks is None:
+            chunks_per_sae_replica = math.ceil(
+                self.cfg.training_tokens / self.cfg.streaming_chunk_size_tokens
+            )
+            target_chunks = chunks_per_sae_replica * max(1, self.sae_dp_size)
+        total_tokens = target_chunks * chunk_size
         buf = self._streaming_buffer
         store = self.activations_store
 
@@ -2397,8 +2470,9 @@ class LanguageModelSAETrainingRunner:
         chunk_idx = -1
         seq_no = -1
         chunk_step = 0
-        # chunk_step only advances on the TP root; every rank needs its own
-        # counter so the window boundaries line up across the TP group.
+        # Every TP rank advances this counter after a successful chunk so the
+        # outer quiesce check enters the same collective sequence everywhere.
+        # Root-only logging and quota accounting use the same value.
         producer_step = 0
         window_profiler = self._make_vllm_window_profiler(step_unit="vllm_chunk")
 
@@ -2495,6 +2569,11 @@ class LanguageModelSAETrainingRunner:
                     _shm_log({"event": "dataset_exhausted", "chunk_idx": chunk_idx, "total_chunks": chunk_step})
                 break  # dataset exhausted; all TP ranks exit together
 
+            # The EOF broadcast above guarantees that every rank has a valid
+            # chunk. Keep this local counter identical across the TP group
+            # before the next iteration's quiesce check.
+            chunk_step += 1
+
             # Write to buffer (TP root only)
             if is_tp_root:
                 t_write_start = time.perf_counter()
@@ -2507,7 +2586,6 @@ class LanguageModelSAETrainingRunner:
                 buf.mark_ready(chunk_idx)
                 t_write_end = time.perf_counter()
 
-                chunk_step += 1
                 inference_time_s = t_infer_end - t_infer_start
                 write_time_s = t_write_end - t_write_start
                 step_write_time_s = write_time_s
@@ -2864,8 +2942,18 @@ class LanguageModelSAETrainingRunner:
         if ds.is_sae_tp_root() and self.cfg.output_path is not None:
             out_dir = Path(self.cfg.output_path)
             out_dir.mkdir(parents=True, exist_ok=True)
-            shm_log_path = out_dir / "shm_log_sae.jsonl"
-            buffer_monitor_path = out_dir / "buffer_monitor.jsonl"
+            dp_idx = ds.get_sae_dp_idx()
+            pp_rank = ds.get_sae_pp_rank()
+            suffix = (
+                f"_d{dp_idx}_pp{pp_rank}"
+                if self.sae_dp_size > 1 or self.sae_pp_size > 1
+                else ""
+            )
+            shm_log_path = out_dir / f"shm_log_sae{suffix}.jsonl"
+            buffer_monitor_path = out_dir / f"buffer_monitor{suffix}.jsonl"
+        else:
+            dp_idx = ds.get_sae_dp_idx()
+            pp_rank = ds.get_sae_pp_rank()
 
         qdir = self._quiesce_dir or (
             Path(self.cfg.checkpoint_path) if self.cfg.checkpoint_path is not None else None
@@ -2875,12 +2963,11 @@ class LanguageModelSAETrainingRunner:
         )
 
         from sae_lens.util import str_to_dtype
-        # PP coordination: PP-0 + TP-0 of each DP replica claims chunks; siblings
-        # read the same chunks from /dev/shm and slice their own hook subset.
-        from sae_lens import distributed_v2
-        pp_rank = distributed_v2.get_sae_pp_rank() if distributed_v2.is_consumer() else 0
-        dp_replica_group = distributed_v2.get_sae_dp_replica_group()
-        dp_replica_root = distributed_v2.get_sae_dp_replica_root_global_rank()
+        # PP coordination is TP-root-only: PP-0 + TP-0 claims the DP cohort,
+        # sibling PP TP-roots receive chunk indices, then each PP root broadcasts
+        # activations inside its own SAE-TP group.
+        pp_root_group = ds.get_sae_pp_root_group()
+        pp_root_global = ds.get_sae_pp_root_global_rank()
         pp_hook_names = (
             self._pp_hook_names
             if self.is_multi_sae and hasattr(self, "_pp_hook_names")
@@ -2903,7 +2990,7 @@ class LanguageModelSAETrainingRunner:
             mix_chunks=self.cfg.streaming_mix_chunks,
             mix_fraction=self.cfg.streaming_mix_fraction,
             mixing_seed=self.cfg.seed,
-            mixing_shard_index=0,
+            mixing_shard_index=dp_idx,
             stop_acquire_check=(
                 (lambda: sae_stop_acquire_request.exists())
                 if sae_stop_acquire_request is not None
@@ -2913,8 +3000,10 @@ class LanguageModelSAETrainingRunner:
             hook_names=self.hook_names if self.is_multi_sae else None,
             force_multi_hook=self.is_multi_sae,
             select_hook_names=pp_hook_names,
-            dp_replica_group=dp_replica_group if self.sae_pp_size > 1 else None,
-            dp_replica_root_global_rank=dp_replica_root if self.sae_pp_size > 1 else None,
+            pp_root_group=pp_root_group if self.sae_pp_size > 1 else None,
+            pp_root_global_rank=pp_root_global if self.sae_pp_size > 1 else None,
+            sae_dp_size=self.sae_dp_size,
+            sae_dp_idx=dp_idx,
             sae_pp_size=self.sae_pp_size,
             pp_rank=pp_rank,
         )
@@ -2991,6 +3080,7 @@ class LanguageModelSAETrainingRunner:
         return self._run_streaming_consumer_multi(provider, ds)
 
     def _run_streaming_consumer_single(self, provider: Any, ds: Any) -> TrainingSAE[Any]:
+        sae_dp_group = ds.get_sae_dp_group() if self.sae_dp_size > 1 else None
         trainer = SAETrainer(
             sae=self.sae,
             base_sae=self._base_sae,
@@ -2998,7 +3088,7 @@ class LanguageModelSAETrainingRunner:
             evaluator=None,
             save_checkpoint_fn=self._streaming_save_checkpoint,
             cfg=self.cfg.to_sae_trainer_config(),
-            dp_group=None,
+            dp_group=sae_dp_group,
             token_count_weighted_dp=False,
             append_logs=self.cfg.resume_from_checkpoint is not None
             or self.cfg.append_history_logs,
@@ -3053,6 +3143,7 @@ class LanguageModelSAETrainingRunner:
         local_hooks = (
             self._pp_hook_names if hasattr(self, "_pp_hook_names") else self.hook_names
         )
+        sae_dp_group = ds.get_sae_dp_group() if self.sae_dp_size > 1 else None
         trainer = MultiSAETrainer(
             hook_names=local_hooks,
             sae_by_hook=self.sae_by_hook,
@@ -3061,9 +3152,9 @@ class LanguageModelSAETrainingRunner:
             data_provider=provider,
             save_checkpoint_fn=self._streaming_save_checkpoint,
             cfg=self.cfg.to_sae_trainer_config(),
-            dp_group=None,
+            dp_group=sae_dp_group,
             token_count_weighted_dp=False,
-            sae_dp_mode="ddp",
+            sae_dp_mode=self.cfg.sae_dp_mode,
             backward_mode=self.cfg.multi_sae_backward_mode,
             seed_mode=self.cfg.multi_sae_seed_mode,
             append_logs=self.cfg.resume_from_checkpoint is not None

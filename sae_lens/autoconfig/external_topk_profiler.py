@@ -22,17 +22,17 @@ from __future__ import annotations
 # =============================================================================
 DEFAULT_BATCH_SIZES: list[int] = [256, 512, 1024, 2048, 4096]
 # local d_sae: F_local = global d_sae / tp
-DEFAULT_LOCAL_D_SAE_VALUES: list[int] = [8192, 16384, 32768, 65536, 131072]
+DEFAULT_LOCAL_D_SAE_VALUES: list[int] = [8192, 16384, 32768, 65536, 131072,262144]
 # Optional direct global widths. Legacy F_local*tp inputs are canonicalized to these.
 DEFAULT_GLOBAL_D_SAE_VALUES: list[int] = []
-DEFAULT_TP_VALUES: list[int] = [1, 2]
+DEFAULT_TP_VALUES: list[int] = [1, 2, 4]
 DEFAULT_K_VALUES: list[int] = [128,256,512]
 DEFAULT_ACTIVATION_TYPES: list[str] = ["topk"]
 DEFAULT_DEVICES: list[str] = ["cuda:0"]
 DEFAULT_DTYPES: list[str] = ["float32"]
 
-DEFAULT_WARMUP: int = 5
-DEFAULT_REPEATS: int = 8
+DEFAULT_WARMUP: int = 3
+DEFAULT_REPEATS: int = 5
 DEFAULT_OUTPUT_DIR: str = "sae_lens/autoconfig/profile_results"
 DEFAULT_OUTPUT_NAME: str = "activation_compute_profile"
 # median/min above this ratio marks a case as contended. TopK on an idle A40

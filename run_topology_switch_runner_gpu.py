@@ -10,7 +10,8 @@ Phase 2 — after switch (2 GPUs):
   GPU 0+1: SAE consumer (vllm_dp=0, sae_tp=2) — no vLLM, SAE spans both GPUs
 
 Usage:
-  python3 scripts/demo_topology_switch.py run                         # start supervisor
+  python3 scripts/run_topology_switch_runner_gpu.py run                # start supervisor
+  python3 scripts/run_topology_switch_runner_gpu.py run --no_cleanup   # keep runtime shared memory
   python3 scripts/demo_topology_switch.py watch                       # watch buffer state
   python3 scripts/demo_topology_switch.py monitor [--verbose]         # auto-switch monitor
   python3 scripts/demo_topology_switch.py switch --topo TOPO_0VLLM_SAE2
@@ -567,7 +568,7 @@ def _active_topology_process_pids(
     marker = str(run_dir)
     process_markers = (
         "scripts/topology_supervisor.py",
-        "scripts/run_sae_runner_gpu.py",
+        "run_sae_runner_gpu.py",
         "torch.distributed.run",
     )
     pids: list[int] = []
@@ -649,10 +650,13 @@ def _cleanup_shm_buffers() -> None:
 # Commands
 # ---------------------------------------------------------------------------
 
-def cmd_run() -> None:
+def cmd_run(cleanup: bool = True) -> None:
     previous_run_dir = _resolve_run_dir()
     _terminate_existing_run_processes(run_dir=previous_run_dir)
-    _cleanup_shm_buffers()
+    if cleanup:
+        _cleanup_shm_buffers()
+    else:
+        print("Skipping topology runner shared-memory cleanup (--no_cleanup).")
 
     run_dir = _make_timestamped_run_dir(RUN_DIR)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -699,6 +703,10 @@ def cmd_run() -> None:
                 target_topology_arg,
             ]
         )
+    if not cleanup:
+        # The supervisor has its own startup/finally cleanup path. Keep the
+        # launcher flag effective for the full lifetime of this run.
+        cmd.append("--no-cleanup-shm")
     subprocess.run(cmd, check=False)
 
 
@@ -926,7 +934,29 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="cmd", metavar="COMMAND")
 
-    sub.add_parser("run", help="Start the topology supervisor")
+    parser.add_argument(
+        "--no_cleanup",
+        "--no-cleanup",
+        dest="cleanup",
+        action="store_false",
+        default=True,
+        help=(
+            "Keep topology-runner shared-memory artifacts when starting streaming "
+            "mode (cleanup is enabled by default)."
+        ),
+    )
+
+    run = sub.add_parser("run", help="Start the topology supervisor")
+    # Also accept the option after the subcommand. SUPPRESS avoids replacing a
+    # value supplied before the subcommand with the subparser default.
+    run.add_argument(
+        "--no_cleanup",
+        "--no-cleanup",
+        dest="cleanup",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="Keep topology-runner shared-memory artifacts.",
+    )
     sub.add_parser("watch", help="Live buffer state (1s refresh)")
 
     mon = sub.add_parser("monitor", help="Auto-switch monitor")
@@ -954,7 +984,7 @@ def main() -> None:
         args.cmd = "run"
 
     if args.cmd == "run":
-        cmd_run()
+        cmd_run(cleanup=args.cleanup)
     elif args.cmd == "watch":
         cmd_watch()
     elif args.cmd == "monitor":

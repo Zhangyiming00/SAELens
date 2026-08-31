@@ -19,16 +19,19 @@ Example:
         --max-model-len 128 \
         --output-path /tmp/saelens_runner_gpu_smoke
 
-For multi-GPU shared TP:
-    torchrun --nproc_per_node=2 scripts/run_sae_runner_gpu.py ... --tp-size 2
+Streaming startup removes stale topology-switch shared-memory files by default.
+Pass ``--no_cleanup`` with ``--streaming-mode`` to preserve them.
+
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -48,12 +51,12 @@ from sae_lens.util import extract_layer_from_tlens_hook_name
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name", default="/root/models/Llama-3.1-8B")
-    parser.add_argument("--dataset-path", default="/mnt/L202500425/dzl/datasets/wikitext2_tokenized_llama31_ctx2048")
-    parser.add_argument("--hook-name", default="blocks.21.hook_resid_post")
-    parser.add_argument("--hook-names",
+    parser.add_argument("--model-name","--model", default="/root/models/Llama-3.1-8B")
+    parser.add_argument("--dataset-path","--dataset", default="/mnt/L202500425/dzl/datasets/wikitext2_tokenized_llama31_ctx2048")
+    parser.add_argument("--hook-name","--hook", default="blocks.21.hook_resid_post")
+    parser.add_argument("--hook-names","--hooks",
         # default=None,
-        default="blocks.21.hook_resid_post,blocks.31.hook_resid_post",        
+        default="blocks.21.hook_resid_post,blocks.26.hook_resid_post,blocks.31.hook_resid_post",        
         help="Comma-separated hook names for multi-layer independent SAE training.",
     )
     parser.add_argument("--d-sae", type=int, default=32768)
@@ -65,16 +68,41 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Disable TopK rescale_acts_by_decoder_norm (default: enabled).",
     )
-    parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--vllm-tp-size", type=int, default=None)
-    parser.add_argument("--sae-tp-size", type=int, default=None)
-    parser.add_argument("--vllm-dp-size", type=int, default=1)
-    parser.add_argument("--sae-dp-size", type=int, default=1)
-    parser.add_argument("--sae-pp-size", type=int, default=1)
-    parser.add_argument("--training-tokens", type=int, default=2048*8192)
+    parser.add_argument("--tp-size", "-tp", type=int, default=1)
+    parser.add_argument("--vllm-tp-size","-vtp", type=int, default=None)
+    parser.add_argument("--sae-tp-size", "-stp", type=int, default=None)
+    parser.add_argument("--vllm-dp-size","-vdp", type=int, default=1)
+    parser.add_argument("--sae-dp-size", "-sdp", type=int, default=1)
+    parser.add_argument("--sae-pp-size", "-spp", type=int, default=1)
+    parser.add_argument("--training-tokens", type=int, default=2048*512)
     parser.add_argument("--train-batch-size-tokens", type=int, default=2048)
     parser.add_argument("--context-size", type=int, default=2048)
-    parser.add_argument("--store-batch-size-prompts", type=int, default=8)
+    parser.add_argument(
+        "--store-batch-size-prompts",
+        type=int,
+        default=8,
+        help=(
+            "Baseline number of prompts fetched by one vLLM DP producer per batch. "
+            "In non-streaming mode it is automatically scaled by "
+            "sae_dp_size / vllm_dp_size by default."
+        ),
+    )
+    parser.add_argument(
+        "--auto-scale-store-batch-size-prompts",
+        dest="auto_scale_store_batch_size_prompts",
+        action="store_true",
+        default=True,
+        help=(
+            "Automatically scale --store-batch-size-prompts for non-streaming DP "
+            "topologies (default: enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-scale-store-batch-size-prompts",
+        dest="auto_scale_store_batch_size_prompts",
+        action="store_false",
+        help="Keep --store-batch-size-prompts unchanged in all non-streaming topologies.",
+    )
     parser.add_argument("--n-batches-in-buffer", type=int, default=None)
     parser.add_argument("--activations-mixing-fraction", type=float, default=0.5)
     parser.add_argument(
@@ -107,7 +135,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/results_2.0.4_70_runs/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_3.0.1_streaming_test1/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
     parser.add_argument("--save-mse-every-n-steps", type=int, default=1)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=1)
@@ -416,10 +444,21 @@ def parse_args() -> argparse.Namespace:
     # Streaming mode (v1): vLLM and SAE processes on separate GPU sets via /dev/shm.
     # Requires sae_dp_size=1. World size = vllm_tp * vllm_dp + sae_tp * 1.
     parser.add_argument(
-        "--streaming-mode",
+        "--streaming-mode", "--streaming",
         action="store_true",
         default=False,
         help="Enable streaming_mode v1 (vLLM producers + SAE consumers via /dev/shm).",
+    )
+    parser.add_argument(
+        "--no_cleanup",
+        "--no-cleanup",
+        dest="streaming_cleanup",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable topology-switch runner shared-memory cleanup at streaming "
+            "startup (cleanup is enabled by default)."
+        ),
     )
     parser.add_argument(
         "--streaming-chunk-size-tokens",
@@ -533,6 +572,105 @@ def _resolve_device() -> str:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     return f"cuda:{local_rank}"
+
+
+def _cleanup_topology_runner_shm() -> int:
+    """Remove shared-memory files left by a previous topology-switch run."""
+    removed = 0
+    for path in Path("/dev/shm").glob("sae_buf_*"):
+        try:
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            # Another rank or a concurrently exiting process removed it first.
+            pass
+        except OSError as exc:
+            print(f"[WARNING] Could not remove streaming shared-memory file {path}: {exc}")
+    return removed
+
+
+def _cleanup_topology_runner_runtime() -> int:
+    """Stop a stale topology runner and remove its shared-memory artifacts."""
+    try:
+        try:
+            from scripts.run_topology_switch_runner_gpu import (
+                _resolve_run_dir,
+                _terminate_existing_run_processes,
+            )
+        except ImportError:
+            launcher_path = Path(__file__).resolve().parent / "scripts" / "run_topology_switch_runner_gpu.py"
+            spec = importlib.util.spec_from_file_location(
+                "_saelens_topology_switch_runner", launcher_path
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(f"could not load {launcher_path}")
+            launcher = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = launcher
+            spec.loader.exec_module(launcher)
+            _resolve_run_dir = launcher._resolve_run_dir
+            _terminate_existing_run_processes = launcher._terminate_existing_run_processes
+
+        _terminate_existing_run_processes(run_dir=_resolve_run_dir())
+    except Exception as exc:
+        # Cleanup should not prevent a standalone streaming run from starting
+        # when the optional topology-runner launcher is unavailable.
+        print(f"[WARNING] Could not clean stale topology-runner processes: {exc}")
+    return _cleanup_topology_runner_shm()
+
+
+def _prepare_streaming_startup(*, cleanup: bool, world_size: int) -> None:
+    """Run topology-runner cleanup once before streaming buffers are created.
+
+    ``run_sae_runner_gpu.py`` is commonly launched under ``torchrun``.  The
+    process group is initialized here so all ranks can wait until rank 0 has
+    finished cleaning stale topology-runner processes and ``sae_buf_*`` files
+    before constructing the streaming runner.  When cleanup is disabled,
+    initialization is left to the normal runner path.
+    """
+    if not cleanup:
+        return
+
+    rank = int(os.environ.get("RANK", "0"))
+    if dist.is_initialized():
+        rank = dist.get_rank()
+    if rank == 0:
+        removed = _cleanup_topology_runner_runtime()
+        print(
+            f"[INFO] streaming startup cleanup removed {removed} "
+            "shared-memory file(s)."
+        )
+
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    if dist.is_initialized() and world_size > 1:
+        dist.barrier()
+
+
+def _resolve_store_batch_size_prompts(
+    baseline_prompts: int,
+    *,
+    vllm_dp_size: int,
+    sae_dp_size: int,
+    auto_scale: bool,
+) -> int:
+    """Resolve the per-vLLM-producer prompt batch for non-streaming DP.
+
+    ``baseline_prompts`` is defined for the 1-vLLM-DP -> 1-SAE-DP topology.
+    A producer batch is partitioned/fanned in across SAE DP replicas, so the
+    equivalent per-producer batch is proportional to ``sae_dp / vllm_dp``.
+    ``ceil`` avoids underfeeding an SAE replica when that ratio is fractional.
+    Streaming has a separate chunk allocator and intentionally does not use
+    this scaling helper.
+    """
+    if baseline_prompts < 1:
+        raise ValueError("--store-batch-size-prompts must be >= 1")
+    if not auto_scale or vllm_dp_size <= 0 or sae_dp_size <= 0:
+        return baseline_prompts
+    return max(
+        1,
+        (baseline_prompts * sae_dp_size + vllm_dp_size - 1) // vllm_dp_size,
+    )
 
 
 def _resolve_hidden_size(model_name: str) -> int:
@@ -776,15 +914,22 @@ def main() -> None:
         raise ValueError("--max-num-batched-tokens must be >= 1")
     if args.train_batch_size_tokens < 1:
         raise ValueError("--train-batch-size-tokens must be >= 1")
+    if args.store_batch_size_prompts < 1:
+        raise ValueError("--store-batch-size-prompts must be >= 1")
     if args.save_vllm_memory_every_n_steps < 0:
         raise ValueError("--save-vllm-memory-every-n-steps must be >= 0")
-    if args.sae_dp_size > 1 and args.vllm_dp_size == 1:
+    if not args.streaming_mode and args.sae_dp_size > 1 and args.vllm_dp_size == 1:
         print(
             f"[INFO] vllm_dp_size=1, sae_dp_size={args.sae_dp_size} (1:m topology) — "
             "automatically enabling --use-shard-routing."
         )
         args.use_shard_routing = True
-    if not args.use_shard_routing and args.vllm_dp_size > 1 and args.sae_dp_size > 1:
+    if (
+        not args.streaming_mode
+        and not args.use_shard_routing
+        and args.vllm_dp_size > 1
+        and args.sae_dp_size > 1
+    ):
         large = max(args.vllm_dp_size, args.sae_dp_size)
         small = min(args.vllm_dp_size, args.sae_dp_size)
         needs_shard_routing = (large % small != 0) or (args.sae_dp_size > args.vllm_dp_size)
@@ -804,8 +949,6 @@ def main() -> None:
     if hook_names is not None and len(hook_names) == 0:
         hook_names = None
     if args.streaming_mode:
-        if args.sae_dp_size not in (0, 1):
-            raise ValueError("--streaming-mode requires --sae-dp-size 0 or 1")
         args.use_shard_routing = False
         expected_world_size = (
             vllm_tp_size * args.vllm_dp_size
@@ -836,6 +979,33 @@ def main() -> None:
                 f"WORLD_SIZE={world_size} does not match "
                 f"the expected world size {expected_world_size}."
             )
+
+    # Treat the CLI value as the DP=1 -> DP=1 baseline. In non-streaming mode
+    # each vLLM producer batch is partitioned/fanned in across SAE DP replicas,
+    # so scale the producer batch to keep the per-SAE input volume equivalent.
+    # Streaming uses a shared chunk allocator and deliberately keeps the value
+    # per producer unchanged.
+    store_batch_size_prompts = _resolve_store_batch_size_prompts(
+        args.store_batch_size_prompts,
+        vllm_dp_size=args.vllm_dp_size,
+        sae_dp_size=args.sae_dp_size,
+        auto_scale=(
+            args.auto_scale_store_batch_size_prompts and not args.streaming_mode
+        ),
+    )
+    if (
+        not args.streaming_mode
+        and args.auto_scale_store_batch_size_prompts
+        and args.vllm_dp_size > 0
+        and args.sae_dp_size > 0
+        and store_batch_size_prompts != args.store_batch_size_prompts
+    ):
+        print(
+            f"[INFO] auto-scaling store_batch_size_prompts "
+            f"{args.store_batch_size_prompts} -> {store_batch_size_prompts} "
+            f"for vllm_dp_size={args.vllm_dp_size}, "
+            f"sae_dp_size={args.sae_dp_size}."
+        )
 
     training_tokens = args.training_tokens
     train_batch_size_tokens = args.train_batch_size_tokens
@@ -919,6 +1089,11 @@ def main() -> None:
             )
 
     device = _resolve_device()
+    if args.streaming_mode and args.control_state_path is None:
+        _prepare_streaming_startup(
+            cleanup=args.streaming_cleanup,
+            world_size=world_size,
+        )
     d_in = (
         _resolve_d_in_for_cached(args)
         if args.use_cached_activations
@@ -950,7 +1125,7 @@ def main() -> None:
         context_size=args.context_size,
         training_tokens=training_tokens,
         train_batch_size_tokens=train_batch_size_tokens,
-        store_batch_size_prompts=args.store_batch_size_prompts,
+        store_batch_size_prompts=store_batch_size_prompts,
         n_batches_in_buffer=n_batches_in_buffer,
         activations_mixing_fraction=args.activations_mixing_fraction,
         device=device,
@@ -1030,6 +1205,18 @@ def main() -> None:
         f"{args.training_tokens} train_batch_size_tokens={args.train_batch_size_tokens} "
         f"(per_replica={training_tokens}/{train_batch_size_tokens})"
     )
+    if args.streaming_mode:
+        print(
+            f"  store_batch_size_prompts={store_batch_size_prompts} "
+            "(streaming; DP auto-scaling not applied)"
+        )
+    elif args.auto_scale_store_batch_size_prompts:
+        print(
+            f"  store_batch_size_prompts={store_batch_size_prompts} "
+            f"(baseline={args.store_batch_size_prompts}, auto_scaled=True)"
+        )
+    else:
+        print(f"  store_batch_size_prompts={store_batch_size_prompts}")
     print(
         f"  vllm_tp_size={vllm_tp_size} vllm_dp_size={args.vllm_dp_size} "
         f"sae_tp_size={sae_tp_size} sae_dp_size={args.sae_dp_size} "

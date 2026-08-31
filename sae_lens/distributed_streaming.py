@@ -3,10 +3,10 @@ Thin wrapper over distributed_v2 for streaming_mode v1.
 
 Exposes the subset of distributed primitives needed by the streaming producer/consumer
 pipeline, and adds helpers that distributed_v2 doesn't provide:
-  - init_distributed_streaming() — enforces sae_dp=1 then delegates to init_distributed_v2
+  - init_distributed_streaming() — delegates to init_distributed_v2
   - get_vllm_dp_size()           — distributed_v2 has _P but no getter
   - get_producer_tp_root()       — convenience: TP root for *this* producer
-  - get_consumer_tp_root()       — convenience: TP root for consumer 0 (sae_dp=1 always)
+  - get_consumer_tp_root()       — TP root for this physical SAE endpoint
   - is_vllm_tp_root()
   - is_sae_tp_root()
 """
@@ -26,15 +26,12 @@ def init_distributed_streaming(
 ) -> None:
     """Initialize process groups for streaming_mode v1.
 
-    sae_dp must be 0 or 1.  sae_dp=0 means no SAE consumers (vLLM-only topology,
-    all ranks are producers).  sae_dp>1 is not supported — independent
-    acquire_up_to() calls diverge at stream tail, causing DDP AllReduce hangs.
+    ``sae_dp=0`` is the vLLM-only topology.  ``sae_dp>=1`` is supported on
+    the SHM path; SAE-DP roots use equal-cohort allocation in
+    SharedActivationBuffer so DDP/FSDP replicas see equal-length inputs.
     """
-    if sae_dp not in (0, 1):
-        raise ValueError(
-            f"streaming_mode v1 requires sae_dp in {{0, 1}}, got sae_dp={sae_dp}. "
-            "sae_dp > 1 is not supported in v1."
-        )
+    if sae_dp < 0:
+        raise ValueError(f"sae_dp must be >= 0, got sae_dp={sae_dp}")
     global _vllm_dp_size
     _vllm_dp_size = vllm_dp
     _v2.init_distributed_v2(
@@ -46,6 +43,7 @@ def init_distributed_streaming(
         batch_size=1,
         disjoint=True,
         use_gpu_direct=use_gpu_direct,
+        build_routing_table=False,
     )
 
 
@@ -60,6 +58,14 @@ get_sae_tp_group = _v2.get_sae_tp_group
 get_sae_tp_cpu_group = _v2.get_sae_tp_cpu_group
 get_sae_tp_rank = _v2.get_sae_tp_rank
 get_sae_tp_size = _v2.get_sae_tp_size
+get_sae_dp_size = _v2.get_sae_dp_size
+get_sae_dp_idx = _v2.get_sae_dp_idx
+get_sae_dp_group = _v2.get_sae_dp_group
+get_sae_pp_rank = _v2.get_sae_pp_rank
+get_sae_pp_size = _v2.get_sae_pp_size
+get_sae_endpoint_idx = _v2.get_sae_endpoint_idx
+get_sae_pp_root_group = _v2.get_sae_pp_root_group
+get_sae_pp_root_global_rank = _v2.get_sae_pp_root_global_rank
 get_vllm_tp_size = _v2.get_vllm_tp_size
 get_vllm_tp_rank = _v2.get_vllm_tp_rank
 get_streaming_nccl_group = _v2.get_streaming_nccl_group
@@ -82,11 +88,11 @@ def get_producer_tp_root() -> int:
 
 
 def get_consumer_tp_root() -> int:
-    """World rank of the TP root for consumer 0.
-
-    In v1 sae_dp=1 always, so there is only consumer 0.
-    """
-    return _v2.get_consumer_tp_root(0)
+    """World rank of the TP root for this physical SAE endpoint."""
+    endpoint_idx = _v2.get_sae_endpoint_idx()
+    if endpoint_idx < 0:
+        return -1
+    return _v2.get_consumer_tp_root(endpoint_idx)
 
 
 def is_vllm_tp_root() -> bool:

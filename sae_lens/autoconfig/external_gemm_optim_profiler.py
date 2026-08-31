@@ -45,17 +45,17 @@ from __future__ import annotations
 # USER-EDITABLE DEFAULT PARAMETERS -- preserve the current profile grid
 # =============================================================================
 DEFAULT_D_IN_VALUES: list[int] = [1024, 4096]
-DEFAULT_LOCAL_D_SAE_VALUES: list[int] = [8192, 16384, 32768, 65536, 131072]
+DEFAULT_LOCAL_D_SAE_VALUES: list[int] = [8192, 16384, 32768, 65536, 131072, 262144]
 DEFAULT_BATCH_SIZES: list[int] = [256, 512, 1024, 2048, 4096]
-DEFAULT_TP_VALUES: list[int] = [1, 2]
+DEFAULT_TP_VALUES: list[int] = [1, 2, 4]
 DEFAULT_OPTIMIZER_IMPLS: list[str] = ["fused"]
 DEFAULT_STATS_SYNC_MODE: str = "immediate"
 DEFAULT_STATS_SYNC_INTERVAL: int = 1
 DEFAULT_NORMALIZE_ACTIVATIONS: str = "none"
 DEFAULT_DEVICES: list[str] = ["cuda:0"]
 DEFAULT_DTYPES: list[str] = ["float32"]
-DEFAULT_WARMUP: int = 5
-DEFAULT_REPEATS: int = 8
+DEFAULT_WARMUP: int = 3
+DEFAULT_REPEATS: int = 5
 DEFAULT_OUTPUT_DIR: str = "sae_lens/autoconfig/profile_results"
 DEFAULT_OUTPUT_NAME: str = "sae_compute_profile"
 DEFAULT_SUBPROCESS_ISOLATION: bool = True

@@ -3,18 +3,21 @@ Shared-memory activation buffer for streaming_mode v1.
 
 Layout (5 files in base_dir, default /dev/shm):
   {name}_state.bin   — int8 memmap  (num_chunks,)
-  {name}_meta.bin    — int32 memmap (num_chunks, 4)
+  {name}_meta.bin    — int32 memmap (num_chunks, 6)
                          [0] valid_tokens  [1] producer_id  [2] seq_no  [3] refcount
-                         refcount is the number of consumer-side ranks that still
-                         need to release this chunk before it returns to FREE.
-                         Defaults to 0 (FREE/READY) and is set to N by acquire.
+                         [4] owner_dp      [5] alloc_epoch
+                         owner_dp >= 0 means the chunk is reserved for that SAE-DP
+                         replica but its replica root has not claimed it yet.
+                         owner_dp == -1 means no pending DP reservation.
   {name}_header.bin  — int32 memmap (8,)
                          [0] num_producers
                          [1] done_count       (each producer increments on finish)
                          [2] target_chunks    (global chunk budget, set at create)
                          [3] next_claim_seq   (monotonically incremented under lock)
                          [4] dtype_code       (0=bfloat16, 1=float32)
-                         [5-7] reserved
+                         [5] next_alloc_epoch (SAE-DP cohort allocation epoch)
+                         [6] consumer_stop    (shared quiesce/stop flag for SAE-DP)
+                         [7] reserved
   {name}_data.bin    — dtype-dependent memmap (num_chunks, chunk_size_tokens, d_model)
                          bfloat16: uint16 memmap, bfloat16 stored as raw uint16 bit-pattern
                          float32:  float32 memmap
@@ -116,13 +119,18 @@ class SharedActivationBuffer:
             try:
                 # Create and zero-initialise all files.
                 self._create_file(state_path, num_chunks, dtype=np.int8)
-                self._create_file(meta_path, num_chunks * 4, dtype=np.int32)
+                meta = self._create_file(meta_path, num_chunks * 6, dtype=np.int32)
+                meta_2d = meta.reshape(num_chunks, 6)
+                meta_2d[:, 4:6] = -1
+                meta.flush()
                 hdr = self._create_file(header_path, 8, dtype=np.int32)
                 hdr[0] = num_producers
                 hdr[1] = 0
                 hdr[2] = target_chunks
                 hdr[3] = 0
                 hdr[4] = dtype_code
+                hdr[5] = 0
+                hdr[6] = 0
                 hdr.flush()
                 self._create_file(data_path, num_chunks * chunk_size_tokens * d_model, dtype=np_dtype)
                 lock_path.touch(exist_ok=True)
@@ -136,7 +144,7 @@ class SharedActivationBuffer:
             str(state_path), dtype=np.int8, mode=mode, shape=(num_chunks,)
         )
         self._meta: np.ndarray = np.memmap(
-            str(meta_path), dtype=np.int32, mode=mode, shape=(num_chunks, 4)
+            str(meta_path), dtype=np.int32, mode=mode, shape=(num_chunks, 6)
         )
         self._header: np.ndarray = np.memmap(
             str(header_path), dtype=np.int32, mode=mode, shape=(8,)
@@ -172,7 +180,7 @@ class SharedActivationBuffer:
         data_bytes = num_chunks * chunk_size_tokens * d_model * elem_bytes
         metadata_bytes = (
             num_chunks * np.dtype(np.int8).itemsize
-            + num_chunks * 4 * np.dtype(np.int32).itemsize
+            + num_chunks * 6 * np.dtype(np.int32).itemsize
             + 8 * np.dtype(np.int32).itemsize
         )
         return {
@@ -232,7 +240,9 @@ class SharedActivationBuffer:
                     seq = int(self._header[3])
                     self._header[3] += 1
                     self._state[free_idx] = ChunkState.WRITING
+                    self._meta[free_idx, 0:4] = 0
                     self._meta[free_idx, 2] = seq
+                    self._meta[free_idx, 4:6] = -1
                     self._meta.flush()
                     self._header.flush()
                     self._state.flush()
@@ -250,6 +260,9 @@ class SharedActivationBuffer:
                 f"{ChunkState(self._state[chunk_idx]).name}"
             )
             self._state[chunk_idx] = ChunkState.FREE
+            self._meta[chunk_idx, 0:4] = 0
+            self._meta[chunk_idx, 4:6] = -1
+            self._meta.flush()
             self._state.flush()
 
     def write_chunk(
@@ -298,6 +311,17 @@ class SharedActivationBuffer:
             self._header[1] += 1
             self._header.flush()
 
+    def request_consumer_stop(self) -> None:
+        """Request a DP-safe consumer stop after the currently reserved cohort.
+
+        The flag is shared across every SAE-DP replica. acquire_dp_up_to() still
+        lets each replica claim an already-reserved cohort, but creates no new
+        cohort after all reservations from that cohort have been claimed.
+        """
+        with self._locked():
+            self._header[6] = 1
+            self._header.flush()
+
     # ------------------------------------------------------------------
     # Consumer API
     # ------------------------------------------------------------------
@@ -309,23 +333,8 @@ class SharedActivationBuffer:
         refcount: int = 1,
         stop_check: Callable[[], bool] | None = None,
     ) -> tuple[list[int], float]:
-        """Claim up to n READY slots as CONSUMING.
-
-        Returns (indices, wait_s) where wait_s is the total time spent sleeping
-        waiting for READY chunks to appear (0.0 if chunks were available immediately).
-
-        Blocks only when ready == 0 and not all producers done.
-        Raises StopIteration when ready == 0 and all producers done.
-
-        Args:
-            n: Maximum number of slots to claim.
-            random: If True, shuffle the ready list before claiming (default True).
-            refcount: Number of release_chunk() calls required before each claimed
-                slot returns to FREE. Default 1. Used by multi-PP consumers where
-                the same chunk is read by multiple sibling ranks.
-            stop_check: Optional callable returning True when the caller should
-                stop waiting/acquiring and treat the stream as exhausted.
-        """
+        """Claim up to n READY slots as CONSUMING."""
+        assert n >= 1, "n must be >= 1"
         assert refcount >= 1, "refcount must be >= 1"
         total_sleep: float = 0.0
         while True:
@@ -344,12 +353,126 @@ class SharedActivationBuffer:
                     for i in claim:
                         self._state[i] = ChunkState.CONSUMING
                         self._meta[i, 3] = refcount
+                        self._meta[i, 4:6] = -1
                     self._state.flush()
                     self._meta.flush()
                     self._backoff_count = 0
                     return claim, total_sleep
                 if int(self._header[1]) >= int(self._header[0]):  # done_count >= num_producers
                     raise StopIteration
+            sleep_s = self._backoff()
+            total_sleep += sleep_s
+            time.sleep(sleep_s)
+
+    def acquire_dp_up_to(
+        self,
+        n: int,
+        *,
+        dp_idx: int,
+        dp_size: int,
+        random: bool = True,
+        refcount: int = 1,
+        stop_check: Callable[[], bool] | None = None,
+    ) -> tuple[list[int], float]:
+        """Claim an equal SAE-DP cohort from the global READY pool."""
+        assert n >= 1, "n must be >= 1"
+        assert dp_size >= 1, "dp_size must be >= 1"
+        assert 0 <= dp_idx < dp_size, f"dp_idx={dp_idx} out of range for dp_size={dp_size}"
+        assert refcount >= 1, "refcount must be >= 1"
+        if dp_size == 1:
+            return self.acquire_up_to(
+                n,
+                random=random,
+                refcount=refcount,
+                stop_check=stop_check,
+            )
+        if self._num_chunks < dp_size:
+            raise ValueError(
+                f"streaming_num_chunks={self._num_chunks} must be >= sae_dp_size={dp_size}"
+            )
+
+        total_sleep: float = 0.0
+        while True:
+            with self._locked():
+                if stop_check is not None and stop_check():
+                    self._header[6] = 1
+                    self._header.flush()
+
+                assigned = [
+                    int(i)
+                    for i in range(self._num_chunks)
+                    if int(self._state[i]) == ChunkState.CONSUMING
+                    and int(self._meta[i, 4]) == dp_idx
+                ]
+                if assigned:
+                    epoch = min(int(self._meta[i, 5]) for i in assigned)
+                    claim = [i for i in assigned if int(self._meta[i, 5]) == epoch]
+                    for i in claim:
+                        self._meta[i, 4] = -1
+                    self._meta.flush()
+                    self._backoff_count = 0
+                    return claim, total_sleep
+
+                reservations_pending = any(
+                    int(self._state[i]) == ChunkState.CONSUMING
+                    and int(self._meta[i, 4]) >= 0
+                    for i in range(self._num_chunks)
+                )
+                if not reservations_pending:
+                    if int(self._header[6]) != 0:
+                        raise StopIteration
+
+                    partial_ready = [
+                        int(i)
+                        for i in range(self._num_chunks)
+                        if int(self._state[i]) == ChunkState.READY
+                        and int(self._meta[i, 0]) != self._chunk_size_tokens
+                    ]
+                    for i in partial_ready:
+                        self._state[i] = ChunkState.FREE
+                        self._meta[i, 0:4] = 0
+                        self._meta[i, 4:6] = -1
+
+                    full_ready = [
+                        int(i)
+                        for i in range(self._num_chunks)
+                        if int(self._state[i]) == ChunkState.READY
+                        and int(self._meta[i, 0]) == self._chunk_size_tokens
+                    ]
+                    k = min(n, len(full_ready) // dp_size)
+                    if k > 0:
+                        if random:
+                            _rng.shuffle(full_ready)
+                        selected = full_ready[: k * dp_size]
+                        epoch = int(self._header[5])
+                        self._header[5] += 1
+                        mine: list[int] = []
+                        for pos, i in enumerate(selected):
+                            owner = pos % dp_size
+                            self._state[i] = ChunkState.CONSUMING
+                            self._meta[i, 3] = refcount
+                            self._meta[i, 4] = owner
+                            self._meta[i, 5] = epoch
+                            if owner == dp_idx:
+                                mine.append(i)
+                        for i in mine:
+                            self._meta[i, 4] = -1
+                        self._state.flush()
+                        self._meta.flush()
+                        self._header.flush()
+                        self._backoff_count = 0
+                        return mine, total_sleep
+
+                    if int(self._header[1]) >= int(self._header[0]):
+                        for i in range(self._num_chunks):
+                            if int(self._state[i]) == ChunkState.READY:
+                                self._state[i] = ChunkState.FREE
+                                self._meta[i, 0:4] = 0
+                                self._meta[i, 4:6] = -1
+                        self._state.flush()
+                        self._meta.flush()
+                        raise StopIteration
+
             sleep_s = self._backoff()
             total_sleep += sleep_s
             time.sleep(sleep_s)
@@ -386,6 +509,7 @@ class SharedActivationBuffer:
             self._meta[chunk_idx, 3] = rc
             if rc == 0:
                 self._state[chunk_idx] = ChunkState.FREE
+                self._meta[chunk_idx, 4:6] = -1
                 self._state.flush()
             self._meta.flush()
 
@@ -459,10 +583,12 @@ class SharedActivationBuffer:
                 if state == ChunkState.WRITING:
                     self._state[i] = ChunkState.FREE
                     self._meta[i, 3] = 0
+                    self._meta[i, 4:6] = -1
             self._state.flush()
             self._meta.flush()
             self._header[0] = new_num_producers
             self._header[1] = 0
+            self._header[6] = 0
             self._header.flush()
 
     # ------------------------------------------------------------------
