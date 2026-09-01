@@ -2932,7 +2932,9 @@ class LanguageModelSAETrainingRunner:
 
     def _run_streaming_consumer_loop(self) -> TrainingSAE[Any]:
         import sae_lens.distributed_streaming as ds
-        from sae_lens.training.streaming_activation_provider import StreamingActivationProvider
+        from sae_lens.training.async_streaming_activation_provider import (
+            AsyncStreamingActivationProvider,
+        )
 
         sae_tp_group = ds.get_sae_tp_group()
         sae_tp_size = ds.get_sae_tp_size()
@@ -2974,7 +2976,7 @@ class LanguageModelSAETrainingRunner:
             else None
         )
 
-        provider = StreamingActivationProvider(
+        provider = AsyncStreamingActivationProvider(
             buffer=self._streaming_buffer,
             train_batch_size_tokens=self.cfg.train_batch_size_tokens,
             prefetch_chunks=self.cfg.streaming_prefetch_chunks,
@@ -3006,6 +3008,12 @@ class LanguageModelSAETrainingRunner:
             sae_dp_idx=dp_idx,
             sae_pp_size=self.sae_pp_size,
             pp_rank=pp_rank,
+            replica_root_global_rank=(
+                pp_root_global
+                if self.sae_pp_size > 1
+                else ds.get_consumer_tp_root()
+            ),
+            coord_name=self._streaming_buffer_name,
         )
 
         return self._run_streaming_consumer_multi(provider, ds)

@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hook-name","--hook", default="blocks.21.hook_resid_post")
     parser.add_argument("--hook-names","--hooks",
         # default=None,
-        default="blocks.21.hook_resid_post,blocks.26.hook_resid_post,blocks.31.hook_resid_post",        
+        default="blocks.21.hook_resid_post,blocks.31.hook_resid_post",        
         help="Comma-separated hook names for multi-layer independent SAE training.",
     )
     parser.add_argument("--d-sae", type=int, default=32768)
@@ -73,8 +73,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sae-tp-size", "-stp", type=int, default=None)
     parser.add_argument("--vllm-dp-size","-vdp", type=int, default=1)
     parser.add_argument("--sae-dp-size", "-sdp", type=int, default=1)
+    # DP convenience aliases. These are normalized after parsing so the original
+    # --sae-dp-size + --sae-dp-mode interface remains fully supported.
+    parser.add_argument(
+        "--ddp",
+        action="store_true",
+        help="Shortcut for --sae-dp-mode ddp.",
+    )
+    parser.add_argument(
+        "--fsdp",
+        action="store_true",
+        help="Shortcut for --sae-dp-mode fsdp.",
+    )
+    parser.add_argument(
+        "-sddp",
+        dest="sae_ddp_size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Shortcut for --sae-dp-size N --sae-dp-mode ddp. Also accepts -sddpN.",
+    )
+    parser.add_argument(
+        "-sfsdp",
+        dest="sae_fsdp_size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Shortcut for --sae-dp-size N --sae-dp-mode fsdp. Also accepts -sfsdpN.",
+    )
     parser.add_argument("--sae-pp-size", "-spp", type=int, default=1)
-    parser.add_argument("--training-tokens", type=int, default=2048*512)
+    parser.add_argument("--training-tokens", type=int, default=2048*4096)
     parser.add_argument("--train-batch-size-tokens", type=int, default=2048)
     parser.add_argument("--context-size", type=int, default=2048)
     parser.add_argument(
@@ -135,11 +163,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/results_3.0.1_streaming_test1/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_2.3.4_H2_long_runs_new1/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
-    parser.add_argument("--save-mse-every-n-steps", type=int, default=1)
-    parser.add_argument("--save-timing-every-n-steps", type=int, default=1)
-    parser.add_argument("--save-memory-every-n-steps", type=int, default=1)
+    parser.add_argument("--save-mse-every-n-steps", type=int, default=64)
+    parser.add_argument("--save-timing-every-n-steps", type=int, default=64)
+    parser.add_argument("--save-memory-every-n-steps", type=int, default=64)
     parser.add_argument(
         "--save-vllm-memory-every-n-steps",
         type=int,
@@ -273,15 +301,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-checkpoints", type=int, default=0)
     parser.add_argument("--save-final-checkpoint", action="store_true", default=True)
     parser.add_argument(
-        "--no-save-final-checkpoint",
+        "--no-save-final-checkpoint", "--no-final-checkpoint", "-nsfc", "-nfc",
         dest="save_final_checkpoint",
         action="store_false",
-        help="Do not write the final training checkpoint.",
+        help="Do not write the final training checkpoint (short: -nsfc / -nfc).",
     )
     parser.add_argument(
-        "--no-save-final-sae",
+        "--no-save-final-sae", "--no-final-sae", "-nsfs", "-nfs",
+        dest="no_save_final_sae",
         action="store_true",
-        help="Do not write final SAE weights to output_path. Useful for smoke tests.",
+        help="Do not write final SAE weights to output_path (short: -nsfs / -nfs).",
+    )
+    parser.add_argument(
+        "--no-save-final", "-nsf",
+        action="store_true",
+        default=False,
+        help="Disable both the final checkpoint and final SAE save.",
     )
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -289,12 +324,12 @@ def parse_args() -> argparse.Namespace:
                         help="Use unified shard-routing DP (supports arbitrary vllm_dp:sae_dp ratios).")
     parser.add_argument(
         "--sae-dp-mode",
-        default="manual",
+        default=None,
         choices=["manual", "ddp", "fsdp"],
         help=(
             "SAE data-parallel sync mode. 'ddp' replicates SAE parameters across DP "
-            "replicas; 'fsdp' shards them. Multi-layer SAE defaults manual to ddp; "
-            "with --sae-dp-size 1 this runs without DP communication."
+            "replicas; 'fsdp' shards them. Default: ddp. Use "
+            "'--sae-dp-mode manual' explicitly to select manual mode."
         ),
     )
     parser.add_argument(
@@ -563,7 +598,77 @@ def parse_args() -> argparse.Namespace:
             "HuggingFace Dataset). Required when --use-cached-activations is set."
         ),
     )
-    return parser.parse_args()
+    # argparse does not split custom compact options such as ``-sddp2`` into
+    # ``-sddp 2``. Normalize those two convenience spellings before parsing.
+    argv = []
+    for token in sys.argv[1:]:
+        if token.startswith("-sddp") and token != "-sddp":
+            suffix = token[len("-sddp"):]
+            if suffix.isdigit():
+                argv.extend(["-sddp", suffix])
+                continue
+        if token.startswith("-sfsdp") and token != "-sfsdp":
+            suffix = token[len("-sfsdp"):]
+            if suffix.isdigit():
+                argv.extend(["-sfsdp", suffix])
+                continue
+        argv.append(token)
+
+    args = parser.parse_args(argv)
+
+    shortcut_modes = []
+    if args.ddp:
+        shortcut_modes.append("ddp")
+    if args.fsdp:
+        shortcut_modes.append("fsdp")
+    if args.sae_ddp_size is not None:
+        shortcut_modes.append("ddp")
+    if args.sae_fsdp_size is not None:
+        shortcut_modes.append("fsdp")
+
+    distinct_shortcut_modes = set(shortcut_modes)
+    if len(distinct_shortcut_modes) > 1:
+        parser.error("DDP and FSDP shortcut options cannot be used together")
+    shortcut_mode = next(iter(distinct_shortcut_modes), None)
+
+    if args.sae_ddp_size is not None and args.sae_fsdp_size is not None:
+        parser.error("-sddp and -sfsdp cannot be used together")
+
+    shortcut_size = (
+        args.sae_ddp_size
+        if args.sae_ddp_size is not None
+        else args.sae_fsdp_size
+    )
+    if shortcut_size is not None:
+        if shortcut_size < 1:
+            parser.error("-sddp/-sfsdp size must be >= 1")
+        # Reject an explicitly different -sdp value rather than silently overriding it.
+        explicit_sdp = any(
+            token in ("-sdp", "--sae-dp-size")
+            or token.startswith("--sae-dp-size=")
+            for token in argv
+        )
+        if explicit_sdp and args.sae_dp_size != shortcut_size:
+            parser.error(
+                f"conflicting SAE DP sizes: -sdp/--sae-dp-size={args.sae_dp_size} "
+                f"but shortcut requests {shortcut_size}"
+            )
+        args.sae_dp_size = shortcut_size
+
+    if args.sae_dp_mode is not None and shortcut_mode is not None:
+        if args.sae_dp_mode != shortcut_mode:
+            parser.error(
+                f"conflicting SAE DP modes: --sae-dp-mode={args.sae_dp_mode} "
+                f"but shortcut requests {shortcut_mode}"
+            )
+    elif args.sae_dp_mode is None:
+        args.sae_dp_mode = shortcut_mode or "ddp"
+
+    if args.no_save_final:
+        args.save_final_checkpoint = False
+        args.no_save_final_sae = True
+
+    return args
 
 
 def _resolve_device() -> str:
@@ -780,10 +885,12 @@ def _append_total_runtime_record(
     run_id: str,
     total_time_s: float,
     vllm_tp_size: int,
-    sae_tp_size: int,
     vllm_dp_size: int,
+    sae_tp_size: int,
     sae_dp_size: int,
+    sae_pp_size: int,
     sae_dp_mode: str,
+    hooks: list[str],
     status: str,
     error: str | None,
 ) -> None:
@@ -799,10 +906,12 @@ def _append_total_runtime_record(
         "total_time_s": total_time_s,
         "config": {
             "vllm_tp_size": vllm_tp_size,
-            "sae_tp_size": sae_tp_size,
             "vllm_dp_size": vllm_dp_size,
+            "sae_tp_size": sae_tp_size,
             "sae_dp_size": sae_dp_size,
+            "sae_pp_size": sae_pp_size,
             "sae_dp_mode": sae_dp_mode,
+            "hooks": hooks,
         },
     }
     if error is not None:
@@ -1362,10 +1471,12 @@ def main() -> None:
             run_id=run_id,
             total_time_s=time.perf_counter() - run_t0,
             vllm_tp_size=vllm_tp_size,
-            sae_tp_size=sae_tp_size,
             vllm_dp_size=args.vllm_dp_size,
+            sae_tp_size=sae_tp_size,
             sae_dp_size=args.sae_dp_size,
+            sae_pp_size=args.sae_pp_size,
             sae_dp_mode=args.sae_dp_mode,
+            hooks=hook_names if hook_names is not None else [args.hook_name],
             status=run_status,
             error=run_error,
         )
