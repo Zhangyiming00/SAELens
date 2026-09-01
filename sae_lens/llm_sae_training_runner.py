@@ -55,6 +55,10 @@ from sae_lens.saes.sae import (
 )
 from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.activations_store import ActivationsStore
+from sae_lens.training.async_vllm_shm_writer import (
+    AsyncJsonlWriter,
+    AsyncVLLMShmWriter,
+)
 from sae_lens.training.multi_hook_sae import MultiHookSAE
 from sae_lens.training.multi_sae_trainer import MultiSAETrainer, sanitize_hook_name_for_path
 from sae_lens.training.sae_trainer import SAETrainer
@@ -2428,6 +2432,7 @@ class LanguageModelSAETrainingRunner:
 
     def _run_streaming_producer_loop(self) -> None:
         import sae_lens.distributed_streaming as ds
+        from sae_lens.util import str_to_dtype
 
         vllm_tp_group = ds.get_vllm_tp_group()
         is_tp_root = ds.is_vllm_tp_root()
@@ -2445,7 +2450,10 @@ class LanguageModelSAETrainingRunner:
         buf = self._streaming_buffer
         store = self.activations_store
 
-        # Set up per-chunk timing and shm management logs (TP root only)
+        num_hooks = max(1, len(self.hook_names))
+        # Set up per-chunk timing and shm management logs (TP root only).
+        # Both are CPU background writers; producer-side file I/O is no longer
+        # on the vLLM hot path.
         timing_path: Path | None = None
         shm_log_path: Path | None = None
         t_ready = time.time()
@@ -2454,22 +2462,62 @@ class LanguageModelSAETrainingRunner:
             out_dir.mkdir(parents=True, exist_ok=True)
             if self.cfg.save_timing_every_n_steps > 0:
                 timing_path = out_dir / "timing_history_vllm.jsonl"
-                timing_path.write_text("")
             shm_log_path = out_dir / "shm_log_vllm.jsonl"
-            shm_log_path.write_text("")
+        shm_logger = AsyncJsonlWriter(shm_log_path, t0=t_ready)
+        timing_logger = AsyncJsonlWriter(timing_path, t0=t_ready)
 
         def _shm_log(record: dict) -> None:
-            if shm_log_path is None:
-                return
-            record["elapsed_s"] = time.time() - t_ready
-            with open(shm_log_path, "a") as f:
-                json.dump(record, f)
-                f.write("\n")
+            shm_logger.log(record)
 
         ctrl = torch.zeros(1, dtype=torch.int32, device=self.device)
         chunk_idx = -1
         seq_no = -1
         chunk_step = 0
+        writer: AsyncVLLMShmWriter | None = None
+        if is_tp_root:
+            # Two slots are enough for the common case where one vLLM batch
+            # yields two streaming chunks. Override only for experiments.
+            staging_slots = max(
+                2, int(os.environ.get("SAELENS_VLLM_SHM_STAGING_SLOTS", "2"))
+            )
+
+            def _on_chunk_written(record: dict) -> None:
+                # This callback runs on the SHM writer CPU thread.
+                valid_tph = int(record["valid_tokens_per_hook"])
+                record["total_tokens"] = (
+                    int(record["seq_no"]) * chunk_size + valid_tph
+                )
+                _shm_log(record)
+                if (
+                    timing_path is not None
+                    and int(record["step"]) % self.cfg.save_timing_every_n_steps == 0
+                ):
+                    timing_logger.log(
+                        {
+                            "step": int(record["step"]),
+                            "inference_time_s": float(record["inference_time_s"]),
+                            "d2h_time_s": float(record["d2h_time_s"]),
+                            "write_time_s": float(record["write_time_s"]),
+                            "staging_wait_s": float(record["staging_wait_s"]),
+                            # These components overlap by design; do not sum
+                            # them and call the result producer wall time.
+                            "async_write": True,
+                            "valid_tokens": int(record["valid_tokens"]),
+                            "valid_tokens_per_hook": valid_tph,
+                            "total_tokens": int(record["total_tokens"]),
+                        }
+                    )
+
+            writer = AsyncVLLMShmWriter(
+                buffer=buf,
+                device=self.device,
+                dtype=str_to_dtype(self.cfg.dtype),
+                max_rows=chunk_size * num_hooks,
+                d_model=self.cfg.sae.d_in,
+                producer_id=ds.get_producer_idx(),
+                staging_slots=staging_slots,
+                on_written=_on_chunk_written,
+            )
         # Every TP rank advances this counter after a successful chunk so the
         # outer quiesce check enters the same collective sequence everywhere.
         # Root-only logging and quota accounting use the same value.
@@ -2501,6 +2549,10 @@ class LanguageModelSAETrainingRunner:
         def _save_producer_state_and_ack() -> None:
             if not is_tp_root:
                 return
+            # All already-produced chunks must be visible as READY before the
+            # dataset iterator state is checkpointed.
+            if writer is not None:
+                writer.drain()
             if _qdir is not None:
                 store.save_to_checkpoint(
                     _qdir / f"producer_dataset_state_{ds.get_producer_idx()}"
@@ -2553,14 +2605,16 @@ class LanguageModelSAETrainingRunner:
             else:
                 max_this_chunk = chunk_size  # non-root: ignored, root drives the internal loop
 
-            # All TP ranks participate in inference (required by vLLM external_launcher semantics)
+            # All TP ranks participate in inference (required by vLLM
+            # external_launcher semantics). Keep activations on GPU here:
+            # D2H + SHM publication are handled asynchronously on TP root.
             t_infer_start = time.perf_counter()
-            acts_cpu, valid_tokens = store.get_streaming_activations(max_this_chunk)
+            acts_gpu, valid_rows = store.get_streaming_activations_gpu(max_this_chunk)
             t_infer_end = time.perf_counter()
 
             # Outer Phase 2: EOF check — did dataset run dry?
             if is_tp_root:
-                ctrl[0] = 0 if acts_cpu is None else 1
+                ctrl[0] = 0 if acts_gpu is None else 1
             if vllm_tp_group is not None:
                 dist.broadcast(ctrl, src=tp_root_world, group=vllm_tp_group)
             if int(ctrl[0]) == 0:
@@ -2574,53 +2628,44 @@ class LanguageModelSAETrainingRunner:
             # before the next iteration's quiesce check.
             chunk_step += 1
 
-            # Write to buffer (TP root only)
+            # Publish asynchronously (TP root only). The producer thread only
+            # enqueues a non-blocking GPU->pinned-host copy and immediately
+            # proceeds to the next vLLM iteration.
             if is_tp_root:
-                t_write_start = time.perf_counter()
-                buf.write_chunk(
-                    chunk_idx,
-                    acts_cpu,
-                    valid_tokens,
-                    producer_id=ds.get_producer_idx(),
-                )
-                buf.mark_ready(chunk_idx)
-                t_write_end = time.perf_counter()
-
+                assert writer is not None
+                assert acts_gpu is not None
+                valid_rows = int(valid_rows)
+                if valid_rows % num_hooks != 0:
+                    raise RuntimeError(
+                        f"packed streaming rows {valid_rows} are not divisible "
+                        f"by num_hooks={num_hooks}"
+                    )
+                valid_tokens_per_hook = valid_rows // num_hooks
                 inference_time_s = t_infer_end - t_infer_start
-                write_time_s = t_write_end - t_write_start
-                step_write_time_s = write_time_s
-                _shm_log({
-                    "event": "chunk_written",
-                    "chunk_idx": chunk_idx,
-                    "seq_no": seq_no,
-                    "step": chunk_step,
-                    "valid_tokens": valid_tokens,
-                    "total_tokens": seq_no * chunk_size + valid_tokens,
-                    "inference_time_s": inference_time_s,
-                    "write_time_s": write_time_s,
-                    "buffer_state": buf.queue_counts(),
-                })
-
-                if timing_path is not None and chunk_step % self.cfg.save_timing_every_n_steps == 0:
-                    record = {
-                        "step": chunk_step,
-                        "elapsed_s": time.time() - t_ready,
-                        "inference_time_s": inference_time_s,
-                        "write_time_s": write_time_s,
-                        "chunk_time_s": inference_time_s + write_time_s,
-                        "valid_tokens": valid_tokens,
-                        "total_tokens": seq_no * chunk_size + valid_tokens,
-                    }
-                    with open(timing_path, "a") as f:
-                        json.dump(record, f)
-                        f.write("\n")
+                staging_wait_s = writer.submit(
+                    chunk_idx=chunk_idx,
+                    seq_no=seq_no,
+                    step=chunk_step,
+                    activations_gpu=acts_gpu,
+                    valid_rows=valid_rows,
+                    valid_tokens_per_hook=valid_tokens_per_hook,
+                    inference_time_s=inference_time_s,
+                )
+                if staging_wait_s > 0.001:
+                    _shm_log(
+                        {
+                            "event": "producer_staging_wait",
+                            "step": chunk_step,
+                            "wait_time_s": staging_wait_s,
+                        }
+                    )
 
             if window_profiler is not None:
-                # Non-root TP ranks only run inference, so their write time
-                # stays 0.
+                # SHM publication is asynchronous; write_time_s is reported by
+                # the background writer callback rather than this hot path.
                 window_profiler.on_step_end(
                     producer_step,
-                    samples=valid_tokens if is_tp_root else 0,
+                    samples=valid_rows if is_tp_root else 0,
                     components={
                         "inference_time_s": t_infer_end - t_infer_start,
                         "write_time_s": step_write_time_s,
@@ -2630,11 +2675,16 @@ class LanguageModelSAETrainingRunner:
         if window_profiler is not None:
             window_profiler.close()
         if is_tp_root:
+            assert writer is not None
+            # READY must be published for every submitted chunk before EOF.
+            writer.close()
             buf.signal_done()
             _shm_log({"event": "producer_done", "total_chunks": chunk_step})
             if vllm_finished_ack_path is not None:
                 vllm_finished_ack_path.parent.mkdir(parents=True, exist_ok=True)
                 vllm_finished_ack_path.touch()
+        shm_logger.close()
+        timing_logger.close()
         buf.close()
 
     def _run_gpu_direct_producer_loop(self) -> None:

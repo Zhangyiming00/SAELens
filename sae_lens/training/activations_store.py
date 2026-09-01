@@ -1246,18 +1246,22 @@ class ActivationsStore:
         if self.is_multi_hook:
             num_hooks = len(self.hook_names)
             per_hook_cats = [
-                torch.cat(self._stream_collected_by_hook_gpu[h], dim=0)
+                (
+                    self._stream_collected_by_hook_gpu[h][0]
+                    if len(self._stream_collected_by_hook_gpu[h]) == 1
+                    else torch.cat(self._stream_collected_by_hook_gpu[h], dim=0)
+                )
                 for h in self.hook_names
             ]
             trimmed = [cat[:chunk_size_tokens] for cat in per_hook_cats]
-            full = torch.cat(trimmed, dim=0)
+            full = trimmed[0] if len(trimmed) == 1 else torch.cat(trimmed, dim=0)
             for i, h in enumerate(self.hook_names):
                 if per_hook_cats[i].shape[0] > chunk_size_tokens:
                     self._stream_collected_by_hook_gpu[h] = [per_hook_cats[i][chunk_size_tokens:]]
                 else:
                     self._stream_collected_by_hook_gpu[h] = []
         else:
-            full = torch.cat(collected, dim=0)
+            full = collected[0] if len(collected) == 1 else torch.cat(collected, dim=0)
             if full.shape[0] > chunk_size_tokens:
                 self._stream_residual_gpu = full[chunk_size_tokens:]
                 full = full[:chunk_size_tokens]

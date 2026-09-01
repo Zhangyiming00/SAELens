@@ -76,12 +76,12 @@ def parse_args() -> argparse.Namespace:
     # DP convenience aliases. These are normalized after parsing so the original
     # --sae-dp-size + --sae-dp-mode interface remains fully supported.
     parser.add_argument(
-        "--ddp",
+        "--ddp","-ddp",
         action="store_true",
         help="Shortcut for --sae-dp-mode ddp.",
     )
     parser.add_argument(
-        "--fsdp",
+        "--fsdp","-fsdp",
         action="store_true",
         help="Shortcut for --sae-dp-mode fsdp.",
     )
@@ -163,11 +163,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/results_2.3.4_H2_long_runs_new1/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_2.3.5_H2_long_runs_new2/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
-    parser.add_argument("--save-mse-every-n-steps", type=int, default=64)
-    parser.add_argument("--save-timing-every-n-steps", type=int, default=64)
-    parser.add_argument("--save-memory-every-n-steps", type=int, default=64)
+    parser.add_argument("--save-mse-every-n-steps", type=int, default=32)
+    parser.add_argument("--save-timing-every-n-steps", type=int, default=512)
+    parser.add_argument("--save-memory-every-n-steps", type=int, default=512)
     parser.add_argument(
         "--save-vllm-memory-every-n-steps",
         type=int,
@@ -236,7 +236,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--step-window-profile-start-step",
         type=int,
-        default=17,
+        default=65,
         help=(
             "First step of the first step-window profiling window (1-based). "
             "Windows are contiguous, so --step-window-profile-start-step 11 with "
@@ -251,13 +251,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--step-window-profile-window-steps",
         type=int,
-        default=16,
+        default=64,
         help="Steps per step-window profiling window.",
     )
     parser.add_argument(
         "--step-window-profile-window-count",
         type=int,
-        default=2,
+        default=5,
         help="Number of consecutive step-window profiling windows to record.",
     )
     parser.add_argument(
@@ -299,17 +299,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--n-checkpoints", type=int, default=0)
-    parser.add_argument("--save-final-checkpoint", action="store_true", default=True)
+    parser.add_argument(
+        "--save-final-checkpoint",
+        dest="save_final_checkpoint",
+        action="store_true",
+        default=False,
+        help="Write the final training checkpoint (default: disabled).",
+    )
     parser.add_argument(
         "--no-save-final-checkpoint", "--no-final-checkpoint", "-nsfc", "-nfc",
         dest="save_final_checkpoint",
         action="store_false",
-        help="Do not write the final training checkpoint (short: -nsfc / -nfc).",
+        help="Do not write the final training checkpoint (default; short: -nsfc / -nfc).",
     )
     parser.add_argument(
         "--no-save-final-sae", "--no-final-sae", "-nsfs", "-nfs",
         dest="no_save_final_sae",
         action="store_true",
+        default=False,
         help="Do not write final SAE weights to output_path (short: -nsfs / -nfs).",
     )
     parser.add_argument(
