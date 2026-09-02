@@ -163,7 +163,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/results_2.3.5_H2_long_runs_new2/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_2.1_H2_asynctp__test2/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
     parser.add_argument("--save-mse-every-n-steps", type=int, default=32)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=512)
@@ -257,7 +257,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--step-window-profile-window-count",
         type=int,
-        default=5,
+        default=14,
         help="Number of consecutive step-window profiling windows to record.",
     )
     parser.add_argument(
@@ -379,12 +379,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--multi-sae-distributed-architecture",
-        default="legacy_per_hook_wrapper",
+        default="unified_multi_hook",
         choices=["legacy_per_hook_wrapper", "unified_multi_hook"],
         help=(
-            "Multi-layer SAE distributed wrapper architecture. The default keeps "
-            "legacy per-hook DDP/FSDP wrappers; unified_multi_hook trains through "
-            "one MultiHookSAE owner."
+            "Multi-layer SAE distributed wrapper architecture. The default "
+            "unified_multi_hook trains through one MultiHookSAE owner and enables "
+            "cross-hook TP wavefront forward when TP>1. legacy_per_hook_wrapper "
+            "keeps the old path. FSDP automatically falls back to legacy."
         ),
     )
     parser.add_argument(

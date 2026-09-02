@@ -15,7 +15,14 @@ from transformer_lens.hook_points import HookPoint
 from typing_extensions import override
 from safetensors.torch import save_file
 
-from sae_lens.distributed import tp_allgather, tp_allreduce
+from sae_lens.distributed import (
+    TPAsyncAllGather,
+    TPAsyncAllReduce,
+    tp_allgather,
+    tp_allgather_async,
+    tp_allreduce,
+    tp_allreduce_async,
+)
 from sae_lens.constants import SAE_CFG_FILENAME, SAE_WEIGHTS_FILENAME
 from sae_lens.saes.sae import (
     SAE,
@@ -24,6 +31,7 @@ from sae_lens.saes.sae import (
     TrainingSAE,
     TrainingSAEConfig,
     TrainStepInput,
+    TrainStepOutput,
 )
 from sae_lens.util import str_to_dtype
 
@@ -382,6 +390,17 @@ class TopKTrainingSAEConfig(TrainingSAEConfig):
         return "topk"
 
 
+@dataclass
+class TopKTPWavefrontState:
+    step_input: TrainStepInput
+    hidden_pre_local: torch.Tensor
+    gather: TPAsyncAllGather
+    hidden_pre: torch.Tensor | None = None
+    feature_acts: torch.Tensor | None = None
+    decode_bias: torch.Tensor | None = None
+    reduce: TPAsyncAllReduce | None = None
+
+
 class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
     """
     TopK variant with training functionality. Calculates a topk-related auxiliary loss, etc.
@@ -639,6 +658,86 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
             if param.grad is not None:
                 param.grad.mul_(clip_coef.to(device=param.grad.device, dtype=param.grad.dtype))
         return total_norm
+
+    def tp_wavefront_supported(self) -> bool:
+        """Whether this SAE can participate in cross-hook TP wavefront forward."""
+        return (
+            self._tp_group is not None
+            and dist.is_initialized()
+            and dist.get_world_size(self._tp_group) > 1
+            and not self.cfg.use_sparse_activations
+        )
+
+    def tp_wavefront_encode_launch(
+        self,
+        step_input: TrainStepInput,
+    ) -> TopKTPWavefrontState:
+        """Run the local encoder shard and launch its TP all-gather."""
+        if not self.tp_wavefront_supported() or self._tp_group is None:
+            raise RuntimeError("TP wavefront requested for an unsupported TopK SAE")
+
+        sae_in = self.process_sae_in(step_input.sae_in)
+        hidden_pre_local = self.hook_sae_acts_pre(sae_in @ self.W_enc + self.b_enc)
+        _debug_topk_tp("wavefront encode local pre done")
+        if self.cfg.rescale_acts_by_decoder_norm:
+            hidden_pre_local = hidden_pre_local * self.W_dec.norm(dim=-1)
+
+        gather = tp_allgather_async(hidden_pre_local, self._tp_group)
+        _debug_topk_tp("wavefront encode allgather launched")
+        return TopKTPWavefrontState(
+            step_input=step_input,
+            hidden_pre_local=hidden_pre_local,
+            gather=gather,
+        )
+
+    def tp_wavefront_decode_launch(self, state: TopKTPWavefrontState) -> None:
+        """Finish encoder AG, run local decoder work, and launch decoder AR."""
+        if self._tp_group is None:
+            raise RuntimeError("TP wavefront state has no TP group")
+
+        hidden_pre = state.gather.wait()
+        _debug_topk_tp("wavefront encode allgather done")
+        feature_acts = self.hook_sae_acts_post(self.activation_fn(hidden_pre))
+        _debug_topk_tp("wavefront activation done")
+
+        tp_rank = dist.get_rank(self._tp_group)
+        tp_size = dist.get_world_size(self._tp_group)
+        shard_size = feature_acts.shape[-1] // tp_size
+        local_acts = feature_acts[
+            ..., tp_rank * shard_size : (tp_rank + 1) * shard_size
+        ]
+        if self.cfg.rescale_acts_by_decoder_norm:
+            local_acts = local_acts * (1 / self.W_dec.norm(dim=-1))
+
+        decode_bias = _scale_gradient(self.b_dec, 1.0 / tp_size)
+        reduce = tp_allreduce_async(local_acts @ self.W_dec, self._tp_group)
+        _debug_topk_tp("wavefront decode allreduce launched")
+        state.hidden_pre = hidden_pre
+        state.feature_acts = feature_acts
+        state.decode_bias = decode_bias
+        state.reduce = reduce
+
+    def tp_wavefront_finish(self, state: TopKTPWavefrontState) -> TrainStepOutput:
+        """Drain decoder AR and build the regular training output/loss graph."""
+        if (
+            state.reduce is None
+            or state.hidden_pre is None
+            or state.feature_acts is None
+            or state.decode_bias is None
+        ):
+            raise RuntimeError("Incomplete TP wavefront state")
+
+        sae_out_pre = state.reduce.wait() + state.decode_bias
+        _debug_topk_tp("wavefront decode allreduce done")
+        sae_out_pre = self.hook_sae_recons(sae_out_pre)
+        sae_out_pre = self.run_time_activation_norm_fn_out(sae_out_pre)
+        sae_out = self.reshape_fn_out(sae_out_pre, self.d_head)
+        return self._build_train_step_output(
+            state.step_input,
+            state.feature_acts,
+            state.hidden_pre,
+            sae_out,
+        )
 
     def encode_with_hidden_pre(
         self, x: torch.Tensor

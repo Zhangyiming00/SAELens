@@ -730,6 +730,18 @@ class LanguageModelSAETrainingRunner:
             )
 
         self.cfg = cfg
+        # Cross-hook TP wavefront currently relies on raw TopK children and is
+        # deliberately disabled for FSDP.  Config construction applies the same
+        # fallback, but repeat it here for callers that mutate cfg after init.
+        if (
+            self.cfg.sae_dp_mode == "fsdp"
+            and self.cfg.multi_sae_distributed_architecture == "unified_multi_hook"
+        ):
+            logger.warning(
+                "unified_multi_hook is not supported with FSDP; "
+                "falling back to legacy_per_hook_wrapper."
+            )
+            self.cfg.multi_sae_distributed_architecture = "legacy_per_hook_wrapper"
         effective_streaming_mode = streaming_mode or cfg.streaming_mode
         self.cached_activations_only = bool(cfg.use_cached_activations)
         self.hook_names = (
@@ -1312,6 +1324,15 @@ class LanguageModelSAETrainingRunner:
     def _init_multi_saes(self) -> None:
         if self.cfg.sae_dp_mode == "fsdp" and not dist.is_initialized():
             raise ValueError("Multi-layer SAE training with FSDP requires torch distributed.")
+        if (
+            self.cfg.sae_dp_mode == "fsdp"
+            and self.cfg.multi_sae_distributed_architecture == "unified_multi_hook"
+        ):
+            logger.warning(
+                "unified_multi_hook is not supported with FSDP; "
+                "falling back to legacy_per_hook_wrapper."
+            )
+            self.cfg.multi_sae_distributed_architecture = "legacy_per_hook_wrapper"
 
         sae_dp_group = get_dp_group() if dist.is_initialized() else None
         if self.use_shard_routing and dist.is_initialized():
@@ -2268,7 +2289,7 @@ class LanguageModelSAETrainingRunner:
         self._base_sae = sae
         self.sae = self._streaming_wrap_sae_dp(sae, ds)
 
-    def _streaming_wrap_sae_dp(self, sae: TrainingSAE[Any], ds: Any) -> Any:
+    def _streaming_wrap_sae_dp(self, sae: torch.nn.Module, ds: Any) -> Any:
         """Apply the configured SAE-DP wrapper on the current (PP, TP) shard."""
         if self.sae_dp_size <= 1:
             return sae
@@ -2338,6 +2359,7 @@ class LanguageModelSAETrainingRunner:
         else:
             self._pp_hook_names = list(self.hook_names)
 
+        raw_sae_by_hook: dict[str, TrainingSAE[Any]] = {}
         for idx, hook_name in enumerate(self._pp_hook_names):
             seed = (
                 cfg.seed
@@ -2364,7 +2386,20 @@ class LanguageModelSAETrainingRunner:
             )
 
             self.base_sae_by_hook[hook_name] = sae
-            self.sae_by_hook[hook_name] = self._streaming_wrap_sae_dp(sae, ds)
+            raw_sae_by_hook[hook_name] = sae
+
+        if cfg.multi_sae_distributed_architecture == "unified_multi_hook":
+            # Keep one DDP owner around the MultiHookSAE so its TP collectives
+            # run inside a single forward/backward lifecycle.
+            raw_multi_hook_sae = MultiHookSAE(
+                list(self._pp_hook_names), raw_sae_by_hook
+            )
+            self.sae_by_hook = dict(raw_sae_by_hook)
+            self.multi_hook_sae = self._streaming_wrap_sae_dp(raw_multi_hook_sae, ds)
+        else:
+            # FSDP and explicitly selected legacy mode retain one wrapper per hook.
+            for hook_name, sae in raw_sae_by_hook.items():
+                self.sae_by_hook[hook_name] = self._streaming_wrap_sae_dp(sae, ds)
 
         self._base_sae = None  # type: ignore[assignment]
         self.sae = None
@@ -3206,7 +3241,7 @@ class LanguageModelSAETrainingRunner:
             hook_names=local_hooks,
             sae_by_hook=self.sae_by_hook,
             base_sae_by_hook=self.base_sae_by_hook,
-            multi_hook_sae=None,
+            multi_hook_sae=self.multi_hook_sae,
             data_provider=provider,
             save_checkpoint_fn=self._streaming_save_checkpoint,
             cfg=self.cfg.to_sae_trainer_config(),

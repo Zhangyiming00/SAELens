@@ -465,6 +465,131 @@ class _AllReduce(torch.autograd.Function):
         return grad, None
 
 
+_tp_comm_streams: dict[int, torch.cuda.Stream] = {}
+
+
+def _get_tp_comm_stream(device: torch.device) -> torch.cuda.Stream:
+    """Return the persistent CUDA stream used for asynchronous TP collectives."""
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    stream = _tp_comm_streams.get(device_index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device_index)
+        _tp_comm_streams[device_index] = stream
+    return stream
+
+
+class _AsyncAllGatherFinalize(torch.autograd.Function):
+    """Attach an asynchronously gathered tensor to the local shard's graph."""
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: torch.autograd.function.FunctionCtx,
+        local: torch.Tensor,
+        tp_rank: int,
+        *gathered: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.tp_rank = tp_rank
+        ctx.shard_size = local.shape[-1]
+        ctx.num_gathered = len(gathered)
+        return torch.cat(gathered, dim=-1)
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_full: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, ...]:
+        start = ctx.tp_rank * ctx.shard_size
+        grad_local = grad_full[..., start : start + ctx.shard_size].contiguous()
+        return (grad_local, None, *(None for _ in range(ctx.num_gathered)))
+
+
+class _AsyncAllReduceFinalize(torch.autograd.Function):
+    """Attach an asynchronously reduced tensor to the input graph."""
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: torch.autograd.function.FunctionCtx,
+        x: torch.Tensor,
+        reduced: torch.Tensor,
+    ) -> torch.Tensor:
+        return reduced
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: torch.autograd.function.FunctionCtx,
+        grad: torch.Tensor,
+    ) -> tuple[torch.Tensor, None]:
+        return grad, None
+
+
+class TPAsyncAllGather:
+    """Handle for an in-flight SAE-TP all-gather."""
+
+    def __init__(
+        self,
+        local: torch.Tensor,
+        send: torch.Tensor,
+        gathered: list[torch.Tensor],
+        work: object,
+        group: dist.ProcessGroup,
+        tp_rank: int,
+        event: torch.cuda.Event | None = None,
+    ) -> None:
+        self.local = local
+        self.send = send
+        self.gathered = gathered
+        self.work = work
+        self.group = group
+        self.tp_rank = tp_rank
+        self.event = event
+        self._result: torch.Tensor | None = None
+
+    def wait(self) -> torch.Tensor:
+        if self._result is None:
+            with nccl_nvtx_range("nccl:sae_tp_all_gather_wait", self.group):
+                self.work.wait()  # type: ignore[attr-defined]
+            if self.event is not None:
+                torch.cuda.current_stream(self.local.device).wait_event(self.event)
+            self._result = _AsyncAllGatherFinalize.apply(  # type: ignore[assignment]
+                self.local, self.tp_rank, *self.gathered
+            )
+            self.gathered = []
+            self.send = self.local
+        return self._result
+
+
+class TPAsyncAllReduce:
+    """Handle for an in-flight SAE-TP all-reduce."""
+
+    def __init__(
+        self,
+        x: torch.Tensor,
+        reduced: torch.Tensor,
+        work: object,
+        group: dist.ProcessGroup,
+        event: torch.cuda.Event | None = None,
+    ) -> None:
+        self.x = x
+        self.reduced = reduced
+        self.work = work
+        self.group = group
+        self.event = event
+        self._result: torch.Tensor | None = None
+
+    def wait(self) -> torch.Tensor:
+        if self._result is None:
+            with nccl_nvtx_range("nccl:sae_tp_all_reduce_wait", self.group):
+                self.work.wait()  # type: ignore[attr-defined]
+            if self.event is not None:
+                torch.cuda.current_stream(self.x.device).wait_event(self.event)
+            self._result = _AsyncAllReduceFinalize.apply(  # type: ignore[assignment]
+                self.x, self.reduced
+            )
+        return self._result
+
+
 def tp_allgather(local: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
     """AllGather along last dim with proper gradient support."""
     return _AllGather.apply(local, group)  # type: ignore[return-value]
@@ -473,6 +598,51 @@ def tp_allgather(local: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
 def tp_allreduce(x: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
     """AllReduce (sum) with proper gradient support."""
     return _AllReduce.apply(x, group)  # type: ignore[return-value]
+
+
+def tp_allgather_async(local: torch.Tensor, group: dist.ProcessGroup) -> TPAsyncAllGather:
+    """Launch a TP all-gather and defer synchronization until ``wait``."""
+    tp_size = dist.get_world_size(group)
+    tp_rank = dist.get_rank(group)
+    send = local.contiguous()
+    gathered = [torch.empty_like(send) for _ in range(tp_size)]
+    event: torch.cuda.Event | None = None
+    if local.is_cuda:
+        stream = _get_tp_comm_stream(local.device)
+        current_stream = torch.cuda.current_stream(local.device)
+        with torch.cuda.stream(stream):
+            stream.wait_stream(current_stream)
+            send.record_stream(stream)
+            for output in gathered:
+                output.record_stream(stream)
+            with nccl_nvtx_range("nccl:sae_tp_all_gather_launch", group):
+                work = dist.all_gather(gathered, send, group=group, async_op=True)
+            event = torch.cuda.Event()
+            event.record(stream)
+    else:
+        with nccl_nvtx_range("nccl:sae_tp_all_gather_launch", group):
+            work = dist.all_gather(gathered, send, group=group, async_op=True)
+    return TPAsyncAllGather(local, send, gathered, work, group, tp_rank, event)
+
+
+def tp_allreduce_async(x: torch.Tensor, group: dist.ProcessGroup) -> TPAsyncAllReduce:
+    """Launch a TP sum all-reduce and defer synchronization until ``wait``."""
+    reduced = x.detach().clone()
+    event: torch.cuda.Event | None = None
+    if x.is_cuda:
+        stream = _get_tp_comm_stream(x.device)
+        current_stream = torch.cuda.current_stream(x.device)
+        with torch.cuda.stream(stream):
+            stream.wait_stream(current_stream)
+            reduced.record_stream(stream)
+            with nccl_nvtx_range("nccl:sae_tp_all_reduce_launch", group):
+                work = dist.all_reduce(reduced, group=group, async_op=True)
+            event = torch.cuda.Event()
+            event.record(stream)
+    else:
+        with nccl_nvtx_range("nccl:sae_tp_all_reduce_launch", group):
+            work = dist.all_reduce(reduced, group=group, async_op=True)
+    return TPAsyncAllReduce(x, reduced, work, group, event)
 
 
 def preinit_vllm_distributed(vllm_world_ranks: list[int], vllm_tp_size: int) -> None:

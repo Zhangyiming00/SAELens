@@ -985,45 +985,31 @@ class TrainingSAE(SAE[T_TRAINING_SAE_CONFIG], ABC):
         """Calculate architecture-specific auxiliary loss terms."""
         ...
 
-    def training_forward_pass(
+    def _build_train_step_output(
         self,
         step_input: TrainStepInput,
+        feature_acts: torch.Tensor,
+        hidden_pre: torch.Tensor,
+        sae_out: torch.Tensor,
     ) -> TrainStepOutput:
-        """Forward pass during training."""
-        feature_acts, hidden_pre = self.encode_with_hidden_pre(step_input.sae_in)
-        sae_out = self.decode(feature_acts)
-
-        # Calculate MSE loss
+        """Build losses/output from already-computed training-forward tensors."""
         per_item_mse_loss = self.mse_loss_fn(sae_out, step_input.sae_in)
         mse_loss = per_item_mse_loss.sum(dim=-1).mean()
-
-        # Calculate architecture-specific auxiliary losses
         aux_losses = self.calculate_aux_loss(
             step_input=step_input,
             feature_acts=feature_acts,
             hidden_pre=hidden_pre,
             sae_out=sae_out,
         )
-
-        # Total loss is MSE plus all auxiliary losses
         total_loss = mse_loss
-
-        # Create losses dictionary with mse_loss
         losses = {"mse_loss": mse_loss}
-
-        # Add architecture-specific losses to the dictionary
-        # Make sure aux_losses is a dictionary with string keys and tensor values
         if isinstance(aux_losses, dict):
             losses.update(aux_losses)
-
-        # Sum all losses for total_loss
         if isinstance(aux_losses, dict):
             for loss_value in aux_losses.values():
                 total_loss = total_loss + loss_value
         else:
-            # Handle case where aux_losses is a tensor
             total_loss = total_loss + aux_losses
-
         return TrainStepOutput(
             sae_in=step_input.sae_in,
             sae_out=sae_out,
@@ -1031,6 +1017,17 @@ class TrainingSAE(SAE[T_TRAINING_SAE_CONFIG], ABC):
             hidden_pre=hidden_pre,
             loss=total_loss,
             losses=losses,
+        )
+
+    def training_forward_pass(
+        self,
+        step_input: TrainStepInput,
+    ) -> TrainStepOutput:
+        """Forward pass during training."""
+        feature_acts, hidden_pre = self.encode_with_hidden_pre(step_input.sae_in)
+        sae_out = self.decode(feature_acts)
+        return self._build_train_step_output(
+            step_input, feature_acts, hidden_pre, sae_out
         )
 
     def save_inference_model(self, path: str | Path) -> tuple[Path, Path]:
