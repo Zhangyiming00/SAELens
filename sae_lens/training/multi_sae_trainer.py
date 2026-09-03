@@ -38,7 +38,14 @@ from sae_lens.constants import (
 )
 from sae_lens.profiling import cuda_nvtx_range, nccl_nvtx_range
 from sae_lens.saes.sae import TrainingSAE, TrainStepInput, TrainStepOutput
+from sae_lens.saes.topk_sae import TopKTrainingSAE
 from sae_lens.training.activation_scaler import ActivationScaler
+from sae_lens.training.ddp_overlap_v2 import (
+    DDPOptimizerOverlapState,
+    TPPostSharedMemory,
+    apply_clip_coef_,
+    tp_post_cpu_shm_prepare_clip,
+)
 from sae_lens.training.multi_hook_sae import MultiHookSAE
 from sae_lens.training.optim import get_lr_scheduler
 from sae_lens.training.sae_trainer import (
@@ -181,6 +188,138 @@ class MultiSAETrainer:
         elif _adam_impl == "forloop":
             _adam_kwargs["foreach"] = False
         self.optimizer = Adam(params, **_adam_kwargs)
+
+        # Experimental per-hook DP-reduction -> optimizer overlap.  The raw
+        # MultiHookSAE remains the state-dict owner, while each child executes
+        # through an independent bucket-view DDP reducer.
+        requested_overlap_mode = getattr(cfg, "multi_sae_optimizer_overlap", "off")
+        if os.environ.get("SAE_DDP_OPT_OVERLAP_V2", "0") == "1":
+            requested_overlap_mode = "on"
+        if requested_overlap_mode not in ("off", "on", "non_tp_only"):
+            raise ValueError(
+                "multi_sae_optimizer_overlap must be 'off', 'on', or 'non_tp_only'"
+            )
+        tp_mode = self._tp_world_size() > 1
+        overlap_requested_here = requested_overlap_mode == "on" or (
+            requested_overlap_mode == "non_tp_only" and not tp_mode
+        )
+        # With one local hook or one DP rank there is no cross-hook DDP/optimizer
+        # overlap to exploit.  This is important for uneven PP assignment (e.g.
+        # H=3, PP=2): the H=2 stage takes the new path, while the H=1 stage safely
+        # falls back without changing its optimizer behavior.
+        if (
+            overlap_requested_here
+            and len(self.hook_names) > 1
+            and self._dp_world_size() > 1
+            and not self._is_ddp
+        ):
+            raise ValueError("multi_sae_optimizer_overlap requires sae_dp_mode='ddp'")
+        self._ddp_opt_overlap_v2 = (
+            overlap_requested_here
+            and len(self.hook_names) > 1
+            and self._is_ddp
+            and self._dp_world_size() > 1
+        )
+        self._overlap_optimizer_by_hook: dict[str, Adam] = {}
+        self._overlap_optimizer_done_by_hook: dict[str, torch.cuda.Event] = {}
+        self._overlap_post_ready_by_hook: dict[str, torch.cuda.Event] = {}
+        self._overlap_ddp_state: DDPOptimizerOverlapState | None = None
+        self._overlap_tp_post: TPPostSharedMemory | None = None
+        self._overlap_optimizer_stream: torch.cuda.Stream | None = None
+        self._overlap_backward_done: torch.cuda.Event | None = None
+        self._tp_phase_fence_mode = os.environ.get(
+            "SAE_TP_PHASE_FENCE",
+            getattr(cfg, "multi_sae_tp_phase_fence", "auto"),
+        ).lower()
+        if self._tp_phase_fence_mode not in ("auto", "always", "off"):
+            raise ValueError(
+                "multi_sae_tp_phase_fence/SAE_TP_PHASE_FENCE must be auto|always|off"
+            )
+        self._tp_phase_event: torch.cuda.Event | None = None
+        if torch.cuda.is_available():
+            self._tp_phase_event = torch.cuda.Event(blocking=False, interprocess=False)
+        if self._ddp_opt_overlap_v2:
+            if not self._is_ddp or self._is_fsdp:
+                raise ValueError(
+                    "multi_sae_optimizer_overlap requires sae_dp_mode='ddp'"
+                )
+            if self.multi_sae_distributed_architecture != "unified_multi_hook":
+                raise ValueError(
+                    "multi_sae_optimizer_overlap requires unified_multi_hook so all "
+                    "hooks share one combined DDP backward"
+                )
+            if self.backward_mode != "combined":
+                raise ValueError(
+                    "multi_sae_optimizer_overlap requires combined backward"
+                )
+            if cfg.autocast:
+                raise ValueError(
+                    "multi_sae_optimizer_overlap currently requires autocast=False"
+                )
+            if not torch.cuda.is_available():
+                raise ValueError(
+                    "multi_sae_optimizer_overlap currently requires CUDA"
+                )
+
+            if not isinstance(self.multi_hook_sae, MultiHookSAE):
+                raise ValueError(
+                    "multi_sae_optimizer_overlap expected a MultiHookSAE root"
+                )
+            if self.dp_group is None:
+                raise ValueError("DDP optimizer overlap requires a DP process group")
+            first_device = self.base_sae_by_hook[self.hook_names[0]].device
+            self._overlap_optimizer_stream = torch.cuda.Stream(device=first_device)
+            self._overlap_backward_done = torch.cuda.Event(
+                blocking=False, interprocess=False
+            )
+
+            for hook_name in self.hook_names:
+                base_sae = self.base_sae_by_hook[hook_name]
+                self._overlap_optimizer_by_hook[hook_name] = Adam(
+                    list(base_sae.parameters()), **_adam_kwargs
+                )
+                self._overlap_optimizer_done_by_hook[hook_name] = torch.cuda.Event(
+                    blocking=False, interprocess=False
+                )
+                self._overlap_post_ready_by_hook[hook_name] = torch.cuda.Event(
+                    blocking=False, interprocess=False
+                )
+
+            ddp_by_hook = self.multi_hook_sae.ddp_forward_modules()
+            if set(ddp_by_hook) != set(self.hook_names):
+                raise ValueError(
+                    "multi_sae_optimizer_overlap requires one DDP reducer per hook"
+                )
+            self._overlap_ddp_state = DDPOptimizerOverlapState(
+                list(self.hook_names), ddp_by_hook, self.dp_group
+            )
+
+            tp_group = self._tp_group()
+            if tp_group is not None and dist.get_world_size(tp_group) > 1:
+                if os.environ.get("SAE_TP_POST_TRANSPORT", "cpu_shm") != "cpu_shm":
+                    raise ValueError(
+                        "TP optimizer-overlap currently supports "
+                        "SAE_TP_POST_TRANSPORT=cpu_shm only"
+                    )
+                replicated_sizes: list[int] = []
+                for hook_name in self.hook_names:
+                    hook_sae = self.base_sae_by_hook[hook_name]
+                    if not isinstance(hook_sae, TopKTrainingSAE):
+                        raise TypeError(
+                            "TP optimizer-overlap CPU-post currently supports "
+                            "TopKTrainingSAE only"
+                        )
+                    shard_dims = hook_sae._tp_param_shard_dims()
+                    replicated_sizes.extend(
+                        param.numel()
+                        for name, param in hook_sae.named_parameters()
+                        if shard_dims.get(name) is None
+                    )
+                self._overlap_tp_post = TPPostSharedMemory(
+                    tp_group=tp_group,
+                    max_numel=max(replicated_sizes, default=1),
+                    output_path=getattr(cfg, "output_path", None),
+                )
         self.lr_scheduler = get_lr_scheduler(
             scheduler_name=cfg.lr_scheduler_name,
             optimizer=self.optimizer,
@@ -330,6 +469,7 @@ class MultiSAETrainer:
             cfg.output_path is not None
             and getattr(cfg, "save_memory_every_n_steps", 0) > 0
         )
+        self._memory_phase_step_active = False
         if self._profile_memory:
             output_path = Path(cfg.output_path)  # type: ignore[arg-type]
             output_path.mkdir(exist_ok=True, parents=True)
@@ -588,7 +728,7 @@ class MultiSAETrainer:
             sae_t0 = time.perf_counter()
             self._memory_retained_outputs = self._memory_current_outputs
             self._memory_current_outputs = None
-            if self._profile_memory:
+            if self._memory_phase_step_active:
                 torch.cuda.reset_peak_memory_stats(self.cfg.device)
             with cuda_nvtx_range("multi_sae:train_step"):
                 outputs, sae_phase_timing = self._train_step(scaled_batch_by_hook, local_n)
@@ -596,7 +736,7 @@ class MultiSAETrainer:
             self._maybe_synchronize_timing()
             sae_time_s = time.perf_counter() - sae_t0
 
-            if self._profile_memory:
+            if self._memory_phase_step_active:
                 memory_stats = self._aggregate_memory_phase_stats()
             else:
                 memory_stats = {}
@@ -654,6 +794,11 @@ class MultiSAETrainer:
             _save_quiesce_checkpoint()
         if self.cfg.save_final_checkpoint and not quiesce_checkpoint_saved:
             self.save_checkpoint(checkpoint_name=f"final_{self.n_training_samples}")
+        if self._overlap_tp_post is not None:
+            self._overlap_tp_post.close()
+            self._overlap_tp_post = None
+        if self._overlap_ddp_state is not None:
+            self._overlap_ddp_state.close()
         return self.base_sae_by_hook
 
     def _train_step(
@@ -669,7 +814,16 @@ class MultiSAETrainer:
             for sae in self.sae_by_hook.values():
                 sae.train()
 
+        if self._ddp_opt_overlap_v2:
+            # The scheduler is intentionally attached to the legacy aggregate
+            # optimizer; mirror its current LR into the actual per-hook optimizers.
+            lr = float(self.optimizer.param_groups[0]["lr"])
+            for optimizer in self._overlap_optimizer_by_hook.values():
+                for group in optimizer.param_groups:
+                    group["lr"] = lr
         self.optimizer.zero_grad(set_to_none=True)
+        for optimizer in self._overlap_optimizer_by_hook.values():
+            optimizer.zero_grad(set_to_none=True)
         self._record_memory_phase("after_zero_grad_start")
         outputs: dict[str, TrainStepOutput] = {}
         phase_timing = {
@@ -703,6 +857,13 @@ class MultiSAETrainer:
                 return outputs, phase_timing
             dp_world_size = self._dp_world_size()
             loss_scale = dp_world_size * float(local_n) / global_n
+        if self._ddp_opt_overlap_v2:
+            return self._train_step_ddp_optimizer_overlap_v2(
+                batch_by_hook,
+                local_n,
+                loss_scale,
+                phase_timing,
+            )
         if self.backward_mode == "combined":
             return self._train_step_combined_backward(
                 batch_by_hook, local_n, loss_scale, phase_timing
@@ -711,12 +872,216 @@ class MultiSAETrainer:
             batch_by_hook, local_n, loss_scale, phase_timing
         )
 
+    def _tp_world_size(self) -> int:
+        group = self._tp_group()
+        if group is None or not dist.is_available() or not dist.is_initialized():
+            return 1
+        return dist.get_world_size(group)
+
+    def _tp_phase_fence_if_needed(self) -> None:
+        """Fence a completed TP phase before traffic on a different NCCL group.
+
+        ``auto`` is intentionally narrow: it is active only for the new local
+        cross-hook TP forward when either (a) this SAE also has a distinct,
+        multi-rank DDP communicator or (b) producer and SAE roles share this rank.
+        ``always`` is a debug/safety override and ``off`` preserves the fully
+        asynchronous behavior.
+        The fence is placed *after* the whole cross-hook TP wavefront, never
+        between hooks, so it does not destroy H_i/H_(i+1) forward overlap.
+        """
+
+        mode = self._tp_phase_fence_mode
+        if mode == "off" or self._tp_world_size() <= 1 or self._tp_phase_event is None:
+            return
+        if mode == "auto":
+            # Auto is for the *new cross-hook TP forward* only.  Legacy per-hook
+            # TP remains untouched unless the user explicitly chooses always.
+            cross_hook_tp_forward = len(self.hook_names) > 1 and (
+                self.multi_sae_distributed_architecture == "unified_multi_hook"
+            )
+            producer_sae_overlap = bool(
+                getattr(
+                    self.cfg,
+                    "multi_sae_tp_phase_fence_runtime_hazard",
+                    False,
+                )
+            )
+            distinct_dp_group = (
+                self._is_ddp
+                and self._dp_world_size() > 1
+                and self.dp_group is not None
+                and self.dp_group is not self._tp_group()
+            )
+            if not cross_hook_tp_forward or not (
+                producer_sae_overlap or distinct_dp_group
+            ):
+                return
+        current = torch.cuda.current_stream(torch.device(self.cfg.device))
+        self._tp_phase_event.record(current)
+        # Host-visible by design.  This is a phase fence, not a per-collective
+        # synchronization; it prevents rank-dependent TP/DP enqueue interleaving.
+        self._tp_phase_event.synchronize()
+
+    def _train_step_ddp_optimizer_overlap_v2(
+        self,
+        batch_by_hook: dict[str, torch.Tensor],
+        local_n: int,
+        loss_scale: float,
+        phase_timing: dict[str, float],
+    ) -> tuple[dict[str, TrainStepOutput], dict[str, float]]:
+        """Run one combined backward and overlap per-hook post/optimizer work.
+
+        Per-hook DDP buckets launch as soon as each bucket becomes ready in the
+        normal combined autograd traversal.  The comm hook does not add the real
+        Work to the backward stream, so this returns once every hook's compute
+        has been enqueued.  Only then may the optimizer stream wait for one
+        hook's buckets and update it.  TP post-processing stays on CPU shared
+        memory and cannot reorder the still-running DP/NCCL collectives.
+        """
+
+        state = self._overlap_ddp_state
+        opt_stream = self._overlap_optimizer_stream
+        backward_done = self._overlap_backward_done
+        if state is None or opt_stream is None or backward_done is None:
+            raise RuntimeError("DDP optimizer overlap V2 was not initialized")
+        if self.multi_hook_sae is None:
+            raise RuntimeError("DDP optimizer overlap requires a MultiHookSAE owner")
+
+        state.begin_step()
+
+        inputs: dict[str, TrainStepInput] = {}
+        for hook_name in self.hook_names:
+            acts = batch_by_hook[hook_name]
+            if local_n == 0:
+                acts = torch.zeros(
+                    1,
+                    self.base_sae_by_hook[hook_name].cfg.d_in,
+                    device=self.cfg.device,
+                    dtype=acts.dtype,
+                )
+            inputs[hook_name] = self._build_step_input(hook_name, acts)
+
+        t_fwd = time.perf_counter()
+        with cuda_nvtx_range("multi_sae:overlap_v4_forward"):
+            with self.autocast_if_enabled:
+                outputs = self.multi_hook_sae(inputs)
+        phase_timing["sae_forward_time_s"] += time.perf_counter() - t_fwd
+        self._memory_current_outputs = outputs
+        self._record_memory_phase("after_forward_all")
+
+        # One boundary after the entire TP wavefront.  auto is a no-op when
+        # there is no multi-rank DDP communicator to interleave with TP.
+        self._tp_phase_fence_if_needed()
+
+        scaled_losses: list[torch.Tensor] = []
+        for hook_name in self.hook_names:
+            output = outputs[hook_name]
+            if local_n != 0:
+                t_stats = time.perf_counter()
+                with cuda_nvtx_range(f"multi_sae:{hook_name}:stats_sync"):
+                    self._update_stats(hook_name, output, local_n)
+                phase_timing["sae_stats_sync_time_s"] += time.perf_counter() - t_stats
+            scaled_losses.append(
+                output.loss * (loss_scale if local_n != 0 else 0.0)
+            )
+
+        t_bwd = time.perf_counter()
+        with nccl_nvtx_range(
+            "nccl:multi_sae_dp_overlap_v4_combined_backward",
+            self.dp_group,
+        ):
+            with cuda_nvtx_range("multi_sae:dp_overlap_v4_combined_backward"):
+                sum(scaled_losses).backward()
+        state.end_backward()
+        backward_done.record(torch.cuda.current_stream(torch.device(self.cfg.device)))
+        phase_timing["sae_backward_time_s"] += time.perf_counter() - t_bwd
+        # A device-wide synchronization here would wait for every outstanding
+        # DDP reduction and erase the overlap this path is designed to create.
+        # CUDA allocator counters are host-side, so an enqueue-boundary snapshot
+        # remains useful without draining the device.
+        self._record_memory_phase("after_combined_backward", synchronize=False)
+
+        t_post = time.perf_counter()
+        tp_mode = self._tp_world_size() > 1
+        order = state.completion_order(list(reversed(self.hook_names)))
+        previous_opt_done: torch.cuda.Event | None = None
+        if tp_mode:
+            for hook_name in order:
+                base_sae = self.base_sae_by_hook[hook_name]
+                if (
+                    not isinstance(base_sae, TopKTrainingSAE)
+                    or self._overlap_tp_post is None
+                ):
+                    raise RuntimeError(
+                        "TP optimizer-overlap requires TopKTrainingSAE + cpu_shm reducer"
+                    )
+
+                # .cpu() below is the host-visible wait for this hook only.  The
+                # remaining DP reductions keep progressing on their NCCL streams.
+                current_stream = torch.cuda.current_stream(base_sae.device)
+                current_stream.wait_event(backward_done)
+                state.wait_for_hook(hook_name)
+                with cuda_nvtx_range(f"multi_sae:{hook_name}:tp_post_cpu_shm"):
+                    coef = tp_post_cpu_shm_prepare_clip(
+                        base_sae,
+                        self._overlap_tp_post,
+                    )
+                post_ready = self._overlap_post_ready_by_hook[hook_name]
+                post_ready.record(current_stream)
+                optimizer = self._overlap_optimizer_by_hook[hook_name]
+                opt_done = self._overlap_optimizer_done_by_hook[hook_name]
+                with torch.cuda.stream(opt_stream):
+                    opt_stream.wait_event(post_ready)
+                    with cuda_nvtx_range(f"multi_sae:{hook_name}:clip_scale_v4"):
+                        apply_clip_coef_(base_sae, coef)
+                    with cuda_nvtx_range(f"multi_sae:{hook_name}:optimizer_step_v4"):
+                        optimizer.step()
+                    opt_done.record(opt_stream)
+                previous_opt_done = opt_done
+        else:
+            # A single stream preserves optimizer ordering.  Each wait is scoped
+            # to this hook's parameters, so the first ready hook can update while
+            # later hook reductions are still in flight.
+            with torch.cuda.stream(opt_stream):
+                opt_stream.wait_event(backward_done)
+                for hook_name in order:
+                    base_sae = self.base_sae_by_hook[hook_name]
+                    optimizer = self._overlap_optimizer_by_hook[hook_name]
+                    opt_done = self._overlap_optimizer_done_by_hook[hook_name]
+                    state.wait_for_hook(hook_name)
+                    with cuda_nvtx_range(f"multi_sae:{hook_name}:clip_grad_v4"):
+                        base_sae.clip_grad_norm_(1.0)
+                    with cuda_nvtx_range(f"multi_sae:{hook_name}:optimizer_step_v4"):
+                        optimizer.step()
+                    opt_done.record(opt_stream)
+                    previous_opt_done = opt_done
+
+        phase_timing["sae_post_backward_time_s"] += time.perf_counter() - t_post
+        t_opt = time.perf_counter()
+        # There is no useful cross-hook communication left after the last hook.
+        # A host wait here also makes set_to_none zero_grad on the next step safe
+        # for gradients consumed by the side optimizer stream.
+        if previous_opt_done is not None:
+            previous_opt_done.synchronize()
+        state.finish_step()
+        self._record_memory_phase("after_optimizer_step")
+        t_stats = time.perf_counter()
+        with cuda_nvtx_range("multi_sae:stats_sync_tail"):
+            self._sync_deferred_stats_if_needed(force=False)
+        phase_timing["sae_stats_sync_time_s"] += time.perf_counter() - t_stats
+        phase_timing["sae_optimizer_time_s"] += time.perf_counter() - t_opt
+        self._record_memory_phase("after_stats_tail")
+        return outputs, phase_timing
+
     def _train_step_unified_zero_backward(
         self,
         batch_by_hook: dict[str, torch.Tensor],
         phase_timing: dict[str, float],
     ) -> None:
         assert self.multi_hook_sae is not None
+        overlap_state = self._overlap_ddp_state
+        if overlap_state is not None:
+            overlap_state.begin_step()
         step_inputs_by_hook: dict[str, TrainStepInput] = {}
         for hook_name in self.hook_names:
             acts = batch_by_hook[hook_name]
@@ -732,13 +1097,24 @@ class MultiSAETrainer:
             with self.autocast_if_enabled:
                 outputs = self.multi_hook_sae(step_inputs_by_hook)
         phase_timing["sae_forward_time_s"] += time.perf_counter() - t_fwd
+        self._tp_phase_fence_if_needed()
         total_loss = sum(output.loss * 0.0 for output in outputs.values())
         t_bwd = time.perf_counter()
         with cuda_nvtx_range("multi_sae:combined_backward"):
             self.grad_scaler.scale(total_loss).backward()
         phase_timing["sae_backward_time_s"] += time.perf_counter() - t_bwd
+        if overlap_state is not None:
+            overlap_state.end_backward()
+            for hook_name in overlap_state.completion_order(
+                list(reversed(self.hook_names))
+            ):
+                overlap_state.wait_for_hook(hook_name)
+            torch.cuda.current_stream(torch.device(self.cfg.device)).synchronize()
+            overlap_state.finish_step()
         self.grad_scaler.unscale_(self.optimizer)
         self.optimizer.zero_grad(set_to_none=True)
+        for optimizer in self._overlap_optimizer_by_hook.values():
+            optimizer.zero_grad(set_to_none=True)
 
     def _train_step_sequential_backward(
         self,
@@ -936,6 +1312,10 @@ class MultiSAETrainer:
                 with self.autocast_if_enabled:
                     outputs = self.multi_hook_sae(step_inputs_by_hook)
         phase_timing["sae_forward_time_s"] += time.perf_counter() - t_fwd
+        # Default TP x DDP path: MultiHookSAE already executed the cross-hook TP
+        # wavefront above.  Fence only at the TP->DP phase boundary when policy
+        # requests it; never fence between local hooks.
+        self._tp_phase_fence_if_needed()
 
         scaled_losses: list[torch.Tensor] = []
         for hook_name in self.hook_names:
@@ -1047,7 +1427,9 @@ class MultiSAETrainer:
                 else contextlib.nullcontext()
             )
             with context:
-                return self.sae_by_hook[hook_name](step_input)
+                output = self.sae_by_hook[hook_name](step_input)
+        self._tp_phase_fence_if_needed()
+        return output
 
     def _ordered_hook_names_for_backward(self) -> list[str]:
         if self.backward_order == "forward":
@@ -1593,8 +1975,12 @@ class MultiSAETrainer:
         for hook_name in self.hook_names:
             base_sae = self.base_sae_by_hook[hook_name]
             hook_state: dict[str, dict[str, Any]] = {}
+            state_optimizer = self._overlap_optimizer_by_hook.get(
+                hook_name,
+                self.optimizer,
+            )
             for name, param in base_sae.named_parameters():
-                state = self.optimizer.state.get(param)
+                state = state_optimizer.state.get(param)
                 if not state:
                     continue
                 hook_state[name] = {
@@ -1614,8 +2000,14 @@ class MultiSAETrainer:
         already_processed: bool = False,
     ) -> None:
         self.optimizer.state.clear()
+        for optimizer in self._overlap_optimizer_by_hook.values():
+            optimizer.state.clear()
         for hook_name in self.hook_names:
             base_sae = self.base_sae_by_hook[hook_name]
+            state_optimizer = self._overlap_optimizer_by_hook.get(
+                hook_name,
+                self.optimizer,
+            )
             hook_state = deepcopy(optimizer_state_by_hook.get(hook_name, {}))
             if not already_processed:
                 base_sae.process_named_optimizer_state_for_loading(hook_state)
@@ -1638,7 +2030,7 @@ class MultiSAETrainer:
                         )
                     else:
                         loaded_state[key] = deepcopy(value)
-                self.optimizer.state[param] = loaded_state
+                state_optimizer.state[param] = loaded_state
 
     def _load_checkpoint_models(self, checkpoint_path: Path) -> None:
         if self.multi_sae_distributed_architecture == "unified_multi_hook":
@@ -1939,7 +2331,12 @@ class MultiSAETrainer:
 
     def _start_memory_phase_step(self) -> None:
         if not self._profile_memory:
+            self._memory_phase_step_active = False
             return
+        save_every = int(getattr(self.cfg, "save_memory_every_n_steps", 0))
+        self._memory_phase_step_active = (
+            save_every > 0 and (self.n_training_steps + 1) % save_every == 0
+        )
         self._memory_phase_records = []
 
     def _device_sampler_loop(self, wall_t0: float) -> None:
@@ -1987,7 +2384,7 @@ class MultiSAETrainer:
         self._device_sampler_thread = None
 
     def _reset_memory_phase_peak(self) -> None:
-        if not self._profile_memory:
+        if not self._memory_phase_step_active:
             return
         torch.cuda.reset_peak_memory_stats(self.cfg.device)
 
@@ -2092,13 +2489,17 @@ class MultiSAETrainer:
         grad_bytes = 0
         optimizer_state_bytes = 0
 
-        for sae in self.sae_by_hook.values():
+        for hook_name, sae in self.sae_by_hook.items():
+            state_optimizer = self._overlap_optimizer_by_hook.get(
+                hook_name,
+                self.optimizer,
+            )
             for param in sae.parameters():
                 if param.device.type == "cuda":
                     param_bytes += self._tensor_tree_bytes(param, seen)
                 if param.grad is not None and param.grad.device.type == "cuda":
                     grad_bytes += self._tensor_tree_bytes(param.grad, seen)
-                state = self.optimizer.state.get(param, {})
+                state = state_optimizer.state.get(param, {})
                 optimizer_state_bytes += self._tensor_tree_bytes(state, seen)
 
         trainer_buffer_values: list[Any] = [
@@ -2154,8 +2555,8 @@ class MultiSAETrainer:
             "unattributed_allocated_mb": (allocated_bytes - known_live_bytes) * to_mb,
         }
 
-    def _record_memory_phase(self, phase: str) -> None:
-        if not self._profile_memory:
+    def _record_memory_phase(self, phase: str, *, synchronize: bool = True) -> None:
+        if not self._memory_phase_step_active:
             return
         # Optional: force the caching allocator to release empty blocks back
         # to the CUDA driver before the snapshot, so driver_used_mb reflects
@@ -2163,13 +2564,14 @@ class MultiSAETrainer:
         # default — empty_cache stalls the device and adds tens of ms per
         # phase, so we only flip it on for memory-profiling runs. Enabled via
         # cfg.record_memory_empty_cache (or the legacy SAE_RECORD_EMPTY_CACHE=1).
-        if (
-            getattr(self.cfg, "record_memory_empty_cache", False)
-            or os.environ.get("SAE_RECORD_EMPTY_CACHE") == "1"
-        ):
+        if synchronize:
+            if (
+                getattr(self.cfg, "record_memory_empty_cache", False)
+                or os.environ.get("SAE_RECORD_EMPTY_CACHE") == "1"
+            ):
+                torch.cuda.synchronize(self.cfg.device)
+                torch.cuda.empty_cache()
             torch.cuda.synchronize(self.cfg.device)
-            torch.cuda.empty_cache()
-        torch.cuda.synchronize(self.cfg.device)
         free_bytes, total_bytes = torch.cuda.mem_get_info(self.cfg.device)
         record = {
             "step": self.n_training_steps + 1,
@@ -2332,10 +2734,7 @@ class MultiSAETrainer:
         }
 
     def _record_memory_if_needed(self, memory_stats: dict[str, float]) -> None:
-        if self.memory_history_path is None:
-            return
-        save_every = getattr(self.cfg, "save_memory_every_n_steps", 0)
-        if (self.n_training_steps + 1) % save_every != 0:
+        if self.memory_history_path is None or not self._memory_phase_step_active:
             return
         record: dict[str, object] = {
             "step": self.n_training_steps + 1,

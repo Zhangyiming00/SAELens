@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Mapping
 from typing import Any, cast
 
 import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from sae_lens.saes.sae import TrainingSAE, TrainStepInput, TrainStepOutput
 from sae_lens.saes.topk_sae import TopKTrainingSAE, TopKTPWavefrontState
@@ -15,7 +17,9 @@ def _sanitize_module_key(hook_name: str) -> str:
 
 
 class MultiHookSAE(torch.nn.Module):
-    """Single distributed owner for a fixed ordered set of hook SAEs."""
+    """Single state owner for a fixed ordered set of hook SAEs."""
+
+    _ddp_forward_by_hook: dict[str, DDP]
 
     def __init__(
         self,
@@ -52,6 +56,46 @@ class MultiHookSAE(torch.nn.Module):
             self.hook_by_module_key[module_key] = hook_name
             modules[module_key] = sae_by_hook[hook_name]
         self.saes = torch.nn.ModuleDict(modules)
+        # The DDP wrappers intentionally stay outside ``self._modules``.  The raw
+        # SAEs remain the single state-dict owner, while these wrappers provide
+        # one independent reducer/bucket sequence per hook for overlap mode.
+        object.__setattr__(self, "_ddp_forward_by_hook", {})
+
+    def set_ddp_forward_modules(
+        self,
+        ddp_by_hook: Mapping[str, DDP],
+    ) -> None:
+        if set(ddp_by_hook) != set(self.hook_names):
+            raise ValueError(
+                "Per-hook DDP modules require the exact hook set "
+                f"{self.hook_names}; got {sorted(ddp_by_hook)}"
+            )
+        wrappers: dict[str, DDP] = {}
+        for hook_name in self.hook_names:
+            wrapper = ddp_by_hook[hook_name]
+            if not isinstance(wrapper, DDP):
+                raise TypeError(
+                    f"DDP wrapper for hook {hook_name!r} has type "
+                    f"{type(wrapper).__name__}"
+                )
+            raw_sae = self.saes[self.module_key_by_hook[hook_name]]
+            if wrapper.module is not raw_sae:
+                raise ValueError(
+                    f"DDP wrapper for hook {hook_name!r} does not own its raw SAE"
+                )
+            wrappers[hook_name] = wrapper
+        object.__setattr__(self, "_ddp_forward_by_hook", wrappers)
+
+    def ddp_forward_modules(self) -> dict[str, DDP]:
+        return dict(self._ddp_forward_by_hook)
+
+    def _ddp_forward_context(self, hook_name: str) -> Any:
+        ddp = self._ddp_forward_by_hook.get(hook_name)
+        return (
+            ddp._inside_ddp_forward()
+            if ddp is not None
+            else contextlib.nullcontext()
+        )
 
     def _forward_serial(
         self,
@@ -60,7 +104,11 @@ class MultiHookSAE(torch.nn.Module):
         outputs: dict[str, TrainStepOutput] = {}
         for hook_name in self.hook_names:
             module_key = self.module_key_by_hook[hook_name]
-            output = self.saes[module_key](inputs_by_hook[hook_name])
+            module = self._ddp_forward_by_hook.get(
+                hook_name,
+                self.saes[module_key],
+            )
+            output = module(inputs_by_hook[hook_name])
             if not isinstance(output, TrainStepOutput):
                 raise TypeError(
                     f"SAE for hook {hook_name!r} returned {type(output).__name__}, "
@@ -92,22 +140,41 @@ class MultiHookSAE(torch.nn.Module):
         inputs_by_hook: dict[str, TrainStepInput],
     ) -> dict[str, TrainStepOutput]:
         """Overlap adjacent hooks' TP all-gathers and decoder all-reduces."""
+        if self._ddp_forward_by_hook:
+            # TP wavefront splits each child forward into multiple calls, so
+            # bracket them with the same reducer lifecycle used by DDP.forward.
+            prepared_inputs: dict[str, TrainStepInput] = {}
+            for hook_name in self.hook_names:
+                ddp = self._ddp_forward_by_hook[hook_name]
+                args, kwargs = ddp._pre_forward(inputs_by_hook[hook_name])
+                if kwargs or len(args) != 1 or not isinstance(args[0], TrainStepInput):
+                    raise RuntimeError(
+                        "Per-hook DDP TP wavefront expected one TrainStepInput"
+                    )
+                prepared_inputs[hook_name] = args[0]
+            inputs_by_hook = prepared_inputs
+
         states: dict[str, TopKTPWavefrontState] = {}
         current_hook = self.hook_names[0]
         current_sae = cast(
             TopKTrainingSAE, self.saes[self.module_key_by_hook[current_hook]]
         )
-        current_state = current_sae.tp_wavefront_encode_launch(
-            inputs_by_hook[current_hook]
-        )
+        with self._ddp_forward_context(current_hook):
+            current_state = current_sae.tp_wavefront_encode_launch(
+                inputs_by_hook[current_hook]
+            )
 
         for next_hook in self.hook_names[1:]:
             next_sae = cast(
                 TopKTrainingSAE, self.saes[self.module_key_by_hook[next_hook]]
             )
             # AG(current) overlaps this next hook's local encoder work.
-            next_state = next_sae.tp_wavefront_encode_launch(inputs_by_hook[next_hook])
-            current_sae.tp_wavefront_decode_launch(current_state)
+            with self._ddp_forward_context(next_hook):
+                next_state = next_sae.tp_wavefront_encode_launch(
+                    inputs_by_hook[next_hook]
+                )
+            with self._ddp_forward_context(current_hook):
+                current_sae.tp_wavefront_decode_launch(current_state)
             states[current_hook] = current_state
             current_hook, current_sae, current_state = (
                 next_hook,
@@ -115,16 +182,31 @@ class MultiHookSAE(torch.nn.Module):
                 next_state,
             )
 
-        current_sae.tp_wavefront_decode_launch(current_state)
+        with self._ddp_forward_context(current_hook):
+            current_sae.tp_wavefront_decode_launch(current_state)
         states[current_hook] = current_state
 
-        return {
-            hook_name: cast(
-                TopKTrainingSAE,
-                self.saes[self.module_key_by_hook[hook_name]],
-            ).tp_wavefront_finish(states[hook_name])
-            for hook_name in self.hook_names
-        }
+        outputs: dict[str, TrainStepOutput] = {}
+        for hook_name in self.hook_names:
+            with self._ddp_forward_context(hook_name):
+                outputs[hook_name] = cast(
+                    TopKTrainingSAE,
+                    self.saes[self.module_key_by_hook[hook_name]],
+                ).tp_wavefront_finish(states[hook_name])
+        if self._ddp_forward_by_hook:
+            outputs = {
+                hook_name: self._ddp_forward_by_hook[hook_name]._post_forward(
+                    outputs[hook_name]
+                )
+                for hook_name in self.hook_names
+            }
+        return outputs
+
+    def train(self, mode: bool = True) -> MultiHookSAE:
+        super().train(mode)
+        for ddp in self._ddp_forward_by_hook.values():
+            ddp.train(mode)
+        return self
 
     def forward(
         self,

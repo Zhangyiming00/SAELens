@@ -820,6 +820,28 @@ class LanguageModelSAETrainingRunner:
                     "cfg.model_from_pretrained_kwargs['tensor_parallel_size']"
                 )
 
+        overlap_mode = self.cfg.multi_sae_optimizer_overlap
+        if os.environ.get("SAE_DDP_OPT_OVERLAP_V2", "0") == "1":
+            overlap_mode = "on"
+            self.cfg.multi_sae_optimizer_overlap = "on"
+        overlap_uses_per_hook_ddp = (
+            self.sae_dp_size > 1
+            and self.cfg.sae_dp_mode == "ddp"
+            and (
+                overlap_mode == "on"
+                or (overlap_mode == "non_tp_only" and self.sae_tp_size <= 1)
+            )
+        )
+        if (
+            overlap_uses_per_hook_ddp
+            and self.cfg.multi_sae_distributed_architecture == "legacy_per_hook_wrapper"
+        ):
+            logger.warning(
+                "multi_sae_optimizer_overlap requires one combined module owner; "
+                "switching the wrapper architecture to unified_multi_hook."
+            )
+            self.cfg.multi_sae_distributed_architecture = "unified_multi_hook"
+
         self._quiesce_dir = quiesce_dir
         self.streaming_mode = effective_streaming_mode
 
@@ -1442,6 +1464,16 @@ class LanguageModelSAETrainingRunner:
                 forward_prefetch=self.cfg.fsdp_forward_prefetch,
             )
         elif sae_dp_world_size > 1:
+            if self._per_hook_ddp_overlap_enabled(len(self._pp_hook_names)):
+                self._attach_per_hook_overlap_ddp(
+                    raw_multi_hook_sae,
+                    sae_dp_group,
+                )
+                logger.info(
+                    "multi_sae_optimizer_overlap uses one bucket-view DDP reducer "
+                    "per hook with a combined backward."
+                )
+                return
             from torch.nn.parallel import DistributedDataParallel as DDP
 
             device_ids = None
@@ -1463,14 +1495,73 @@ class LanguageModelSAETrainingRunner:
                 **self._resolve_ddp_kwargs(),
             )
 
-    def _resolve_ddp_kwargs(self) -> dict[str, Any]:
-        ddp_kwargs: dict[str, Any] = {}
+    def _per_hook_ddp_overlap_enabled(self, local_hook_count: int) -> bool:
+        if local_hook_count <= 1 or self.sae_dp_size <= 1:
+            return False
+        mode = self.cfg.multi_sae_optimizer_overlap
+        return mode == "on" or (
+            mode == "non_tp_only" and self.sae_tp_size <= 1
+        )
+
+    def _attach_per_hook_overlap_ddp(
+        self,
+        module: MultiHookSAE,
+        group: "dist.ProcessGroup | None",
+    ) -> None:
+        if group is None:
+            raise ValueError("DDP optimizer overlap requires a DP process group")
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        device_ids = None
+        output_device = None
+        device = torch.device(self.cfg.device)
+        if device.type == "cuda":
+            device_index = (
+                device.index
+                if device.index is not None
+                else torch.cuda.current_device()
+            )
+            device_ids = [device_index]
+            output_device = device_index
+
+        if self.cfg.ddp_gradient_as_bucket_view is False:
+            logger.warning(
+                "multi_sae_optimizer_overlap requires DDP bucket-backed gradients; "
+                "overriding gradient_as_bucket_view=True."
+            )
+        ddp_kwargs = self._resolve_ddp_kwargs(force_gradient_as_bucket_view=True)
+        ddp_by_hook = {
+            hook_name: DDP(
+                module.get_raw_sae(hook_name),
+                process_group=group,
+                device_ids=device_ids,
+                output_device=output_device,
+                **ddp_kwargs,
+            )
+            for hook_name in module.hook_names
+        }
+        module.set_ddp_forward_modules(ddp_by_hook)
+
+    def _resolve_ddp_kwargs(
+        self,
+        *,
+        force_gradient_as_bucket_view: bool = False,
+    ) -> dict[str, Any]:
+        # A bucket-backed .grad avoids keeping both the DDP communication bucket
+        # and a second gradient-sized allocation.  Callers can still explicitly
+        # disable it for compatibility/debugging outside optimizer-overlap mode.
+        ddp_kwargs: dict[str, Any] = {
+            "gradient_as_bucket_view": (
+                True
+                if force_gradient_as_bucket_view
+                or self.cfg.ddp_gradient_as_bucket_view is None
+                else self.cfg.ddp_gradient_as_bucket_view
+            )
+        }
         if self.cfg.ddp_broadcast_buffers is not None:
             ddp_kwargs["broadcast_buffers"] = self.cfg.ddp_broadcast_buffers
         if self.cfg.ddp_find_unused_parameters is not None:
             ddp_kwargs["find_unused_parameters"] = self.cfg.ddp_find_unused_parameters
-        if self.cfg.ddp_gradient_as_bucket_view is not None:
-            ddp_kwargs["gradient_as_bucket_view"] = self.cfg.ddp_gradient_as_bucket_view
         if self.cfg.ddp_static_graph is not None:
             ddp_kwargs["static_graph"] = self.cfg.ddp_static_graph
         if self.cfg.ddp_bucket_cap_mb is not None:
@@ -1652,6 +1743,10 @@ class LanguageModelSAETrainingRunner:
             sae_dp_group = v2_mod.get_sae_dp_group()
 
         pp_hooks = self._pp_hook_names if hasattr(self, "_pp_hook_names") else self.hook_names
+        trainer_cfg = self.cfg.to_sae_trainer_config()
+        trainer_cfg.multi_sae_tp_phase_fence_runtime_hazard = bool(
+            self.sae_active and self.vllm_active
+        )
         trainer = MultiSAETrainer(
             hook_names=pp_hooks,
             sae_by_hook=self.sae_by_hook,
@@ -1659,7 +1754,7 @@ class LanguageModelSAETrainingRunner:
             multi_hook_sae=self.multi_hook_sae,
             data_provider=self.activations_store,
             save_checkpoint_fn=self.save_checkpoint,
-            cfg=self.cfg.to_sae_trainer_config(),
+            cfg=trainer_cfg,
             dp_group=sae_dp_group,
             token_count_weighted_dp=self.use_shard_routing,
             sae_dp_mode=self.cfg.sae_dp_mode,
@@ -2321,6 +2416,15 @@ class LanguageModelSAETrainingRunner:
                 f"Streaming sae_dp_size>1 requires sae_dp_mode='ddp' or 'fsdp', "
                 f"got {self.cfg.sae_dp_mode!r}"
             )
+        if isinstance(sae, MultiHookSAE) and self._per_hook_ddp_overlap_enabled(
+            len(sae.hook_names)
+        ):
+            self._attach_per_hook_overlap_ddp(sae, sae_dp_group)
+            logger.info(
+                "multi_sae_optimizer_overlap uses one bucket-view DDP reducer "
+                "per hook with a streaming combined backward."
+            )
+            return sae
         from torch.nn.parallel import DistributedDataParallel as DDP
 
         device_ids = None
@@ -3237,6 +3341,10 @@ class LanguageModelSAETrainingRunner:
             self._pp_hook_names if hasattr(self, "_pp_hook_names") else self.hook_names
         )
         sae_dp_group = ds.get_sae_dp_group() if self.sae_dp_size > 1 else None
+        trainer_cfg = self.cfg.to_sae_trainer_config()
+        trainer_cfg.multi_sae_tp_phase_fence_runtime_hazard = bool(
+            self.sae_active and self.vllm_active
+        )
         trainer = MultiSAETrainer(
             hook_names=local_hooks,
             sae_by_hook=self.sae_by_hook,
@@ -3244,7 +3352,7 @@ class LanguageModelSAETrainingRunner:
             multi_hook_sae=self.multi_hook_sae,
             data_provider=provider,
             save_checkpoint_fn=self._streaming_save_checkpoint,
-            cfg=self.cfg.to_sae_trainer_config(),
+            cfg=trainer_cfg,
             dp_group=sae_dp_group,
             token_count_weighted_dp=False,
             sae_dp_mode=self.cfg.sae_dp_mode,

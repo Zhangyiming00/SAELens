@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hook-name","--hook", default="blocks.21.hook_resid_post")
     parser.add_argument("--hook-names","--hooks",
         # default=None,
-        default="blocks.21.hook_resid_post,blocks.31.hook_resid_post",        
+        default="blocks.21.hook_resid_post,blocks.26.hook_resid_post,blocks.31.hook_resid_post",        
         help="Comma-separated hook names for multi-layer independent SAE training.",
     )
     parser.add_argument("--d-sae", type=int, default=32768)
@@ -389,6 +389,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--multi-sae-tp-phase-fence",
+        default="auto",
+        choices=["auto", "always", "off"],
+        help=(
+            "Host-visible fence between SAE-TP work and a different NCCL phase. "
+            "auto fences only for cross-hook TP when a distinct DDP group or "
+            "co-located producer path can interleave; always forces the fence; "
+            "off disables it."
+        ),
+    )
+    parser.add_argument(
+        "--multi-sae-optimizer-overlap",
+        default="off",
+        choices=["off", "on", "non_tp_only"],
+        help=(
+            "Experimental per-hook DDP bucket reduction -> optimizer overlap. "
+            "Buckets launch during combined backward; 'on' also supports SAE-TP "
+            "through CPU shared-memory TP post; 'non_tp_only' keeps TP x DDP on "
+            "the normal optimizer path."
+        ),
+    )
+    parser.add_argument(
         "--ddp-broadcast-buffers",
         dest="ddp_broadcast_buffers",
         action="store_true",
@@ -419,13 +441,19 @@ def parse_args() -> argparse.Namespace:
         dest="ddp_gradient_as_bucket_view",
         action="store_true",
         default=None,
-        help="Explicitly set DDP gradient_as_bucket_view=True.",
+        help=(
+            "Use DDP bucket-backed gradients (the effective default, avoiding a "
+            "second gradient-sized allocation)."
+        ),
     )
     parser.add_argument(
         "--no-ddp-gradient-as-bucket-view",
         dest="ddp_gradient_as_bucket_view",
         action="store_false",
-        help="Explicitly set DDP gradient_as_bucket_view=False.",
+        help=(
+            "Disable bucket-backed gradients on the standard DDP/off path. "
+            "The optimizer-overlap path requires and forces bucket views."
+        ),
     )
     parser.add_argument(
         "--ddp-static-graph",
@@ -1284,6 +1312,8 @@ def main() -> None:
         multi_sae_stats_sync_interval=args.multi_sae_stats_sync_interval,
         multi_sae_seed_mode=args.multi_sae_seed_mode,
         multi_sae_distributed_architecture=args.multi_sae_distributed_architecture,
+        multi_sae_tp_phase_fence=args.multi_sae_tp_phase_fence,
+        multi_sae_optimizer_overlap=args.multi_sae_optimizer_overlap,
         ddp_broadcast_buffers=args.ddp_broadcast_buffers,
         ddp_find_unused_parameters=args.ddp_find_unused_parameters,
         ddp_gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,
@@ -1393,8 +1423,8 @@ def main() -> None:
         )
         if args.save_memory_every_n_steps > 0:
             print(
-                "  WARNING: save_memory_every_n_steps > 0 syncs the device at every "
-                "memory phase, which inflates step-window times. Pass "
+                "  WARNING: save_memory_every_n_steps > 0 syncs the device at memory "
+                "phases on sampled steps, which inflates those steps. Pass "
                 "--save-memory-every-n-steps 0 for throughput measurements."
             )
         if args.synchronize_timing:

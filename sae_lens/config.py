@@ -353,6 +353,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     multi_sae_distributed_architecture: Literal[
         "legacy_per_hook_wrapper", "unified_multi_hook"
     ] = "unified_multi_hook"
+    multi_sae_tp_phase_fence: Literal["auto", "always", "off"] = "auto"
+    multi_sae_optimizer_overlap: Literal["off", "on", "non_tp_only"] = "off"
     ddp_broadcast_buffers: bool | None = None
     ddp_find_unused_parameters: bool | None = None
     ddp_gradient_as_bucket_view: bool | None = None
@@ -417,6 +419,14 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             raise ValueError(
                 "multi_sae_distributed_architecture must be "
                 "'legacy_per_hook_wrapper' or 'unified_multi_hook'"
+            )
+        if self.multi_sae_tp_phase_fence not in ("auto", "always", "off"):
+            raise ValueError(
+                "multi_sae_tp_phase_fence must be 'auto', 'always', or 'off'"
+            )
+        if self.multi_sae_optimizer_overlap not in ("off", "on", "non_tp_only"):
+            raise ValueError(
+                "multi_sae_optimizer_overlap must be 'off', 'on', or 'non_tp_only'"
             )
         if (
             self.multi_sae_distributed_architecture == "unified_multi_hook"
@@ -777,6 +787,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             multi_sae_overlap_trace_dir=self.multi_sae_overlap_trace_dir,
             multi_sae_overlap_max_steps=self.multi_sae_overlap_max_steps,
             multi_sae_distributed_architecture=self.multi_sae_distributed_architecture,
+            multi_sae_tp_phase_fence=self.multi_sae_tp_phase_fence,
+            multi_sae_optimizer_overlap=self.multi_sae_optimizer_overlap,
             total_training_samples=self.total_training_tokens,
             device=self.device,
             autocast=self.autocast,
@@ -1093,6 +1105,12 @@ class SAETrainerConfig:
     multi_sae_distributed_architecture: Literal[
         "legacy_per_hook_wrapper", "unified_multi_hook"
     ] = "unified_multi_hook"
+    multi_sae_tp_phase_fence: Literal["auto", "always", "off"] = "auto"
+    multi_sae_optimizer_overlap: Literal["off", "on", "non_tp_only"] = "off"
+    # Runtime-only hint filled by LanguageModelSAETrainingRunner.  It is true
+    # when producer and SAE roles share this rank, so auto fence can protect a
+    # cross-process-group handoff without exposing another CLI knob.
+    multi_sae_tp_phase_fence_runtime_hazard: bool = False
 
     @property
     def total_training_steps(self) -> int:
