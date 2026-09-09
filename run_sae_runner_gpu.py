@@ -56,11 +56,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hook-name","--hook", default="blocks.21.hook_resid_post")
     parser.add_argument("--hook-names","--hooks",
         # default=None,
-        default="blocks.21.hook_resid_post,blocks.26.hook_resid_post,blocks.31.hook_resid_post",        
+        default="blocks.21.hook_resid_post,blocks.31.hook_resid_post",
         help="Comma-separated hook names for multi-layer independent SAE training.",
     )
     parser.add_argument("--d-sae", type=int, default=32768)
     parser.add_argument("--k", type=int, default=128)
+    parser.add_argument(
+        "--use-sparse-activations",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use COO sparse Top-K activations during SAE training (default: disabled).",
+    )
     parser.add_argument(
         "--no-rescale-acts-by-decoder-norm",
         dest="rescale_acts_by_decoder_norm",
@@ -163,7 +169,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--act-store-device", default="cuda")
     parser.add_argument(
         "--output-path",
-        default=f"results/results_2.1_H2_asynctp__test2/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+        default=f"results/results_2.3_H5_asynctpddp_long1/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
     parser.add_argument("--save-mse-every-n-steps", type=int, default=32)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=512)
@@ -401,7 +407,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--multi-sae-optimizer-overlap",
-        default="off",
+        default="on",
         choices=["off", "on", "non_tp_only"],
         help=(
             "Experimental per-hook DDP bucket reduction -> optimizer overlap. "
@@ -440,7 +446,7 @@ def parse_args() -> argparse.Namespace:
         "--ddp-gradient-as-bucket-view",
         dest="ddp_gradient_as_bucket_view",
         action="store_true",
-        default=None,
+        default=True,
         help=(
             "Use DDP bucket-backed gradients (the effective default, avoiding a "
             "second gradient-sized allocation)."
@@ -534,7 +540,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--streaming-chunk-size-tokens",
         type=int,
-        default=4096,
+        default=8192,
         help="Tokens per shared-memory chunk in streaming_mode.",
     )
     parser.add_argument(
@@ -1251,6 +1257,7 @@ def main() -> None:
             k=args.k,
             device=device,
             dtype=args.dtype,
+            use_sparse_activations=args.use_sparse_activations,
             rescale_acts_by_decoder_norm=args.rescale_acts_by_decoder_norm,
         ),
         model_name=args.model_name,

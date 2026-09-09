@@ -4,6 +4,7 @@ import contextlib
 import json
 import pickle
 import time
+import weakref
 from collections.abc import Iterator
 from copy import deepcopy
 from pathlib import Path
@@ -132,6 +133,65 @@ def _build_trainer(
         token_count_weighted_dp=False,
         sae_dp_mode="ddp",
     )
+
+
+def test_fit_releases_previous_outputs_before_next_data_fetch(tmp_path: Path) -> None:
+    output_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    class RefillProbe:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.trainer: MultiSAETrainer | None = None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> dict[str, torch.Tensor]:
+            if self.calls >= 2:
+                raise StopIteration
+            if self.calls == 1:
+                assert self.trainer is not None
+                assert self.trainer._memory_retained_outputs is None
+                assert self.trainer._memory_current_outputs is None
+                assert all(ref() is None for ref in output_refs)
+            self.calls += 1
+            return {
+                hook: torch.randn(BATCH, D_IN)
+                for hook in HOOK_NAMES
+            }
+
+    sae_by_hook = {hook: _make_sae() for hook in HOOK_NAMES}
+    cfg = _make_trainer_cfg(tmp_path, total_training_samples=2 * BATCH)
+    cfg.multi_sae_distributed_architecture = "legacy_per_hook_wrapper"
+    trainer = MultiSAETrainer(
+        hook_names=HOOK_NAMES,
+        sae_by_hook=sae_by_hook,
+        base_sae_by_hook=sae_by_hook,
+        data_provider=iter(()),
+        save_checkpoint_fn=None,
+        cfg=cfg,
+        dp_group=None,
+        token_count_weighted_dp=False,
+        sae_dp_mode="ddp",
+    )
+    provider = RefillProbe()
+    provider.trainer = trainer
+    trainer.data_provider = provider
+    original_train_step = trainer._train_step
+
+    def recording_train_step(batch_by_hook, local_n):
+        outputs, timing = original_train_step(batch_by_hook, local_n)
+        output_refs.extend(
+            weakref.ref(output.feature_acts) for output in outputs.values()
+        )
+        return outputs, timing
+
+    trainer._train_step = recording_train_step  # type: ignore[method-assign]
+    trainer.fit()
+
+    assert provider.calls == 2
+    assert trainer._memory_retained_outputs is None
+    assert trainer._memory_current_outputs is None
 
 
 def test_multi_hook_sae_requires_exact_hook_set_and_splits_state_dict() -> None:

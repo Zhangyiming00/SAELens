@@ -777,6 +777,16 @@ class MultiSAETrainer:
                     components={**timing, **sae_phase_timing},
                 )
 
+            # The next data fetch can run a large vLLM capture/routing refill.
+            # Nothing after this point consumes tensor-valued step outputs, so
+            # release them before that refill instead of retaining two steps of
+            # TrainStepOutput graphs and activation batches concurrently.
+            self._memory_retained_outputs = None
+            self._memory_current_outputs = None
+            self._memory_current_raw_batch_by_hook = None
+            self._memory_current_scaled_batch_by_hook = None
+            del outputs, scaled_batch_by_hook, batch_by_hook
+
             _maybe_start_quiesce_drain()
             if quiesce_checkpoint_now:
                 _ack_drain_done()

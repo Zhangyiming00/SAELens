@@ -263,10 +263,50 @@ def act_times_W_dec(
     Handles both dense and sparse tensors. Does NOT add b_dec — callers add it if needed.
     """
     if rescale_acts_by_decoder_norm:
-        feature_acts = feature_acts * (1 / W_dec.norm(dim=-1))
+        inverse_norm = 1 / W_dec.norm(dim=-1)
+        if feature_acts.is_sparse:
+            # Scaling sparse values by a broadcast dense tensor produces a sparse
+            # gradient for inverse_norm, which norm backward cannot consume. Moving
+            # the equivalent row scaling onto W_dec keeps that gradient dense.
+            W_dec = W_dec * inverse_norm.unsqueeze(-1)
+        else:
+            feature_acts = feature_acts * inverse_norm
     if feature_acts.is_sparse:
         return _sparse_matmul_nd(feature_acts, W_dec)
     return feature_acts @ W_dec
+
+
+def _tp_feature_shard(
+    feature_acts: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor:
+    """Return one TP feature shard without applying dense slicing to COO tensors."""
+    full_size = feature_acts.shape[-1]
+    if full_size % tp_size != 0:
+        raise ValueError(
+            f"Feature dimension {full_size} must be divisible by tp_size={tp_size}"
+        )
+
+    shard_size = full_size // tp_size
+    start = tp_rank * shard_size
+    if not feature_acts.is_sparse:
+        return feature_acts.narrow(-1, start, shard_size)
+
+    coalesced = feature_acts.coalesce()
+    indices = coalesced.indices()
+    feature_indices = indices[-1]
+    in_shard = (feature_indices >= start) & (feature_indices < start + shard_size)
+    local_indices = indices[:, in_shard].clone()
+    local_indices[-1].sub_(start)
+    local_size = (*feature_acts.shape[:-1], shard_size)
+    return torch.sparse_coo_tensor(
+        local_indices,
+        coalesced.values()[in_shard],
+        local_size,
+        dtype=feature_acts.dtype,
+        device=feature_acts.device,
+    ).coalesce()
 
 
 class TopKSAE(SAE[TopKSAEConfig]):
@@ -665,7 +705,6 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
             self._tp_group is not None
             and dist.is_initialized()
             and dist.get_world_size(self._tp_group) > 1
-            and not self.cfg.use_sparse_activations
         )
 
     def tp_wavefront_encode_launch(
@@ -702,15 +741,13 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
 
         tp_rank = dist.get_rank(self._tp_group)
         tp_size = dist.get_world_size(self._tp_group)
-        shard_size = feature_acts.shape[-1] // tp_size
-        local_acts = feature_acts[
-            ..., tp_rank * shard_size : (tp_rank + 1) * shard_size
-        ]
-        if self.cfg.rescale_acts_by_decoder_norm:
-            local_acts = local_acts * (1 / self.W_dec.norm(dim=-1))
+        local_acts = _tp_feature_shard(feature_acts, tp_rank, tp_size)
 
         decode_bias = _scale_gradient(self.b_dec, 1.0 / tp_size)
-        reduce = tp_allreduce_async(local_acts @ self.W_dec, self._tp_group)
+        local_recons = act_times_W_dec(
+            local_acts, self.W_dec, self.cfg.rescale_acts_by_decoder_norm
+        )
+        reduce = tp_allreduce_async(local_recons, self._tp_group)
         _debug_topk_tp("wavefront decode allreduce launched")
         state.hidden_pre = hidden_pre
         state.feature_acts = feature_acts
@@ -782,17 +819,17 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
         if self._tp_group is not None:
             tp_rank = dist.get_rank(self._tp_group)
             tp_size = dist.get_world_size(self._tp_group)
-            shard_size = feature_acts.shape[-1] // tp_size
-            local_acts = feature_acts[..., tp_rank * shard_size : (tp_rank + 1) * shard_size]
-            if self.cfg.rescale_acts_by_decoder_norm:
-                local_acts = local_acts * (1 / self.W_dec.norm(dim=-1))
+            local_acts = _tp_feature_shard(feature_acts, tp_rank, tp_size)
             _debug_topk_tp("decode allreduce start")
             # b_dec also appears in process_sae_in(). Its encode-path gradient is sharded
             # across TP ranks, while its decode-path gradient is replicated on every rank.
             # Scale only the decode-path backward contribution so the later TP all-reduce on
             # b_dec.grad reconstructs the single-rank gradient exactly.
             decode_bias = _scale_gradient(self.b_dec, 1.0 / tp_size)
-            sae_out_pre = tp_allreduce(local_acts @ self.W_dec, self._tp_group) + decode_bias
+            local_recons = act_times_W_dec(
+                local_acts, self.W_dec, self.cfg.rescale_acts_by_decoder_norm
+            )
+            sae_out_pre = tp_allreduce(local_recons, self._tp_group) + decode_bias
             _debug_topk_tp("decode allreduce done")
         else:
             sae_out_pre = (

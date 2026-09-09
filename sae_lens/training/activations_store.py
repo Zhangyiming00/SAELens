@@ -1766,7 +1766,7 @@ class ActivationsStore:
             first_buf = next(iter(buf_map.values()))
             with routing_phase(getattr(self, "_routing_probe", None), "consumer_assemble"):
                 if isinstance(first_buf, dict):
-                    payload_hook_names = self._v2_payload_hook_names()
+                    payload_hook_names = self._v2_endpoint_hook_names(endpoint_idx)
                     assembled_payload = {
                         hook_name: torch.cat(
                             [buf_map[r.producer_idx][hook_name] for r in c_routes],
@@ -1845,6 +1845,19 @@ class ActivationsStore:
     def _v2_payload_hook_names(self) -> list[str]:
         """Hooks carried across v2 producer/consumer P2P payloads."""
         return list(getattr(self, "_all_hook_names", None) or self.hook_names)
+
+    def _v2_endpoint_hook_names(self, endpoint_idx: int) -> list[str]:
+        """Hooks required by one physical SAE PP endpoint."""
+        import sae_lens.distributed_v2 as v2
+        from sae_lens.distributed_v2 import hooks_for_pp_rank
+
+        all_hook_names = self._v2_payload_hook_names()
+        pp_size = v2.get_sae_pp_size()
+        return hooks_for_pp_rank(
+            endpoint_idx % pp_size,
+            pp_size,
+            all_hook_names,
+        )
 
     def _pack_v2_payload(
         self,
@@ -1979,9 +1992,8 @@ class ActivationsStore:
 
         from sae_lens.shard_routing import routes_for_consumer, routes_for_producer
 
-        recv_slices: dict[int, Any] = {}
+        recv_slices: dict[int, tuple[torch.Tensor, int, list[str]]] = {}
         rank = dist.get_rank() if dist.is_initialized() else -1
-        payload_hook_names = self._v2_payload_hook_names()
 
         producer_routes = (
             routes_for_producer(v2.get_routing_table(), v2.get_producer_idx())
@@ -1994,6 +2006,7 @@ class ActivationsStore:
 
         for endpoint_idx in range(v2.get_num_sae_stage_endpoints()):
             c = endpoint_idx // v2.get_sae_pp_size()
+            endpoint_hook_names = self._v2_endpoint_hook_names(endpoint_idx)
             consumer_root = v2.get_consumer_tp_root(endpoint_idx)
             consumer_routes = routes_for_consumer(v2.get_routing_table(), c)
             remote_routes = [
@@ -2023,12 +2036,13 @@ class ActivationsStore:
 
             ops: list[dist.P2POp] = []
             with routing_phase(getattr(self, "_routing_probe", None), "p2p_setup"):
+                send_buf: torch.Tensor | None = None
                 if should_recv:
                     for route in remote_routes:
                         n_rows = route.row_end - route.row_start
                         if self.is_multi_hook:
                             recv_buf = torch.empty(
-                                n_rows * len(payload_hook_names),
+                                n_rows * len(endpoint_hook_names),
                                 self.d_in,
                                 dtype=self.dtype,
                                 device=self.device,
@@ -2040,7 +2054,11 @@ class ActivationsStore:
                                 dtype=self.dtype,
                                 device=self.device,
                             )
-                        recv_slices[route.producer_idx] = (recv_buf, n_rows)
+                        recv_slices[route.producer_idx] = (
+                            recv_buf,
+                            n_rows,
+                            endpoint_hook_names,
+                        )
                         ops.append(
                             dist.P2POp(
                                 dist.irecv,
@@ -2051,7 +2069,10 @@ class ActivationsStore:
                         )
 
                 if should_send:
-                    send_buf = self._pack_v2_payload(outgoing[c], payload_hook_names)
+                    send_buf = self._pack_v2_payload(
+                        outgoing[c],
+                        endpoint_hook_names,
+                    )
                     ops.append(
                         dist.P2POp(
                             dist.isend,
@@ -2063,18 +2084,25 @@ class ActivationsStore:
 
             with nccl_nvtx_range("nccl:shard_routing_p2p_exchange", p2p_group):
                 with routing_phase(getattr(self, "_routing_probe", None), "p2p_exchange"):
-                    for work in dist.batch_isend_irecv(ops):
+                    works = dist.batch_isend_irecv(ops)
+                    for work in works:
                         work.wait()
+            # P2POp retains its tensor. Drop both the completed operations and
+            # the contiguous pack before constructing the next PP endpoint's
+            # payload, otherwise Python keeps one previous pack alive.
+            del work, works, ops
+            if send_buf is not None:
+                del send_buf
 
         with routing_phase(getattr(self, "_routing_probe", None), "p2p_unpack"):
             return {
                 producer_idx: self._unpack_v2_payload(
                     recv_buf,
                     n_rows=n_rows,
-                    hook_names=payload_hook_names,
+                    hook_names=hook_names,
                     is_multi_hook=self.is_multi_hook,
                 )
-                for producer_idx, (recv_buf, n_rows) in recv_slices.items()
+                for producer_idx, (recv_buf, n_rows, hook_names) in recv_slices.items()
             }
 
     def get_data_loader(

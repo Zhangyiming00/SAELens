@@ -1101,7 +1101,7 @@ def test_run_producer_phase2_v2_pp_endpoint_uses_all_hooks_for_payload(
     assert torch.equal(local_slices[1]["h1"], raw_acts["h1"][2:6].contiguous())
 
 
-def test_run_nccl_p2p_exchange_v2_uses_endpoint_groups_and_packs_hook_payload(
+def test_run_nccl_p2p_exchange_v2_packs_only_each_endpoint_hooks(
     monkeypatch: pytest.MonkeyPatch,
 ):
     store = ActivationsStore.__new__(ActivationsStore)
@@ -1176,9 +1176,25 @@ def test_run_nccl_p2p_exchange_v2_uses_endpoint_groups_and_packs_hook_payload(
 
     assert groups == [0, 1]
     assert op_shapes == [
-        ("isend", (4, 2), 0),
-        ("irecv", (4, 2), 0),
+        ("isend", (2, 2), 0),
+        ("irecv", (2, 2), 0),
     ]
+
+
+def test_v2_endpoint_hooks_repeat_across_dp_replicas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ActivationsStore.__new__(ActivationsStore)
+    store.hook_names = ["h0", "h1"]
+    store._all_hook_names = [f"h{i}" for i in range(6)]
+
+    import sae_lens.distributed_v2 as v2
+
+    monkeypatch.setattr(v2, "get_sae_pp_size", lambda: 4)
+
+    expected = [["h0", "h1"], ["h2", "h3"], ["h4"], ["h5"]]
+    assert [store._v2_endpoint_hook_names(i) for i in range(4)] == expected
+    assert [store._v2_endpoint_hook_names(i) for i in range(4, 8)] == expected
 
 
 def test_activations_store_consumer_only_is_recv_only():

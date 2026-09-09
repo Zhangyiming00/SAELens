@@ -29,13 +29,10 @@ from statistics import median
 
 import pytest
 
-REF_TP1 = Path(
-    "/home/zhangyiming/SAELens/results/memory_model/sae_phase_v4/tp1/memory_phase_history_rank0.jsonl"
-)
-REF_TP2 = Path(
-    "/home/zhangyiming/SAELens/results/memory_model/sae_phase_v4/tp2/memory_phase_history_rank0.jsonl"
-)
-PREDICTOR = Path("/home/zhangyiming/SAELens/scripts/predict_sae_memory.py")
+ROOT = Path(__file__).resolve().parents[1]
+REF_TP1 = ROOT / "results/memory_model/sae_phase_v4/tp1/memory_phase_history_rank0.jsonl"
+REF_TP2 = ROOT / "results/memory_model/sae_phase_v4/tp2/memory_phase_history_rank0.jsonl"
+PREDICTOR = ROOT / "scripts/predict_sae_memory.py"
 
 
 def _load_predictor():
@@ -63,6 +60,8 @@ def _measured_per_phase(jsonl_path: Path, key: str) -> dict[str, float]:
 
 def _measured_step_max(jsonl_path: Path, key: str) -> float:
     """Run-wide max of ``key`` across all phases and stable steps."""
+    if not jsonl_path.exists():
+        pytest.skip(f"reference run missing: {jsonl_path}")
     rows = [json.loads(line) for line in jsonl_path.open() if line.strip()]
     rows = [r for r in rows if r["step"] >= 10]
     return max(r[key] for r in rows)
@@ -89,6 +88,7 @@ def test_predict_peak_allocated_per_phase_within_150mb(tp: int, jsonl: Path):
         tp=tp,
         dp_size=1,
         dp_mode="ddp",
+        retain_previous_outputs=True,
     )
 
     pairs = [
@@ -140,6 +140,7 @@ def test_predict_driver_used_run_max_within_envelope(tp: int, jsonl: Path):
         tp=tp,
         dp_size=1,
         dp_mode="ddp",
+        retain_previous_outputs=True,
     )
 
     diff = p.step_peak_driver_mb - measured_driver
@@ -262,9 +263,10 @@ def test_predict_driver_proxy_matches_measured_per_phase(tp: int, jsonl: Path):
     """
     mod = _load_predictor()
 
-    freed_jsonl = Path(
-        f"/home/zhangyiming/SAELens/results/memory_model/sae_phase_v4_freed/tp{tp}/"
-        "memory_phase_history_rank0.jsonl"
+    freed_jsonl = (
+        ROOT
+        / f"results/memory_model/sae_phase_v4_freed/tp{tp}"
+        / "memory_phase_history_rank0.jsonl"
     )
     if not freed_jsonl.exists():
         pytest.skip(f"freed reference run missing: {freed_jsonl}")
@@ -283,6 +285,7 @@ def test_predict_driver_proxy_matches_measured_per_phase(tp: int, jsonl: Path):
     p = mod.predict(
         d_in=4096, d_sae=65536, batch_tokens=2048, k=128,
         dtype="float32", hooks=2, tp=tp, dp_size=1, dp_mode="ddp",
+        retain_previous_outputs=True,
     )
 
     # Predicted max proxy should overshoot measured (so a fits-verdict that
@@ -317,11 +320,10 @@ def test_phase_predictions_are_individually_addressable():
     names = [ph.name for ph in p.phases]
     assert names == ["forward", "backward", "optimizer"]
     fwd, bwd, opt = p.phases
-    # Optimizer adds Adam foreach transient on top of persistent (params·hooks
-    # extra). At v4 reference scale (params per hook ≈ 1 GB) optimizer is
-    # the binding phase.
+    # Every phase remains independently inspectable. The current combined
+    # backward workspace can bind even when foreach adds an optimizer transient.
     assert opt.peak_allocated_mb > fwd.peak_allocated_mb
-    assert opt.peak_allocated_mb > bwd.peak_allocated_mb
+    assert p.binding_phase in {"backward", "optimizer"}
     # Per-phase driver proxy = peak_alloc + runtime_residual.
     for ph in p.phases:
         assert ph.driver_proxy_mb == pytest.approx(
@@ -351,3 +353,93 @@ def test_pool_fragmentation_independent_of_phase_max():
     assert small.overhead["pool_fragmentation"] >= 800.0
     assert large.overhead["pool_fragmentation"] > small.overhead["pool_fragmentation"]
 
+
+def test_ordinary_model_separates_total_and_local_hook_scopes():
+    mod = _load_predictor()
+    common = dict(
+        d_in=4096,
+        d_sae=32768,
+        batch_tokens=4096,
+        k=128,
+        dtype="float32",
+        tp=1,
+        mode="ordinary",
+        optimizer_impl="fused",
+        vllm_tp=4,
+        local_hooks=2,
+    )
+    h6 = mod.predict(total_hooks=6, **common)
+    h8 = mod.predict(total_hooks=8, **common)
+
+    assert h6.components["params_per_rank"] == h8.components["params_per_rank"]
+    assert h6.components["endpoint_pack"] == h8.components["endpoint_pack"]
+    assert h8.components["producer_capture"] > h6.components["producer_capture"]
+    h6_fetch = next(ph for ph in h6.phases if ph.name == "data_fetch")
+    h8_fetch = next(ph for ph in h8.phases if ph.name == "data_fetch")
+    assert h8_fetch.peak_allocated_mb > h6_fetch.peak_allocated_mb
+
+
+def test_ordinary_model_accounts_for_endpoint_pack_and_contexts():
+    mod = _load_predictor()
+    common = dict(
+        d_in=4096,
+        d_sae=32768,
+        batch_tokens=4096,
+        k=128,
+        dtype="float32",
+        tp=1,
+        mode="ordinary",
+        optimizer_impl="fused",
+        vllm_tp=4,
+        total_hooks=6,
+        local_hooks=2,
+    )
+    no_foreign = mod.predict(foreign_cuda_contexts=0, **common)
+    with_foreign = mod.predict(foreign_cuda_contexts=3, **common)
+
+    assert with_foreign.components["producer_capture"] == pytest.approx(1536.0)
+    assert with_foreign.components["endpoint_pack"] == pytest.approx(512.0)
+    assert with_foreign.components["retained_outputs"] == 0.0
+    assert with_foreign.step_peak_allocated_mb == no_foreign.step_peak_allocated_mb
+    assert with_foreign.step_peak_reserved_mb == no_foreign.step_peak_reserved_mb
+    assert with_foreign.step_peak_driver_mb - no_foreign.step_peak_driver_mb == pytest.approx(
+        1500.0
+    )
+    # Regression for saelens_runner_gpu_260903_184325: capacity planning must
+    # use the driver layer, not the old ~20.63 GiB analytical tensor estimate.
+    assert with_foreign.step_peak_driver_mb > 28_000
+
+
+def test_model_uses_fullest_rank_for_uneven_global_dp_batch():
+    mod = _load_predictor()
+    uneven = mod.predict(
+        d_in=1024,
+        d_sae=8192,
+        batch_tokens=8192,
+        k=32,
+        dtype="float32",
+        hooks=1,
+        tp=1,
+        dp_size=3,
+        dp_mode="ddp",
+    )
+    local = mod.predict(
+        d_in=1024,
+        d_sae=8192,
+        batch_tokens=2731,
+        k=32,
+        dtype="float32",
+        hooks=1,
+        tp=1,
+        dp_size=1,
+        dp_mode="ddp",
+    )
+
+    assert uneven.components["global_batch_tokens"] == 8192
+    assert uneven.components["max_local_batch_tokens"] == 2731
+    assert uneven.components["current_outputs"] == pytest.approx(
+        local.components["current_outputs"]
+    )
+    assert uneven.components["forward_workspace"] == pytest.approx(
+        local.components["forward_workspace"]
+    )
