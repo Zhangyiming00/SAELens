@@ -40,6 +40,7 @@ def mixing_buffer(
     activations_loader: Iterator[ActivationBatch],
     mix_fraction: float = 0.5,
     generator: torch.Generator | None = None,
+    shuffle: bool | None = None,
 ) -> Iterator[ActivationBatch]:
     """
     A generator that maintains a mix of old and new activations for better training.
@@ -52,6 +53,8 @@ def mixing_buffer(
         mix_fraction: Fraction of buffer to keep for mixing (default 0.5).
                       Higher values mean more temporal mixing but slower throughput.
                       If 0, no shuffling occurs (passthrough mode).
+        shuffle: Explicitly enable/disable shuffling. ``None`` preserves the
+            historical behavior where ``mix_fraction=0`` disables shuffling.
 
     Yields:
         Batches of activations of shape (batch_size, *activation_dims)
@@ -77,7 +80,8 @@ def mixing_buffer(
 
         if _batch_len(storage_buffer) >= buffer_size:
             with cuda_nvtx_range("mixing_buffer:shuffle"):
-                if mix_fraction > 0:
+                should_shuffle = mix_fraction > 0 if shuffle is None else shuffle
+                if should_shuffle:
                     perm = torch.randperm(
                         _batch_len(storage_buffer), generator=generator
                     )

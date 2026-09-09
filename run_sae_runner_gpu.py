@@ -336,6 +336,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-shard-routing", action="store_true",default=True,
                         help="Use unified shard-routing DP (supports arbitrary vllm_dp:sae_dp ratios).")
     parser.add_argument(
+        "--routing-dp-batch-mode",
+        choices=["equal", "exact"],
+        default="equal",
+        help=(
+            "Routing batch ownership. 'equal' keeps the legacy divisible per-DP "
+            "batch; 'exact' treats train batch/training tokens as global values "
+            "and uses floor/ceil local batches."
+        ),
+    )
+    parser.add_argument(
         "--sae-dp-mode",
         default=None,
         choices=["manual", "ddp", "fsdp"],
@@ -544,6 +554,16 @@ def parse_args() -> argparse.Namespace:
         help="Tokens per shared-memory chunk in streaming_mode.",
     )
     parser.add_argument(
+        "--streaming-dp-batch-mode",
+        choices=["equal_cohort", "exact"],
+        default="equal_cohort",
+        help=(
+            "SHM streaming allocation. 'equal_cohort' preserves legacy full-chunk "
+            "cohorts; 'exact' keeps fixed logical mixing streams and shards each "
+            "global batch exactly across physical SAE-DP."
+        ),
+    )
+    parser.add_argument(
         "--streaming-num-chunks",
         type=int,
         default=32,
@@ -569,6 +589,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="Fraction of the local rolling mix window kept for the next refill.",
+    )
+    parser.add_argument(
+        "--streaming-mixing-streams",
+        type=int,
+        default=0,
+        help=(
+            "Number of topology-independent mixing streams in exact mode. "
+            "0 uses the initial SAE DP size; set it explicitly before a later "
+            "DP resize."
+        ),
     )
     parser.add_argument(
         "--streaming-buffer-name",
@@ -1158,9 +1188,36 @@ def main() -> None:
             f"sae_dp_size={args.sae_dp_size}."
         )
 
+    exact_dp_batch = (
+        args.streaming_dp_batch_mode == "exact"
+        if args.streaming_mode
+        else args.routing_dp_batch_mode == "exact"
+    )
+    if exact_dp_batch and args.training_tokens % args.train_batch_size_tokens != 0:
+        raise ValueError(
+            "exact DP batch mode currently requires --training-tokens to be a "
+            "multiple of --train-batch-size-tokens; short global tail steps are "
+            "reserved for the later elastic cutover implementation."
+        )
+    if exact_dp_batch and args.train_batch_size_tokens < args.sae_dp_size:
+        raise ValueError(
+            "exact DP batch mode requires --train-batch-size-tokens >= --sae-dp-size"
+        )
+    if exact_dp_batch and args.sae_dp_size > 1 and args.sae_dp_mode != "ddp":
+        raise ValueError("exact DP batch mode currently requires --sae-dp-mode ddp")
+    if exact_dp_batch and args.streaming_mode and args.streaming_use_gpu_direct:
+        raise ValueError(
+            "--streaming-dp-batch-mode exact currently supports the SHM path only"
+        )
+    if exact_dp_batch and args.resume_from_checkpoint is not None:
+        raise ValueError(
+            "exact DP batch mode does not yet support checkpoint resume; stateful "
+            "resume will be added with the elastic cutover protocol"
+        )
+
     training_tokens = args.training_tokens
     train_batch_size_tokens = args.train_batch_size_tokens
-    if args.sae_dp_size > 1:
+    if args.sae_dp_size > 1 and not exact_dp_batch:
         if args.training_tokens % args.sae_dp_size != 0:
             raise ValueError(
                 "--training-tokens must be divisible by --sae-dp-size so each "
@@ -1183,17 +1240,23 @@ def main() -> None:
             f"(global batch stays {args.train_batch_size_tokens})."
         )
 
+    buffer_batch_size_tokens = train_batch_size_tokens
+    if exact_dp_batch and not args.streaming_mode and args.sae_dp_size > 1:
+        buffer_batch_size_tokens = math.ceil(
+            args.train_batch_size_tokens / args.sae_dp_size
+        )
     min_n_batches_in_buffer = math.ceil(
-        train_batch_size_tokens / args.context_size
+        buffer_batch_size_tokens / args.context_size
     )
     n_batches_in_buffer = (
         max(2, min_n_batches_in_buffer)
         if args.n_batches_in_buffer is None
         else args.n_batches_in_buffer
     )
-    if n_batches_in_buffer * args.context_size < train_batch_size_tokens:
+    if n_batches_in_buffer * args.context_size < buffer_batch_size_tokens:
         raise ValueError(
-            "n_batches_in_buffer * context_size must be >= train_batch_size_tokens"
+            "n_batches_in_buffer * context_size must be >= the per-replica "
+            "buffer batch size"
         )
 
     output_path = None if args.no_save_final_sae else args.output_path
@@ -1330,12 +1393,15 @@ def main() -> None:
         fsdp_backward_prefetch=args.fsdp_backward_prefetch,
         fsdp_forward_prefetch=args.fsdp_forward_prefetch,
         fsdp_sharding_strategy=args.fsdp_sharding_strategy,
+        routing_dp_batch_mode=args.routing_dp_batch_mode,
+        streaming_dp_batch_mode=args.streaming_dp_batch_mode,
         streaming_mode=args.streaming_mode,
         streaming_chunk_size_tokens=args.streaming_chunk_size_tokens,
         streaming_num_chunks=args.streaming_num_chunks,
         streaming_prefetch_chunks=args.streaming_prefetch_chunks,
         streaming_mix_chunks=args.streaming_mix_chunks,
         streaming_mix_fraction=args.streaming_mix_fraction,
+        streaming_mixing_streams=args.streaming_mixing_streams,
         streaming_buffer_name=args.streaming_buffer_name,
         streaming_shuffle=args.streaming_shuffle,
         streaming_random_chunks=args.streaming_random_chunks,

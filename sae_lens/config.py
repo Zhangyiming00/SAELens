@@ -370,6 +370,12 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     ] = "shard_grad_op"
     sae_pp_size: int = 1
 
+    # Batch ownership is configured independently for ordinary shard routing and
+    # SHM streaming. ``equal`` preserves the legacy per-replica configuration;
+    # ``exact`` keeps the CLI batch/token values global and permits remainders.
+    routing_dp_batch_mode: Literal["equal", "exact"] = "equal"
+    streaming_dp_batch_mode: Literal["equal_cohort", "exact"] = "equal_cohort"
+
     # Streaming mode (v1): vLLM and SAE on separate GPU sets, communicate via /dev/shm.
     # The SHM path supports SAE-DP and SAE-PP; GPU-direct streaming remains a
     # separate MVP topology with stricter size constraints.
@@ -379,6 +385,9 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     streaming_prefetch_chunks: int = 2
     streaming_mix_chunks: int = 8
     streaming_mix_fraction: float = 0.5
+    # 0 resolves to the initial SAE-DP size. Set explicitly before a future
+    # topology change so logical mixing state remains independent of physical DP.
+    streaming_mixing_streams: int = 0
     streaming_buffer_name: str = ""  # auto-generated unique name if empty
     streaming_shuffle: bool = True
     streaming_random_chunks: bool = True
@@ -456,6 +465,12 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             )
         if self.sae_pp_size < 1:
             raise ValueError("sae_pp_size must be >= 1")
+        if self.routing_dp_batch_mode not in ("equal", "exact"):
+            raise ValueError("routing_dp_batch_mode must be 'equal' or 'exact'")
+        if self.streaming_dp_batch_mode not in ("equal_cohort", "exact"):
+            raise ValueError(
+                "streaming_dp_batch_mode must be 'equal_cohort' or 'exact'"
+            )
         if self.streaming_mode:
             if self.streaming_prefetch_chunks < 1:
                 raise ValueError("streaming_prefetch_chunks must be >= 1.")
@@ -467,6 +482,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
                 raise ValueError("streaming_mix_chunks must be >= 0.")
             if not 0 <= self.streaming_mix_fraction <= 1:
                 raise ValueError("streaming_mix_fraction must be in [0, 1].")
+            if self.streaming_mixing_streams < 0:
+                raise ValueError("streaming_mixing_streams must be >= 0.")
             if self.streaming_consumer_prefill_chunks < 0:
                 raise ValueError("streaming_consumer_prefill_chunks must be >= 0.")
         effective_num_hooks = 1

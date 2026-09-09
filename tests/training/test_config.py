@@ -44,6 +44,30 @@ def test_LanguageModelSAERunnerConfig_hook_eval_deprecated_usage():
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("routing_dp_batch_mode", "invalid", "routing_dp_batch_mode"),
+        ("streaming_dp_batch_mode", "invalid", "streaming_dp_batch_mode"),
+    ],
+)
+def test_dp_batch_modes_reject_invalid_values(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        LanguageModelSAERunnerConfig(
+            sae=StandardTrainingSAEConfig(d_in=10, d_sae=10),
+            **{field: value},
+        )
+
+
+def test_streaming_mixing_streams_rejects_negative_value():
+    with pytest.raises(ValueError, match="streaming_mixing_streams"):
+        LanguageModelSAERunnerConfig(
+            sae=StandardTrainingSAEConfig(d_in=10, d_sae=10),
+            streaming_mode=True,
+            streaming_mixing_streams=-1,
+        )
+
+
 @pytest.mark.parametrize("seqpos_slice, expected_error", test_cases_for_seqpos)
 def test_cache_activations_runner_config_seqpos(
     seqpos_slice: tuple[int, int],

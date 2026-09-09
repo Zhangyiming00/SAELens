@@ -805,8 +805,21 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                         op=dist.ReduceOp.SUM,
                         group=self.dp_group,
                     )
-                dp_size = dist.get_world_size(self.dp_group)
-                self.n_frac_active_samples *= dp_size
+                if self.token_count_weighted_dp:
+                    sample_count = torch.tensor(
+                        self.n_frac_active_samples,
+                        dtype=torch.int64,
+                        device=self.act_freq_scores.device,
+                    )
+                    dist.all_reduce(
+                        sample_count,
+                        op=dist.ReduceOp.SUM,
+                        group=self.dp_group,
+                    )
+                    self.n_frac_active_samples = int(sample_count.item())
+                else:
+                    dp_size = dist.get_world_size(self.dp_group)
+                    self.n_frac_active_samples *= dp_size
             if self.cfg.logger.log_to_wandb:
                 sparsity_log_dict = self._build_sparsity_log_dict()
                 wandb.log(sparsity_log_dict, step=self.n_training_steps)

@@ -730,6 +730,11 @@ class LanguageModelSAETrainingRunner:
             )
 
         self.cfg = cfg
+        # Preserve user-facing global budgets before an exact routing consumer
+        # derives its rank-local view. Streaming exact mode keeps cfg global and
+        # localizes only the trainer configuration.
+        self._global_training_tokens = int(cfg.training_tokens)
+        self._global_train_batch_size_tokens = int(cfg.train_batch_size_tokens)
         # Cross-hook TP wavefront currently relies on raw TopK children and is
         # deliberately disabled for FSDP.  Config construction applies the same
         # fallback, but repeat it here for callers that mutate cfg after init.
@@ -819,6 +824,47 @@ class LanguageModelSAETrainingRunner:
                     "vllm_tp_size does not match "
                     "cfg.model_from_pretrained_kwargs['tensor_parallel_size']"
                 )
+
+        exact_dp_batch = (
+            self.cfg.streaming_dp_batch_mode == "exact"
+            if effective_streaming_mode
+            else self.cfg.routing_dp_batch_mode == "exact"
+        )
+        if exact_dp_batch:
+            if self.cfg.sae.architecture() in (
+                "batchtopk",
+                "matryoshka_batchtopk",
+            ):
+                raise ValueError(
+                    "exact DP batches do not support batch-level TopK architectures; "
+                    "their feature selection depends on the physical local batch"
+                )
+            if self._global_training_tokens % self._global_train_batch_size_tokens != 0:
+                raise ValueError(
+                    "exact DP batch mode currently requires training_tokens to be "
+                    "a multiple of train_batch_size_tokens"
+                )
+            if self._global_train_batch_size_tokens < self.sae_dp_size:
+                raise ValueError(
+                    "exact DP batch mode requires train_batch_size_tokens >= sae_dp_size"
+                )
+            if self.sae_dp_size > 1 and self.cfg.sae_dp_mode != "ddp":
+                raise ValueError("exact DP batch mode currently requires sae_dp_mode='ddp'")
+            if self.cfg.resume_from_checkpoint is not None:
+                raise ValueError("exact DP batch mode does not yet support checkpoint resume")
+            if effective_streaming_mode and self.cfg.streaming_use_gpu_direct:
+                raise ValueError("exact streaming DP batches currently require the SHM path")
+            if effective_streaming_mode:
+                mixing_streams = (
+                    self.cfg.streaming_mixing_streams or max(1, self.sae_dp_size)
+                )
+                if self._global_train_batch_size_tokens < mixing_streams:
+                    raise ValueError(
+                        "exact streaming requires train_batch_size_tokens >= "
+                        "streaming_mixing_streams"
+                    )
+            if not effective_streaming_mode and not self.use_shard_routing:
+                raise ValueError("routing exact DP batches require use_shard_routing=True")
 
         overlap_mode = self.cfg.multi_sae_optimizer_overlap
         if os.environ.get("SAE_DDP_OPT_OVERLAP_V2", "0") == "1":
@@ -1036,6 +1082,34 @@ class LanguageModelSAETrainingRunner:
             )
         else:
             self._pp_hook_names = list(self.hook_names)
+
+        if (
+            self.cfg.routing_dp_batch_mode == "exact"
+            and self.use_shard_routing
+            and self.sae_dp_size > 1
+            and self.sae_active
+        ):
+            import sae_lens.distributed_v2 as v2_mod
+            from sae_lens.training.dp_batch import (
+                balanced_token_counts,
+                local_token_budget,
+            )
+
+            dp_idx = v2_mod.get_sae_dp_idx()
+            self.cfg.train_batch_size_tokens = balanced_token_counts(
+                self._global_train_batch_size_tokens, self.sae_dp_size
+            )[dp_idx]
+            self.cfg.training_tokens = local_token_budget(
+                self._global_training_tokens,
+                self._global_train_batch_size_tokens,
+                self.sae_dp_size,
+                dp_idx,
+            )
+            self.cfg.tokens_per_buffer = (
+                self.cfg.train_batch_size_tokens
+                * self.cfg.context_size
+                * self.cfg.n_batches_in_buffer
+            )
 
         if override_model is None:
             if self.cached_activations_only:
@@ -1882,21 +1956,48 @@ class LanguageModelSAETrainingRunner:
         Exits after total_producer_steps steps to stay in lockstep with consumers.
         """
         ctx_size = self.activations_store.training_context_size
-        remaining_training_tokens = max(
-            self.cfg.total_training_tokens - self._resume_training_samples(),
-            0,
-        )
         rows_per_consumer_step = self._v2_rows_per_consumer_step(ctx_size)
         buffer_size = self.cfg.n_batches_in_buffer * ctx_size
+        if self.cfg.routing_dp_batch_mode == "exact":
+            from sae_lens.training.dp_batch import (
+                balanced_token_counts,
+                local_token_budget,
+            )
+
+            target_samples = [
+                local_token_budget(
+                    self._global_training_tokens,
+                    self._global_train_batch_size_tokens,
+                    self.sae_dp_size,
+                    idx,
+                )
+                for idx in range(self.sae_dp_size)
+            ]
+            train_batch_sizes = list(
+                balanced_token_counts(
+                    self._global_train_batch_size_tokens, self.sae_dp_size
+                )
+            )
+        else:
+            remaining_training_tokens = max(
+                self.cfg.total_training_tokens - self._resume_training_samples(),
+                0,
+            )
+            target_samples = [remaining_training_tokens] * len(rows_per_consumer_step)
+            train_batch_sizes = [self.cfg.train_batch_size_tokens] * len(
+                rows_per_consumer_step
+            )
         total_producer_steps = max(
             self._mixing_buffer_source_steps_needed(
-                target_samples=remaining_training_tokens,
+                target_samples=target,
                 source_batch_size=rows_per_step,
                 buffer_size=buffer_size,
-                train_batch_size=self.cfg.train_batch_size_tokens,
+                train_batch_size=batch_size,
                 mix_fraction=self.cfg.activations_mixing_fraction,
             )
-            for rows_per_step in rows_per_consumer_step
+            for rows_per_step, target, batch_size in zip(
+                rows_per_consumer_step, target_samples, train_batch_sizes
+            )
         )
 
         window_profiler = self._make_vllm_window_profiler(
@@ -2206,10 +2307,18 @@ class LanguageModelSAETrainingRunner:
 
         self._streaming_buffer_name = buffer_name
         self._streaming_num_hooks = len(self.hook_names)
-        chunks_per_sae_replica = math.ceil(
-            cfg.training_tokens / cfg.streaming_chunk_size_tokens
+        self._streaming_mixing_streams = (
+            cfg.streaming_mixing_streams or max(1, self.sae_dp_size)
         )
-        target_chunks = chunks_per_sae_replica * max(1, self.sae_dp_size)
+        if cfg.streaming_dp_batch_mode == "exact":
+            target_chunks = math.ceil(
+                self._global_training_tokens / cfg.streaming_chunk_size_tokens
+            )
+        else:
+            chunks_per_sae_replica = math.ceil(
+                cfg.training_tokens / cfg.streaming_chunk_size_tokens
+            )
+            target_chunks = chunks_per_sae_replica * max(1, self.sae_dp_size)
         self._streaming_target_chunks = target_chunks
 
         # Multi-hook: each chunk stores all hooks' activations concatenated.
@@ -2217,6 +2326,7 @@ class LanguageModelSAETrainingRunner:
         if (
             not getattr(self, "_use_gpu_direct", False)
             and self.sae_dp_size > 1
+            and cfg.streaming_dp_batch_mode == "equal_cohort"
             and cfg.streaming_num_chunks < self.sae_dp_size
         ):
             raise ValueError(
@@ -2585,7 +2695,11 @@ class LanguageModelSAETrainingRunner:
                 self.cfg.training_tokens / self.cfg.streaming_chunk_size_tokens
             )
             target_chunks = chunks_per_sae_replica * max(1, self.sae_dp_size)
-        total_tokens = target_chunks * chunk_size
+        total_tokens = (
+            self._global_training_tokens
+            if self.cfg.streaming_dp_batch_mode == "exact"
+            else target_chunks * chunk_size
+        )
         buf = self._streaming_buffer
         store = self.activations_store
 
@@ -3121,9 +3235,6 @@ class LanguageModelSAETrainingRunner:
 
     def _run_streaming_consumer_loop(self) -> TrainingSAE[Any]:
         import sae_lens.distributed_streaming as ds
-        from sae_lens.training.async_streaming_activation_provider import (
-            AsyncStreamingActivationProvider,
-        )
 
         sae_tp_group = ds.get_sae_tp_group()
         sae_tp_size = ds.get_sae_tp_size()
@@ -3165,7 +3276,7 @@ class LanguageModelSAETrainingRunner:
             else None
         )
 
-        provider = AsyncStreamingActivationProvider(
+        provider_kwargs = dict(
             buffer=self._streaming_buffer,
             train_batch_size_tokens=self.cfg.train_batch_size_tokens,
             prefetch_chunks=self.cfg.streaming_prefetch_chunks,
@@ -3197,13 +3308,93 @@ class LanguageModelSAETrainingRunner:
             sae_dp_idx=dp_idx,
             sae_pp_size=self.sae_pp_size,
             pp_rank=pp_rank,
-            replica_root_global_rank=(
-                pp_root_global
-                if self.sae_pp_size > 1
-                else ds.get_consumer_tp_root()
-            ),
-            coord_name=self._streaming_buffer_name,
         )
+
+        if self.cfg.streaming_dp_batch_mode == "exact":
+            from sae_lens.training.dp_batch import balanced_token_counts
+            from sae_lens.training.exact_dp_batch_provider import (
+                ExactDataParallelBatchProvider,
+            )
+            from sae_lens.training.logical_streaming_mixer import (
+                LogicalStreamingMixingProvider,
+            )
+            from sae_lens.training.streaming_activation_provider import (
+                StreamingActivationProvider,
+            )
+
+            # DP0 owns fixed logical rolling-mix states. Other replicas only
+            # consume exact token slices, so physical DP does not own mixing state.
+            logical_provider = None
+            if dp_idx == 0:
+                logical_kwargs = dict(provider_kwargs)
+                logical_kwargs["train_batch_size_tokens"] = (
+                    self.cfg.streaming_chunk_size_tokens
+                )
+                logical_kwargs["sae_dp_size"] = 1
+                logical_kwargs["sae_dp_idx"] = 0
+                logical_kwargs["mixing_shard_index"] = 0
+                logical_kwargs["shuffle"] = False
+                logical_kwargs["mix_chunks"] = 0
+                logical_kwargs["mix_fraction"] = 0.0
+                raw_provider = StreamingActivationProvider(**logical_kwargs)
+                logical_counts = balanced_token_counts(
+                    self._global_train_batch_size_tokens,
+                    self._streaming_mixing_streams,
+                )
+                per_stream_capacity = max(
+                    max(logical_counts),
+                    self.cfg.streaming_mix_chunks
+                    * self.cfg.streaming_chunk_size_tokens,
+                )
+                logical_provider = LogicalStreamingMixingProvider(
+                    source=raw_provider,
+                    global_batch_size=self._global_train_batch_size_tokens,
+                    stream_count=self._streaming_mixing_streams,
+                    buffer_size_per_stream=per_stream_capacity,
+                    mix_fraction=(
+                        self.cfg.streaming_mix_fraction
+                        if self.cfg.streaming_mix_chunks > 0
+                        else 0.0
+                    ),
+                    shuffle=self.cfg.streaming_shuffle,
+                    seed=self.cfg.seed,
+                )
+            if self.sae_dp_size > 1:
+                dp_group = ds.get_sae_dp_group()
+                if dp_group is None:
+                    raise RuntimeError("exact streaming requires an SAE-DP group")
+                selected_hooks = (
+                    pp_hook_names
+                    if pp_hook_names is not None
+                    else (self.hook_names if self.is_multi_sae else None)
+                )
+                provider = ExactDataParallelBatchProvider(
+                    source=logical_provider,
+                    dp_group=dp_group,
+                    dp_idx=dp_idx,
+                    dp_size=self.sae_dp_size,
+                    device=self.device,
+                    dtype=str_to_dtype(self.cfg.dtype),
+                    d_model=self.cfg.sae.d_in,
+                    hook_names=selected_hooks,
+                )
+            else:
+                assert logical_provider is not None
+                provider = logical_provider
+        else:
+            from sae_lens.training.async_streaming_activation_provider import (
+                AsyncStreamingActivationProvider,
+            )
+
+            provider = AsyncStreamingActivationProvider(
+                **provider_kwargs,
+                replica_root_global_rank=(
+                    pp_root_global
+                    if self.sae_pp_size > 1
+                    else ds.get_consumer_tp_root()
+                ),
+                coord_name=self._streaming_buffer_name,
+            )
 
         return self._run_streaming_consumer_multi(provider, ds)
 
@@ -3278,15 +3469,32 @@ class LanguageModelSAETrainingRunner:
 
     def _run_streaming_consumer_single(self, provider: Any, ds: Any) -> TrainingSAE[Any]:
         sae_dp_group = ds.get_sae_dp_group() if self.sae_dp_size > 1 else None
+        trainer_cfg = self.cfg.to_sae_trainer_config()
+        if self.cfg.streaming_dp_batch_mode == "exact" and self.sae_dp_size > 1:
+            from sae_lens.training.dp_batch import (
+                balanced_token_counts,
+                local_token_budget,
+            )
+
+            dp_idx = ds.get_sae_dp_idx()
+            trainer_cfg.train_batch_size_samples = balanced_token_counts(
+                self._global_train_batch_size_tokens, self.sae_dp_size
+            )[dp_idx]
+            trainer_cfg.total_training_samples = local_token_budget(
+                self._global_training_tokens,
+                self._global_train_batch_size_tokens,
+                self.sae_dp_size,
+                dp_idx,
+            )
         trainer = SAETrainer(
             sae=self.sae,
             base_sae=self._base_sae,
             data_provider=provider,
             evaluator=None,
             save_checkpoint_fn=self._streaming_save_checkpoint,
-            cfg=self.cfg.to_sae_trainer_config(),
+            cfg=trainer_cfg,
             dp_group=sae_dp_group,
-            token_count_weighted_dp=False,
+            token_count_weighted_dp=(self.cfg.streaming_dp_batch_mode == "exact"),
             append_logs=self.cfg.resume_from_checkpoint is not None
             or self.cfg.append_history_logs,
         )
@@ -3342,6 +3550,24 @@ class LanguageModelSAETrainingRunner:
         )
         sae_dp_group = ds.get_sae_dp_group() if self.sae_dp_size > 1 else None
         trainer_cfg = self.cfg.to_sae_trainer_config()
+        if self.cfg.streaming_dp_batch_mode == "exact" and self.sae_dp_size > 1:
+            from sae_lens.training.dp_batch import (
+                balanced_token_counts,
+                local_token_budget,
+            )
+
+            import sae_lens.distributed_streaming as streaming_dist
+
+            dp_idx = streaming_dist.get_sae_dp_idx()
+            trainer_cfg.train_batch_size_samples = balanced_token_counts(
+                self._global_train_batch_size_tokens, self.sae_dp_size
+            )[dp_idx]
+            trainer_cfg.total_training_samples = local_token_budget(
+                self._global_training_tokens,
+                self._global_train_batch_size_tokens,
+                self.sae_dp_size,
+                dp_idx,
+            )
         trainer_cfg.multi_sae_tp_phase_fence_runtime_hazard = bool(
             self.sae_active and self.vllm_active
         )
@@ -3354,7 +3580,7 @@ class LanguageModelSAETrainingRunner:
             save_checkpoint_fn=self._streaming_save_checkpoint,
             cfg=trainer_cfg,
             dp_group=sae_dp_group,
-            token_count_weighted_dp=False,
+            token_count_weighted_dp=(self.cfg.streaming_dp_batch_mode == "exact"),
             sae_dp_mode=self.cfg.sae_dp_mode,
             backward_mode=self.cfg.multi_sae_backward_mode,
             seed_mode=self.cfg.multi_sae_seed_mode,
