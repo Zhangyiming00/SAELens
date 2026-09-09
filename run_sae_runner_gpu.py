@@ -1,11 +1,5 @@
 """Minimal GPU entrypoint for real SAE training via LanguageModelSAETrainingRunner.
 
-This is intentionally simpler than ``scripts/train_tp.py``:
-- defaults to single-GPU
-- uses the real runner / activation-store / trainer flow
-- keeps eval / wandb / compilation off
-- aims to be easy to start, not maximally fast
-
 Example:
     python3 scripts/run_sae_runner_gpu.py \
         --model-name /data/models/Llama-3.1-8B \
@@ -18,10 +12,6 @@ Example:
         --context-size 32 \
         --max-model-len 128 \
         --output-path /tmp/saelens_runner_gpu_smoke
-
-Streaming startup removes stale topology-switch shared-memory files by default.
-Pass ``--no_cleanup`` with ``--streaming-mode`` to preserve them.
-
 """
 
 from __future__ import annotations
@@ -35,7 +25,6 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-
 import torch
 import torch.distributed as dist
 from transformers import AutoConfig
@@ -48,145 +37,147 @@ from sae_lens.training.multi_sae_trainer import MULTI_SAE_MANIFEST_FILENAME
 from sae_lens.topology_control import BufferParams, read_control_state, write_control_state
 from sae_lens.util import extract_layer_from_tlens_hook_name
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name","--model", default="/root/models/Llama-3.1-8B")
-    parser.add_argument("--dataset-path","--dataset", default="/mnt/L202500425/dzl/datasets/wikitext2_tokenized_llama31_ctx2048")
-    parser.add_argument("--hook-name","--hook", default="blocks.21.hook_resid_post")
-    parser.add_argument("--hook-names","--hooks",
-        # default=None,
+    # 1. vLLM parameters
+    parser.add_argument("--model-name", "--model", default="/root/models/Llama-3.1-8B")
+    parser.add_argument("--dataset-path", "--dataset", default="/mnt/L202500425/dzl/datasets/wikitext2_tokenized_llama31_ctx2048")
+    parser.add_argument("--context-size", type=int, default=2048)
+    parser.add_argument("--max-model-len", type=int, default=2049)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+
+    # 2. SAE parameters
+    parser.add_argument("--hook-name", "--hook", default="blocks.21.hook_resid_post")
+    parser.add_argument("--hook-names", "--hooks",
         default="blocks.21.hook_resid_post,blocks.31.hook_resid_post",
         help="Comma-separated hook names for multi-layer independent SAE training.",
     )
     parser.add_argument("--d-sae", type=int, default=32768)
     parser.add_argument("--k", type=int, default=128)
-    parser.add_argument(
-        "--use-sparse-activations",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use COO sparse Top-K activations during SAE training (default: disabled).",
-    )
-    parser.add_argument(
-        "--no-rescale-acts-by-decoder-norm",
-        dest="rescale_acts_by_decoder_norm",
-        action="store_false",
-        default=True,
-        help="Disable TopK rescale_acts_by_decoder_norm (default: enabled).",
-    )
-    parser.add_argument("--tp-size", "-tp", type=int, default=1)
-    parser.add_argument("--vllm-tp-size","-vtp", type=int, default=None)
-    parser.add_argument("--sae-tp-size", "-stp", type=int, default=None)
-    parser.add_argument("--vllm-dp-size","-vdp", type=int, default=1)
-    parser.add_argument("--sae-dp-size", "-sdp", type=int, default=1)
-    # DP convenience aliases. These are normalized after parsing so the original
-    # --sae-dp-size + --sae-dp-mode interface remains fully supported.
-    parser.add_argument(
-        "--ddp","-ddp",
-        action="store_true",
-        help="Shortcut for --sae-dp-mode ddp.",
-    )
-    parser.add_argument(
-        "--fsdp","-fsdp",
-        action="store_true",
-        help="Shortcut for --sae-dp-mode fsdp.",
-    )
-    parser.add_argument(
-        "-sddp",
-        dest="sae_ddp_size",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Shortcut for --sae-dp-size N --sae-dp-mode ddp. Also accepts -sddpN.",
-    )
-    parser.add_argument(
-        "-sfsdp",
-        dest="sae_fsdp_size",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Shortcut for --sae-dp-size N --sae-dp-mode fsdp. Also accepts -sfsdpN.",
-    )
-    parser.add_argument("--sae-pp-size", "-spp", type=int, default=1)
-    parser.add_argument("--training-tokens", type=int, default=2048*4096)
+    parser.add_argument("--training-tokens", type=int, default=2048 * 4096)
     parser.add_argument("--train-batch-size-tokens", type=int, default=2048)
-    parser.add_argument("--context-size", type=int, default=2048)
-    parser.add_argument(
-        "--store-batch-size-prompts",
-        type=int,
-        default=8,
-        help=(
-            "Baseline number of prompts fetched by one vLLM DP producer per batch. "
-            "In non-streaming mode it is automatically scaled by "
-            "sae_dp_size / vllm_dp_size by default."
-        ),
-    )
-    parser.add_argument(
-        "--auto-scale-store-batch-size-prompts",
-        dest="auto_scale_store_batch_size_prompts",
-        action="store_true",
-        default=True,
-        help=(
-            "Automatically scale --store-batch-size-prompts for non-streaming DP "
-            "topologies (default: enabled)."
-        ),
-    )
-    parser.add_argument(
-        "--no-auto-scale-store-batch-size-prompts",
-        dest="auto_scale_store_batch_size_prompts",
-        action="store_false",
-        help="Keep --store-batch-size-prompts unchanged in all non-streaming topologies.",
-    )
-    parser.add_argument("--n-batches-in-buffer", type=int, default=None)
-    parser.add_argument("--activations-mixing-fraction", type=float, default=0.5)
-    parser.add_argument(
-        "--dead-feature-window",
-        type=int,
-        default=1000,
+    parser.add_argument("--dead-feature-window", type=int, default=1000,
         help=(
             "Training steps before a feature is considered dead for TopK aux loss. "
             "Use a negative value for profiling the all-dead aux-loss worst case."
         ),
     )
-    parser.add_argument("--max-model-len", type=int, default=2049)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
-    parser.add_argument("--dtype", default="float32")
-    parser.add_argument("--autocast", action="store_true")
-    parser.add_argument("--autocast-lm", action="store_true")
-    parser.add_argument(
-        "--is-dataset-tokenized",
-        dest="is_dataset_tokenized",
-        action="store_true",
-        default=True,
+    parser.add_argument("--output-path",
+        default=f"results/2.4/saelens_run_{datetime.now().strftime('%y%m%d_%H%M%S')}",
     )
-    parser.add_argument(
-        "--no-is-dataset-tokenized",
-        dest="is_dataset_tokenized",
-        action="store_false",
-        help="Dataset has a 'text' column (not pre-tokenized).",
+
+    # 3. Parallelism parameters (including streaming)
+    parser.add_argument("--vllm-tp-size", "-vtp", type=int, default=None)
+    parser.add_argument("--sae-tp-size", "-stp", type=int, default=None)
+    parser.add_argument("--vllm-dp-size", "-vdp", type=int, default=1)
+    parser.add_argument("--sae-dp-size", "-sdp", type=int, default=1)
+    parser.add_argument("--sae-pp-size", "-spp", type=int, default=1)
+    parser.add_argument("--ddp", "-ddp", action="store_true", help="sae dp mode, ddp")
+    parser.add_argument("--fsdp", "-fsdp", action="store_true", help="sae dp mode, fsdp")
+    parser.add_argument("--streaming-mode", "--streaming", action="store_true", default=False,
+        help="Enable streaming_mode v1 (vLLM producers + SAE consumers via /dev/shm).",
     )
+    parser.add_argument("--elastic-permanent-vllm-dp-size", "-evdp", type=int, default=None,
+        help="Number of vLLM DP replicas whose role never changes.",
+    )
+    parser.add_argument("--elastic-permanent-sae-dp-size", "-esdp", type=int, default=None,
+        help="Number of SAE DP replicas whose role never changes.",
+    )
+
+    # 4.1 Buffer parameters (non streaming)
+    parser.add_argument("--store-batch-size-prompts", type=int, default=8,
+        help=(
+            "Baseline number of prompts fetched by one vLLM DP producer per batch. "
+            "In non-streaming mode it is automatically scaled by sae_dp_size / vllm_dp_size by default."
+        ),
+    )
+    parser.add_argument("--n-batches-in-buffer", type=int, default=None)
+    parser.add_argument("--activations-mixing-fraction", type=float, default=0.5)
     parser.add_argument("--act-store-device", default="cuda")
-    parser.add_argument(
-        "--output-path",
-        default=f"results/results_2.3_H5_asynctpddp_long1/saelens_runner_gpu_{datetime.now().strftime('%y%m%d_%H%M%S')}",
+    parser.add_argument("--routing-dp-batch-mode", choices=["equal", "exact"], default="equal",
+        help=(
+            "Routing batch ownership. 'equal' keeps the legacy divisible per-DP "
+            "batch; 'exact' treats train batch/training tokens as global values "
+            "and uses floor/ceil local batches."
+        ),
     )
+    # 4.2 Buffer parameters (streaming)
+    parser.add_argument("--streaming-chunk-size-tokens", type=int, default=8192,
+        help="Tokens per shared-memory chunk in streaming_mode.",
+    )
+    parser.add_argument(
+        "--streaming-dp-batch-mode", choices=["equal_cohort", "exact"], default="equal_cohort",
+        help=(
+            "SHM streaming allocation. 'equal_cohort' preserves legacy full-chunk "
+            "cohorts; 'exact' keeps fixed logical mixing streams and shards each "
+            "global batch exactly across physical SAE-DP."
+        ),
+    )
+    parser.add_argument("--streaming-num-chunks", type=int, default=32,
+        help="Number of shared-memory chunk slots in streaming_mode.",
+    )
+    parser.add_argument("--streaming-prefetch-chunks", type=int, default=2,
+        help="Max chunks to acquire per consumer refill in streaming_mode.",
+    )
+    parser.add_argument("--streaming-mix-chunks", type=int, default=8,
+        help=(
+            "Consumer-local rolling mixing window in shared-memory chunks. "
+            "Set 0 to disable and serve each prefetch pool directly."
+        ),
+    )
+    parser.add_argument("--streaming-mix-fraction", type=float, default=0.5,
+        help="Fraction of the local rolling mix window kept for the next refill.",
+    )
+    parser.add_argument("--streaming-mixing-streams", type=int, default=0,
+        help=(
+            "Number of topology-independent mixing streams in exact mode. "
+            "0 uses the initial SAE DP size; set it explicitly before a later "
+            "DP resize."
+        ),
+    )
+    parser.add_argument(
+        "--streaming-buffer-name", type=str, default="",
+        help="Shared buffer name (auto-generated if empty) in streaming_mode.",
+    )
+    parser.add_argument(
+        "--no-streaming-shuffle", action="store_false", dest="streaming_shuffle",
+        help="Disable per-refill token shuffle in streaming_mode.",
+    )
+    parser.set_defaults(streaming_shuffle=True)
+    parser.add_argument(
+        "--no-streaming-random-chunks", action="store_false", dest="streaming_random_chunks",
+        help="Disable random chunk selection in streaming_mode (use lowest-index READY slots).",
+    )
+    parser.set_defaults(streaming_random_chunks=True)
+    parser.add_argument(
+        "--streaming-use-gpu-direct", action="store_true", default=False,
+        help="Enable GPU direct NCCL streaming (vLLM→SAE GPU-to-GPU transfer, no CPU copy).",
+    )
+    parser.add_argument(
+        "--streaming-staging-queue-capacity", type=int, default=4,
+        help="GPU staging queue capacity (chunks) for GPU direct streaming.",
+    )
+    parser.add_argument(
+        "--streaming-consumer-prefill-chunks", type=int, default=0,
+        help=(
+            "GPU direct consumer prefill target in chunks. Set 0 to disable; "
+            "values >0 wait for post-mixing serving tokens before training starts."
+        ),
+    )
+
+    # 5. Profiling parameters
     parser.add_argument("--save-mse-every-n-steps", type=int, default=32)
     parser.add_argument("--save-timing-every-n-steps", type=int, default=512)
     parser.add_argument("--save-memory-every-n-steps", type=int, default=512)
     parser.add_argument(
-        "--save-vllm-memory-every-n-steps",
-        type=int,
-        default=0,
+        "--save-vllm-memory-every-n-steps", type=int, default=0,
         help=(
             "Save vLLM decoder substage memory records every N capture calls. "
             "0 disables it. Writes vllm_memory_history_rank{rank}.jsonl."
         ),
     )
     parser.add_argument(
-        "--vllm-memory-probe-layer",
-        type=int,
-        default=None,
+        "--vllm-memory-probe-layer", type=int, default=None,
         help=(
             "Decoder layer index for vLLM substage memory profiling "
             "(ln1/attn/ln2/mlp). Defaults to the layer in --hook-name when "
@@ -194,55 +185,49 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--record-memory-empty-cache",
-        action="store_true",
-        help="When memory profiling is on, call torch.cuda.empty_cache() before "
-        "each per-phase snapshot so reserved/driver_used reflect current live "
-        "tensors, not the historical watermark. Adds tens of ms per phase; "
-        "profiling-only.",
+        "--record-memory-empty-cache", action="store_true",
+        help=(
+            "When memory profiling is on, call torch.cuda.empty_cache() before "
+            "each per-phase snapshot so reserved/driver_used reflect current live "
+            "tensors, not the historical watermark. Adds tens of ms per phase; "
+            "profiling-only."
+        ),
     )
     parser.add_argument(
-        "--record-memory-timeline-step",
-        type=int,
-        default=-1,
-        help="When >= 0, record the full PyTorch alloc/free history (every "
-        "event with its Python stack, plus the peak-moment snapshot) for that "
-        "single training step and dump it to memory_timeline_rank{rank}.pickle "
-        "in output_path. Open at https://pytorch.org/memory_viz. Profiling-only; "
-        "-1 disables.",
+        "--record-memory-timeline-step", type=int, default=-1,
+        help=(
+            "When >= 0, record the full PyTorch alloc/free history (every event with "
+            "its Python stack, plus the peak-moment snapshot) for that single training "
+            "step and dump it to memory_timeline_rank{rank}.pickle in output_path. "
+            "Open at https://pytorch.org/memory_viz. Profiling-only; -1 disables."
+        ),
     )
     parser.add_argument(
-        "--record-vllm-memory-timeline-step",
-        type=int,
-        default=-1,
-        help="When >= 0, record the full vLLM forward allocator history for that "
-        "single activation-generation step and dump it to "
-        "memory_timeline_vllm[_tp{rank}].pickle in output_path (one per TP rank). "
-        "Requires --save-vllm-memory-every-n-steps > 0 (live vLLM). "
-        "Open at https://pytorch.org/memory_viz. -1 disables.",
+        "--record-vllm-memory-timeline-step", type=int, default=-1,
+        help=(
+            "When >= 0, record the full vLLM forward allocator history for that "
+            "single activation-generation step and dump it to "
+            "memory_timeline_vllm[_tp{rank}].pickle in output_path (one per TP rank). "
+            "Requires --save-vllm-memory-every-n-steps > 0 (live vLLM). Open at "
+            "https://pytorch.org/memory_viz. -1 disables."
+        ),
     )
     parser.add_argument(
-        "--append-history-logs",
-        action="store_true",
-        default=False,
+        "--append-history-logs", action="store_true", default=False,
         help=(
             "Append mse/timing history logs instead of truncating them at trainer "
             "startup. Topology-supervisor phases use this to preserve each phase."
         ),
     )
     parser.add_argument(
-        "--synchronize-timing",
-        action="store_true",
-        default=False,
+        "--synchronize-timing", action="store_true", default=False,
         help=(
             "If set, force CUDA sync around timed regions for measurement accuracy. "
             "This can perturb runtime; keep disabled for throughput/overlap runs."
         ),
     )
     parser.add_argument(
-        "--step-window-profile-start-step",
-        type=int,
-        default=65,
+        "--step-window-profile-start-step", type=int, default=65,
         help=(
             "First step of the first step-window profiling window (1-based). "
             "Windows are contiguous, so --step-window-profile-start-step 11 with "
@@ -255,21 +240,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--step-window-profile-window-steps",
-        type=int,
-        default=64,
+        "--step-window-profile-window-steps", type=int, default=64,
         help="Steps per step-window profiling window.",
     )
     parser.add_argument(
-        "--step-window-profile-window-count",
-        type=int,
-        default=14,
+        "--step-window-profile-window-count", type=int, default=14,
         help="Number of consecutive step-window profiling windows to record.",
     )
     parser.add_argument(
-        "--step-window-profile-vllm-start-step",
-        type=int,
-        default=0,
+        "--step-window-profile-vllm-start-step", type=int, default=0,
         help=(
             "Override --step-window-profile-start-step on vLLM producer ranks in "
             "streaming/split-role modes, where a step is one produced chunk or "
@@ -278,27 +257,98 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--step-window-profile-vllm-window-steps",
-        type=int,
-        default=0,
+        "--step-window-profile-vllm-window-steps", type=int, default=0,
         help="Override --step-window-profile-window-steps on vLLM producer ranks.",
     )
     parser.add_argument(
-        "--step-window-profile-vllm-window-count",
-        type=int,
-        default=0,
+        "--step-window-profile-vllm-window-count", type=int, default=0,
         help="Override --step-window-profile-window-count on vLLM producer ranks.",
     )
-    parser.add_argument("--checkpoint-path", default="checkpoints/1.60/")
+    # 6. DP parameters
     parser.add_argument(
-        "--checkpoint-storage",
-        choices=["memory", "disk"],
-        default="memory",
+        "--ddp-broadcast-buffers", dest="ddp_broadcast_buffers", action="store_true", default=None,
+        help="Explicitly set DDP broadcast_buffers=True.",
+    )
+    parser.add_argument(
+        "--no-ddp-broadcast-buffers", dest="ddp_broadcast_buffers", action="store_false",
+        help="Explicitly set DDP broadcast_buffers=False.",
+    )
+    parser.add_argument(
+        "--ddp-find-unused-parameters", dest="ddp_find_unused_parameters",
+        action="store_true", default=None,
+        help="Explicitly set DDP find_unused_parameters=True.",
+    )
+    parser.add_argument(
+        "--no-ddp-find-unused-parameters", dest="ddp_find_unused_parameters", action="store_false",
+        help="Explicitly set DDP find_unused_parameters=False.",
+    )
+    parser.add_argument(
+        "--ddp-gradient-as-bucket-view", dest="ddp_gradient_as_bucket_view",
+        action="store_true", default=True,
+        help=(
+            "Use DDP bucket-backed gradients (the effective default, avoiding a "
+            "second gradient-sized allocation)."
+        ),
+    )
+    parser.add_argument(
+        "--no-ddp-gradient-as-bucket-view", dest="ddp_gradient_as_bucket_view",
+        action="store_false",
+        help=(
+            "Disable bucket-backed gradients on the standard DDP/off path. "
+            "The optimizer-overlap path requires and forces bucket views."
+        ),
+    )
+    parser.add_argument(
+        "--ddp-static-graph", dest="ddp_static_graph", action="store_true", default=None,
+        help="Explicitly set DDP static_graph=True.",
+    )
+    parser.add_argument(
+        "--no-ddp-static-graph", dest="ddp_static_graph", action="store_false",
+        help="Explicitly set DDP static_graph=False.",
+    )
+    parser.add_argument(
+        "--ddp-bucket-cap-mb", type=int, default=None,
+        help="Explicitly set DDP bucket_cap_mb.",
+    )
+    parser.add_argument(
+        "--ddp-config-strict", action="store_true", default=False,
+        help="Fail fast on invalid DDP config combinations instead of fallback.",
+    )
+    parser.add_argument(
+        "--fsdp-backward-prefetch", default="backward_pre",
+        choices=["backward_pre", "backward_post", "none"],
+        help=(
+            "FSDP backward prefetch policy. Use 'none' to disable FSDP's default "
+            "BACKWARD_PRE full-parameter prefetch/caching behavior."
+        ),
+    )
+    parser.add_argument(
+        "--fsdp-forward-prefetch", dest="fsdp_forward_prefetch",
+        action="store_true", default=False,
+        help="Enable FSDP forward prefetch for unified multi-hook static execution order.",
+    )
+    parser.add_argument(
+        "--no-fsdp-forward-prefetch", dest="fsdp_forward_prefetch", action="store_false",
+        help="Disable FSDP forward prefetch.",
+    )
+    parser.add_argument(
+        "--fsdp-sharding-strategy", default="shard_grad_op",
+        choices=["shard_grad_op", "full_shard", "no_shard"],
+        help=(
+            "FSDP sharding strategy. 'shard_grad_op' keeps full parameters after "
+            "forward and shards gradients/optimizer state, avoiding a backward "
+            "parameter all-gather. 'full_shard' reshards parameters after forward."
+        ),
+    )
+
+    # 7. Save and path parameters
+    parser.add_argument("--checkpoint-path", default="checkpoints/")
+    parser.add_argument(
+        "--checkpoint-storage", choices=["memory", "disk"], default="memory",
         help="Storage backend for quiesce checkpoints in topology-supervisor mode.",
     )
     parser.add_argument(
-        "--quiesce-checkpoint-path",
-        default=None,
+        "--quiesce-checkpoint-path", default=None,
         help=(
             "Checkpoint base path used for quiesce checkpoints when "
             "--checkpoint-storage=memory. The supervisor supplies this."
@@ -306,59 +356,78 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n-checkpoints", type=int, default=0)
     parser.add_argument(
-        "--save-final-checkpoint",
-        dest="save_final_checkpoint",
-        action="store_true",
-        default=False,
+        "--save-final-checkpoint", dest="save_final_checkpoint", action="store_true", default=False,
         help="Write the final training checkpoint (default: disabled).",
     )
     parser.add_argument(
         "--no-save-final-checkpoint", "--no-final-checkpoint", "-nsfc", "-nfc",
-        dest="save_final_checkpoint",
-        action="store_false",
+        dest="save_final_checkpoint", action="store_false",
         help="Do not write the final training checkpoint (default; short: -nsfc / -nfc).",
     )
     parser.add_argument(
         "--no-save-final-sae", "--no-final-sae", "-nsfs", "-nfs",
-        dest="no_save_final_sae",
-        action="store_true",
-        default=False,
+        dest="no_save_final_sae", action="store_true", default=False,
         help="Do not write final SAE weights to output_path (short: -nsfs / -nfs).",
     )
     parser.add_argument(
-        "--no-save-final", "-nsf",
-        action="store_true",
-        default=False,
+        "--no-save-final", "-nsf", action="store_true", default=False,
         help="Disable both the final checkpoint and final SAE save.",
     )
     parser.add_argument("--resume-from-checkpoint", default=None)
+    parser.add_argument("--elastic-streaming-control-path", type=str, default="/tmp/saelens_control_state.json",
+        help=(
+            "Enable in-process streaming DP hot switching and store its manual "
+            "control state at this path. This is separate from topology-supervisor."
+        ),
+    )
+    parser.add_argument(
+        "--control-state-path", type=str, default="/tmp/saelens_topology_control.json",
+        help=(
+            "Path to control_state.json written by topology_supervisor.py. "
+            "When provided, topology (vllm_tp, vllm_dp, sae_tp), buffer_name, "
+            "and checkpoint_path are read from this file and override CLI args."
+        ),
+    )
+
+    # 7. General settings
+    parser.add_argument(
+        "--use-sparse-activations", action=argparse.BooleanOptionalAction, default=False,
+        help="Use COO sparse Top-K activations during SAE training (default: disabled).",
+    )
+    parser.add_argument(
+        "--no-rescale-acts-by-decoder-norm", dest="rescale_acts_by_decoder_norm",
+        action="store_false", default=True,
+        help="Disable TopK rescale_acts_by_decoder_norm (default: enabled).",
+    )
+    parser.add_argument("--dtype", default="float32")
+    parser.add_argument("--autocast", action="store_true")
+    parser.add_argument("--autocast-lm", action="store_true")
+    parser.add_argument(
+        "--is-dataset-tokenized", dest="is_dataset_tokenized", action="store_true", default=True,
+    )
+    parser.add_argument(
+        "--no-is-dataset-tokenized", dest="is_dataset_tokenized", action="store_false",
+        help="Dataset has a 'text' column (not pre-tokenized).",
+    )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--use-shard-routing", action="store_true",default=True,
-                        help="Use unified shard-routing DP (supports arbitrary vllm_dp:sae_dp ratios).")
     parser.add_argument(
-        "--routing-dp-batch-mode",
-        choices=["equal", "exact"],
-        default="equal",
+        "--use-cached-activations", action="store_true", default=False,
         help=(
-            "Routing batch ownership. 'equal' keeps the legacy divisible per-DP "
-            "batch; 'exact' treats train batch/training tokens as global values "
-            "and uses floor/ceil local batches."
+            "Train SAE(s) from a pre-computed activations cache produced by "
+            "CacheActivationsRunner. vLLM is not loaded. Mutually exclusive with "
+            "--streaming-mode and --control-state-path."
         ),
     )
     parser.add_argument(
-        "--sae-dp-mode",
-        default=None,
-        choices=["manual", "ddp", "fsdp"],
+        "--cached-activations-path", type=str, default=None,
         help=(
-            "SAE data-parallel sync mode. 'ddp' replicates SAE parameters across DP "
-            "replicas; 'fsdp' shards them. Default: ddp. Use "
-            "'--sae-dp-mode manual' explicitly to select manual mode."
+            "Path to the cached activations directory (split-by-hook or monolithic "
+            "HuggingFace Dataset). Required when --use-cached-activations is set."
         ),
     )
+    #7. settings for overlap ,and others 
     parser.add_argument(
-        "--multi-sae-backward-mode",
-        default="combined",
-        choices=["combined", "sequential"],
+        "--multi-sae-backward-mode", default="combined", choices=["combined", "sequential"],
         help=(
             "Multi-layer SAE backward mode. 'combined' keeps all layer graphs "
             "until one backward to allow DDP/FSDP communication overlap with "
@@ -366,27 +435,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--multi-sae-backward-order",
-        default="forward",
+        "--multi-sae-backward-order", default="forward",
         choices=["forward", "reverse", "largest_first"],
         help="Backward order for sequential multi-layer backward mode.",
     )
     parser.add_argument(
-        "--multi-sae-stats-sync-mode",
-        default="immediate",
-        choices=["immediate", "deferred", "periodic"],
-        help="When to DP-sync per-layer firing/token stats in multi-layer mode.",
-    )
-    parser.add_argument(
-        "--multi-sae-stats-sync-interval",
-        type=int,
-        default=1,
-        help="Sync interval for --multi-sae-stats-sync-mode=periodic.",
-    )
-    parser.add_argument(
-        "--multi-sae-seed-mode",
-        default="same",
-        choices=["same", "offset"],
+        "--multi-sae-seed-mode", default="same", choices=["same", "offset"],
         help=(
             "How to seed independent SAE initializations in multi-layer mode. "
             "'same' matches separate single-layer runs with the same --seed; "
@@ -394,8 +448,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--multi-sae-distributed-architecture",
-        default="unified_multi_hook",
+        "--multi-sae-stats-sync-mode", default="immediate",
+        choices=["immediate", "deferred", "periodic"],
+        help="When to DP-sync per-layer firing/token stats in multi-layer mode.",
+    )
+    parser.add_argument(
+        "--multi-sae-stats-sync-interval", type=int, default=1,
+        help="Sync interval for --multi-sae-stats-sync-mode=periodic.",
+    )
+    parser.add_argument(
+        "--multi-sae-distributed-architecture", default="unified_multi_hook",
         choices=["legacy_per_hook_wrapper", "unified_multi_hook"],
         help=(
             "Multi-layer SAE distributed wrapper architecture. The default "
@@ -405,9 +467,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--multi-sae-tp-phase-fence",
-        default="auto",
-        choices=["auto", "always", "off"],
+        "--multi-sae-tp-phase-fence", default="auto", choices=["auto", "always", "off"],
         help=(
             "Host-visible fence between SAE-TP work and a different NCCL phase. "
             "auto fences only for cross-hook TP when a distinct DDP group or "
@@ -416,9 +476,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--multi-sae-optimizer-overlap",
-        default="on",
-        choices=["off", "on", "non_tp_only"],
+        "--multi-sae-optimizer-overlap", default="on", choices=["off", "on", "non_tp_only"],
         help=(
             "Experimental per-hook DDP bucket reduction -> optimizer overlap. "
             "Buckets launch during combined backward; 'on' also supports SAE-TP "
@@ -426,250 +484,48 @@ def parse_args() -> argparse.Namespace:
             "the normal optimizer path."
         ),
     )
+    parser.add_argument("--tp-size", "-tp", type=int, default=1)
     parser.add_argument(
-        "--ddp-broadcast-buffers",
-        dest="ddp_broadcast_buffers",
-        action="store_true",
-        default=None,
-        help="Explicitly set DDP broadcast_buffers=True.",
+        "-sddp", dest="sae_ddp_size", type=int, default=None, metavar="N",
+        help="Shortcut for --sae-dp-size N --sae-dp-mode ddp. Also accepts -sddpN.",
     )
     parser.add_argument(
-        "--no-ddp-broadcast-buffers",
-        dest="ddp_broadcast_buffers",
-        action="store_false",
-        help="Explicitly set DDP broadcast_buffers=False.",
+        "-sfsdp", dest="sae_fsdp_size", type=int, default=None, metavar="N",
+        help="Shortcut for --sae-dp-size N --sae-dp-mode fsdp. Also accepts -sfsdpN.",
     )
     parser.add_argument(
-        "--ddp-find-unused-parameters",
-        dest="ddp_find_unused_parameters",
-        action="store_true",
-        default=None,
-        help="Explicitly set DDP find_unused_parameters=True.",
+        "--use-shard-routing", action="store_true", default=True,
+        help="Use unified shard-routing DP (supports arbitrary vllm_dp:sae_dp ratios)."
     )
     parser.add_argument(
-        "--no-ddp-find-unused-parameters",
-        dest="ddp_find_unused_parameters",
-        action="store_false",
-        help="Explicitly set DDP find_unused_parameters=False.",
-    )
-    parser.add_argument(
-        "--ddp-gradient-as-bucket-view",
-        dest="ddp_gradient_as_bucket_view",
-        action="store_true",
-        default=True,
+        "--sae-dp-mode", default=None, choices=["manual", "ddp", "fsdp"],
         help=(
-            "Use DDP bucket-backed gradients (the effective default, avoiding a "
-            "second gradient-sized allocation)."
+            "SAE data-parallel sync mode. 'ddp' replicates SAE parameters across DP replicas; 'fsdp' shards them."
+            "Please use --ddp or --fsdp to set dp mode directly instead of setting this argument."
+            "Defalut ddp. 'manual' mode is DEPRECATED."
         ),
     )
     parser.add_argument(
-        "--no-ddp-gradient-as-bucket-view",
-        dest="ddp_gradient_as_bucket_view",
-        action="store_false",
+        "--auto-scale-store-batch-size-prompts",
+        dest="auto_scale_store_batch_size_prompts", action="store_true", default=True,
         help=(
-            "Disable bucket-backed gradients on the standard DDP/off path. "
-            "The optimizer-overlap path requires and forces bucket views."
+            "Automatically scale --store-batch-size-prompts for non-streaming DP "
+            "topologies (default: enabled)."
         ),
     )
     parser.add_argument(
-        "--ddp-static-graph",
-        dest="ddp_static_graph",
-        action="store_true",
-        default=None,
-        help="Explicitly set DDP static_graph=True.",
+        "--no-auto-scale-store-batch-size-prompts",
+        dest="auto_scale_store_batch_size_prompts", action="store_false",
+        help="Keep --store-batch-size-prompts unchanged in all non-streaming topologies.",
     )
     parser.add_argument(
-        "--no-ddp-static-graph",
-        dest="ddp_static_graph",
-        action="store_false",
-        help="Explicitly set DDP static_graph=False.",
-    )
-    parser.add_argument(
-        "--ddp-bucket-cap-mb",
-        type=int,
-        default=None,
-        help="Explicitly set DDP bucket_cap_mb.",
-    )
-    parser.add_argument(
-        "--ddp-config-strict",
-        action="store_true",
-        default=False,
-        help="Fail fast on invalid DDP config combinations instead of fallback.",
-    )
-    parser.add_argument(
-        "--fsdp-backward-prefetch",
-        default="backward_pre",
-        choices=["backward_pre", "backward_post", "none"],
+        "--no_cleanup", "--no-cleanup", dest="streaming_cleanup", action="store_false", default=True,
         help=(
-            "FSDP backward prefetch policy. Use 'none' to disable FSDP's default "
-            "BACKWARD_PRE full-parameter prefetch/caching behavior."
-        ),
-    )
-    parser.add_argument(
-        "--fsdp-forward-prefetch",
-        dest="fsdp_forward_prefetch",
-        action="store_true",
-        default=False,
-        help="Enable FSDP forward prefetch for unified multi-hook static execution order.",
-    )
-    parser.add_argument(
-        "--no-fsdp-forward-prefetch",
-        dest="fsdp_forward_prefetch",
-        action="store_false",
-        help="Disable FSDP forward prefetch.",
-    )
-    parser.add_argument(
-        "--fsdp-sharding-strategy",
-        default="shard_grad_op",
-        choices=["shard_grad_op", "full_shard", "no_shard"],
-        help=(
-            "FSDP sharding strategy. 'shard_grad_op' keeps full parameters after "
-            "forward and shards gradients/optimizer state, avoiding a backward "
-            "parameter all-gather. 'full_shard' reshards parameters after forward."
-        ),
-    )
-    # Streaming mode (v1): vLLM and SAE processes on separate GPU sets via /dev/shm.
-    # Requires sae_dp_size=1. World size = vllm_tp * vllm_dp + sae_tp * 1.
-    parser.add_argument(
-        "--streaming-mode", "--streaming",
-        action="store_true",
-        default=False,
-        help="Enable streaming_mode v1 (vLLM producers + SAE consumers via /dev/shm).",
-    )
-    parser.add_argument(
-        "--no_cleanup",
-        "--no-cleanup",
-        dest="streaming_cleanup",
-        action="store_false",
-        default=True,
-        help=(
-            "Disable topology-switch runner shared-memory cleanup at streaming "
+            "Disable topology-switch runner shared-memory cleanup at streaming"
             "startup (cleanup is enabled by default)."
         ),
     )
-    parser.add_argument(
-        "--streaming-chunk-size-tokens",
-        type=int,
-        default=8192,
-        help="Tokens per shared-memory chunk in streaming_mode.",
-    )
-    parser.add_argument(
-        "--streaming-dp-batch-mode",
-        choices=["equal_cohort", "exact"],
-        default="equal_cohort",
-        help=(
-            "SHM streaming allocation. 'equal_cohort' preserves legacy full-chunk "
-            "cohorts; 'exact' keeps fixed logical mixing streams and shards each "
-            "global batch exactly across physical SAE-DP."
-        ),
-    )
-    parser.add_argument(
-        "--streaming-num-chunks",
-        type=int,
-        default=32,
-        help="Number of shared-memory chunk slots in streaming_mode.",
-    )
-    parser.add_argument(
-        "--streaming-prefetch-chunks",
-        type=int,
-        default=2,
-        help="Max chunks to acquire per consumer refill in streaming_mode.",
-    )
-    parser.add_argument(
-        "--streaming-mix-chunks",
-        type=int,
-        default=8,
-        help=(
-            "Consumer-local rolling mixing window in shared-memory chunks. "
-            "Set 0 to disable and serve each prefetch pool directly."
-        ),
-    )
-    parser.add_argument(
-        "--streaming-mix-fraction",
-        type=float,
-        default=0.5,
-        help="Fraction of the local rolling mix window kept for the next refill.",
-    )
-    parser.add_argument(
-        "--streaming-mixing-streams",
-        type=int,
-        default=0,
-        help=(
-            "Number of topology-independent mixing streams in exact mode. "
-            "0 uses the initial SAE DP size; set it explicitly before a later "
-            "DP resize."
-        ),
-    )
-    parser.add_argument(
-        "--streaming-buffer-name",
-        type=str,
-        default="",
-        help="Shared buffer name (auto-generated if empty) in streaming_mode.",
-    )
-    parser.add_argument(
-        "--no-streaming-shuffle",
-        action="store_false",
-        dest="streaming_shuffle",
-        help="Disable per-refill token shuffle in streaming_mode.",
-    )
-    parser.set_defaults(streaming_shuffle=True)
-    parser.add_argument(
-        "--no-streaming-random-chunks",
-        action="store_false",
-        dest="streaming_random_chunks",
-        help="Disable random chunk selection in streaming_mode (use lowest-index READY slots).",
-    )
-    parser.set_defaults(streaming_random_chunks=True)
-    parser.add_argument(
-        "--streaming-use-gpu-direct",
-        action="store_true",
-        default=False,
-        help="Enable GPU direct NCCL streaming (vLLM→SAE GPU-to-GPU transfer, no CPU copy).",
-    )
-    parser.add_argument(
-        "--streaming-staging-queue-capacity",
-        type=int,
-        default=4,
-        help="GPU staging queue capacity (chunks) for GPU direct streaming.",
-    )
-    parser.add_argument(
-        "--streaming-consumer-prefill-chunks",
-        type=int,
-        default=0,
-        help=(
-            "GPU direct consumer prefill target in chunks. Set 0 to disable; "
-            "values >0 wait for post-mixing serving tokens before training starts."
-        ),
-    )
-    parser.add_argument(
-        "--control-state-path",
-        type=str,
-        default=None,
-        help=(
-            "Path to control_state.json written by topology_supervisor.py. "
-            "When provided, topology (vllm_tp, vllm_dp, sae_tp), buffer_name, "
-            "and checkpoint_path are read from this file and override CLI args."
-        ),
-    )
-    parser.add_argument(
-        "--use-cached-activations",
-        action="store_true",
-        default=False,
-        help=(
-            "Train SAE(s) from a pre-computed activations cache produced by "
-            "CacheActivationsRunner. vLLM is not loaded. Mutually exclusive with "
-            "--streaming-mode and --control-state-path."
-        ),
-    )
-    parser.add_argument(
-        "--cached-activations-path",
-        type=str,
-        default=None,
-        help=(
-            "Path to the cached activations directory (split-by-hook or monolithic "
-            "HuggingFace Dataset). Required when --use-cached-activations is set."
-        ),
-    )
+
     # argparse does not split custom compact options such as ``-sddp2`` into
     # ``-sddp 2``. Normalize those two convenience spellings before parsing.
     argv = []
@@ -1085,6 +941,8 @@ def main() -> None:
         raise ValueError("--vllm-tp-size must be >= 1")
     if sae_tp_size < 1:
         raise ValueError("--sae-tp-size must be >= 1")
+    if args.sae_pp_size < 1:
+        raise ValueError("--sae-pp-size must be >= 1")
     if args.vllm_dp_size < 0:
         raise ValueError("--vllm-dp-size must be >= 0")
     if args.sae_dp_size < 0:
@@ -1121,6 +979,57 @@ def main() -> None:
             )
             args.use_shard_routing = True
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    elastic_layout = None
+    if args.elastic_streaming_control_path is not None:
+        from sae_lens.elastic_streaming import ElasticStreamingLayout
+
+        if not args.streaming_mode:
+            raise ValueError(
+                "--elastic-streaming-control-path requires --streaming-mode"
+            )
+        if args.control_state_path is not None:
+            raise ValueError(
+                "elastic streaming is independent of --control-state-path and "
+                "topology_supervisor.py"
+            )
+        if args.elastic_permanent_vllm_dp_size is None:
+            raise ValueError("--elastic-permanent-vllm-dp-size is required")
+        if args.elastic_permanent_sae_dp_size is None:
+            raise ValueError("--elastic-permanent-sae-dp-size is required")
+        if args.sae_dp_mode != "ddp":
+            raise ValueError("elastic streaming currently requires --sae-dp-mode ddp")
+        if args.streaming_dp_batch_mode != "exact":
+            raise ValueError(
+                "elastic streaming requires --streaming-dp-batch-mode exact"
+            )
+        if args.streaming_use_gpu_direct:
+            raise ValueError("elastic streaming currently supports the SHM path only")
+        if args.resume_from_checkpoint is not None:
+            raise ValueError(
+                "elastic streaming is a live hot-switch path and does not accept "
+                "--resume-from-checkpoint"
+            )
+        elastic_layout = ElasticStreamingLayout.from_world_size(
+            world_size=world_size,
+            vllm_tp_size=vllm_tp_size,
+            sae_tp_size=sae_tp_size,
+            sae_pp_size=args.sae_pp_size,
+            permanent_vllm_dp=args.elastic_permanent_vllm_dp_size,
+            permanent_sae_dp=args.elastic_permanent_sae_dp_size,
+        )
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
+        if local_world_size != world_size:
+            raise ValueError(
+                "elastic streaming currently requires a single node because its "
+                "activation buffer uses node-local shared memory"
+            )
+        args.vllm_dp_size = elastic_layout.max_vllm_dp
+        args.sae_dp_size = elastic_layout.min_sae_dp
+        if args.train_batch_size_tokens < elastic_layout.max_sae_dp:
+            raise ValueError(
+                "elastic exact mode requires --train-batch-size-tokens >= "
+                f"maximum sae_dp_size ({elastic_layout.max_sae_dp})"
+            )
     # Hook names are needed early to validate sae_pp_size in streaming_mode.
     hook_names = (
         [hook.strip() for hook in args.hook_names.split(",") if hook.strip()]
@@ -1196,8 +1105,8 @@ def main() -> None:
     if exact_dp_batch and args.training_tokens % args.train_batch_size_tokens != 0:
         raise ValueError(
             "exact DP batch mode currently requires --training-tokens to be a "
-            "multiple of --train-batch-size-tokens; short global tail steps are "
-            "reserved for the later elastic cutover implementation."
+            "multiple of --train-batch-size-tokens; short final optimizer steps "
+            "are not supported."
         )
     if exact_dp_batch and args.train_batch_size_tokens < args.sae_dp_size:
         raise ValueError(
@@ -1443,6 +1352,14 @@ def main() -> None:
         f"output_path={output_path}"
     )
     print(f"  sae_dp_mode={cfg.sae_dp_mode}")
+    if elastic_layout is not None:
+        print(
+            "  elastic_streaming="
+            f"vllm_dp[{elastic_layout.min_vllm_dp},{elastic_layout.max_vllm_dp}] "
+            f"sae_dp[{elastic_layout.min_sae_dp},{elastic_layout.max_sae_dp}] "
+            f"elastic_ranks={elastic_layout.elastic_rank_count} "
+            f"control={args.elastic_streaming_control_path}"
+        )
     if hook_names is not None:
         print(f"  multi_sae_backward_mode={cfg.multi_sae_backward_mode}")
         print(f"  multi_sae_backward_order={cfg.multi_sae_backward_order}")
@@ -1542,6 +1459,9 @@ def main() -> None:
         streaming_mode=args.streaming_mode,
         quiesce_dir=quiesce_dir,
         sae_pp_size=args.sae_pp_size,
+        elastic_streaming_control_path=args.elastic_streaming_control_path,
+        elastic_permanent_vllm_dp_size=args.elastic_permanent_vllm_dp_size,
+        elastic_permanent_sae_dp_size=args.elastic_permanent_sae_dp_size,
     )
 
     # Write buffer name and params to control state on first run (rank 0 only).

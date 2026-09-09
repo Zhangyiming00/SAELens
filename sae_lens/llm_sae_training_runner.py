@@ -1,3 +1,4 @@
+import gc
 import json
 import math
 import os
@@ -719,6 +720,9 @@ class LanguageModelSAETrainingRunner:
         streaming_mode: bool = False,
         quiesce_dir: Path | None = None,
         sae_pp_size: int = 1,
+        elastic_streaming_control_path: Path | str | None = None,
+        elastic_permanent_vllm_dp_size: int | None = None,
+        elastic_permanent_sae_dp_size: int | None = None,
     ):
         if override_dataset is not None:
             logger.warning(
@@ -890,6 +894,13 @@ class LanguageModelSAETrainingRunner:
 
         self._quiesce_dir = quiesce_dir
         self.streaming_mode = effective_streaming_mode
+        self._elastic_streaming_control_path = (
+            Path(elastic_streaming_control_path)
+            if elastic_streaming_control_path is not None
+            else None
+        )
+        self._elastic_permanent_vllm_dp_size = elastic_permanent_vllm_dp_size
+        self._elastic_permanent_sae_dp_size = elastic_permanent_sae_dp_size
 
         # GPU direct streaming validation (must run before _streaming_init)
         one_side_absent = vllm_dp_size == 0 or sae_dp_size == 0
@@ -1712,6 +1723,8 @@ class LanguageModelSAETrainingRunner:
         Run the training of the SAE.
         """
         if self.streaming_mode:
+            if self._elastic_runtime is not None:
+                return self._run_elastic_streaming()
             import sae_lens.distributed_streaming as ds
             if ds.is_producer():
                 if self._use_gpu_direct:
@@ -2283,6 +2296,51 @@ class LanguageModelSAETrainingRunner:
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
 
+        elastic_layout = None
+        elastic_runtime_type = None
+        elastic_controller_type = None
+        if self._elastic_streaming_control_path is not None:
+            from sae_lens.elastic_streaming import (
+                ElasticDistributedRuntime,
+                ElasticStreamingController,
+                ElasticStreamingLayout,
+            )
+
+            if self._elastic_permanent_vllm_dp_size is None:
+                raise ValueError("elastic permanent vLLM DP size is missing")
+            if self._elastic_permanent_sae_dp_size is None:
+                raise ValueError("elastic permanent SAE DP size is missing")
+            if cfg.sae_dp_mode != "ddp":
+                raise ValueError("elastic runtime requires sae_dp_mode='ddp'")
+            if cfg.streaming_dp_batch_mode != "exact":
+                raise ValueError("elastic runtime requires exact streaming batches")
+            if getattr(self, "_use_gpu_direct", False):
+                raise ValueError("elastic runtime currently supports SHM transport only")
+            if cfg.resume_from_checkpoint is not None:
+                raise ValueError("elastic runtime does not support checkpoint resume")
+            elastic_layout = ElasticStreamingLayout.from_world_size(
+                world_size=dist.get_world_size(),
+                vllm_tp_size=self.vllm_tp_size,
+                sae_tp_size=self.sae_tp_size,
+                sae_pp_size=self.sae_pp_size,
+                permanent_vllm_dp=self._elastic_permanent_vllm_dp_size,
+                permanent_sae_dp=self._elastic_permanent_sae_dp_size,
+            )
+            local_world_size = int(
+                os.environ.get("LOCAL_WORLD_SIZE", str(dist.get_world_size()))
+            )
+            if local_world_size != dist.get_world_size():
+                raise ValueError("elastic SHM streaming currently requires one node")
+            if self._global_train_batch_size_tokens < elastic_layout.max_sae_dp:
+                raise ValueError(
+                    "elastic exact mode requires global train batch size >= maximum "
+                    f"SAE DP size ({elastic_layout.max_sae_dp})"
+                )
+            self.vllm_dp_size = elastic_layout.max_vllm_dp
+            self.sae_dp_size = elastic_layout.min_sae_dp
+            elastic_runtime_type = ElasticDistributedRuntime
+            elastic_controller_type = ElasticStreamingController
+
         ds.init_distributed_streaming(
             vllm_tp=self.vllm_tp_size,
             vllm_dp=self.vllm_dp_size,
@@ -2291,6 +2349,23 @@ class LanguageModelSAETrainingRunner:
             sae_pp_size=self.sae_pp_size,
             use_gpu_direct=getattr(self, "_use_gpu_direct", False),
         )
+
+        self._elastic_runtime = None
+        self._elastic_controller = None
+        self._elastic_epoch = 0
+        self._elastic_active_sae_dp = self.sae_dp_size
+        if elastic_layout is not None:
+            assert elastic_runtime_type is not None
+            assert elastic_controller_type is not None
+            assert self._elastic_streaming_control_path is not None
+            self._elastic_runtime = elastic_runtime_type(elastic_layout)
+            self._elastic_controller = elastic_controller_type(
+                self._elastic_streaming_control_path, elastic_layout
+            )
+            if dist.get_rank() == 0:
+                self._elastic_controller.initialize(overwrite=True)
+            dist.barrier()
+            self._elastic_producer_session_registered = False
 
         # Buffer name: rank 0 generates, all ranks receive via CUDA tensor broadcast (NCCL)
         buffer_name = cfg.streaming_buffer_name
@@ -2362,6 +2437,15 @@ class LanguageModelSAETrainingRunner:
                     create=True,
                     dtype=buffer_dtype,
                 )
+            if dist.get_rank() == 0 and self._elastic_controller is not None:
+                # The auto-controller reads these existing SHM counters out of
+                # process. This one startup write adds no periodic work or
+                # synchronization to either role's training hot path.
+                self._elastic_controller.configure_buffer_monitoring(
+                    buffer_name=buffer_name,
+                    num_chunks=cfg.streaming_num_chunks,
+                    chunk_size_tokens=cfg.streaming_chunk_size_tokens,
+                )
             dist.barrier()
             if not (is_new_buffer and dist.get_rank() == 0):
                 self._streaming_buffer = SharedActivationBuffer(
@@ -2399,10 +2483,18 @@ class LanguageModelSAETrainingRunner:
         if ds.is_producer():
             self._streaming_init_producer(cfg)
         else:
-            self._streaming_init_consumer(cfg)
+            consumer_context = (
+                self._elastic_runtime.context(self.sae_dp_size)
+                if self._elastic_runtime is not None
+                else ds
+            )
+            self._streaming_init_consumer(cfg, consumer_context)
 
     def _streaming_init_producer(
-        self, cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG]
+        self,
+        cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG],
+        *,
+        reuse_elastic_store: bool = False,
     ) -> None:
         import sae_lens.distributed_streaming as ds
 
@@ -2412,16 +2504,26 @@ class LanguageModelSAETrainingRunner:
             device=str(self.device),
             model_from_pretrained_kwargs=cfg.model_from_pretrained_kwargs,
         )
-        self.activations_store = ActivationsStore.from_config(
-            self.model,
-            cfg,
-            dataset_shard_index=ds.get_producer_idx(),
-            dataset_shard_count=ds.get_vllm_dp_size(),
+        preserved_store = (
+            getattr(self, "_elastic_activations_store", None)
+            if reuse_elastic_store
+            else None
         )
-        if self._quiesce_dir is not None:
-            best_state = self._find_best_producer_dataset_state(self._quiesce_dir)
-            if best_state is not None:
-                self.activations_store.load_from_checkpoint(best_state)
+        if preserved_store is not None:
+            preserved_store.model = self.model
+            self.activations_store = preserved_store
+            self._elastic_restore_store_tail()
+        else:
+            self.activations_store = ActivationsStore.from_config(
+                self.model,
+                cfg,
+                dataset_shard_index=ds.get_producer_idx(),
+                dataset_shard_count=ds.get_vllm_dp_size(),
+            )
+            if self._quiesce_dir is not None:
+                best_state = self._find_best_producer_dataset_state(self._quiesce_dir)
+                if best_state is not None:
+                    self.activations_store.load_from_checkpoint(best_state)
         self.sae = None
         self._base_sae = None
 
@@ -2460,15 +2562,18 @@ class LanguageModelSAETrainingRunner:
         return saved_tp != self.sae_tp_size
 
     def _streaming_init_consumer(
-        self, cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG]
+        self,
+        cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG],
+        ds: Any | None = None,
     ) -> None:
-        import sae_lens.distributed_streaming as ds
+        if ds is None:
+            import sae_lens.distributed_streaming as ds
 
         self.model = None  # type: ignore[assignment]
         self.activations_store = None  # type: ignore[assignment]
 
         if self.is_multi_sae:
-            self._streaming_init_consumer_multi(cfg)
+            self._streaming_init_consumer_multi(cfg, ds)
             return
 
         if self.sae_tp_size > 1:
@@ -2496,13 +2601,14 @@ class LanguageModelSAETrainingRunner:
 
     def _streaming_wrap_sae_dp(self, sae: torch.nn.Module, ds: Any) -> Any:
         """Apply the configured SAE-DP wrapper on the current (PP, TP) shard."""
-        if self.sae_dp_size <= 1:
+        sae_dp_size = ds.get_sae_dp_size()
+        if sae_dp_size <= 1:
             return sae
         sae_dp_group = ds.get_sae_dp_group()
-        if sae_dp_group is None or dist.get_world_size(sae_dp_group) != self.sae_dp_size:
+        if sae_dp_group is None or dist.get_world_size(sae_dp_group) != sae_dp_size:
             raise RuntimeError(
                 "Streaming SAE-DP group is missing or has the wrong size: "
-                f"expected {self.sae_dp_size}"
+                f"expected {sae_dp_size}"
             )
         if self.cfg.sae_dp_mode == "fsdp":
             if self.sae_tp_size > 1:
@@ -2556,24 +2662,33 @@ class LanguageModelSAETrainingRunner:
         )
 
     def _streaming_init_consumer_multi(
-        self, cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG]
+        self,
+        cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG],
+        ds: Any | None = None,
     ) -> None:
-        import sae_lens.distributed_streaming as ds
+        if ds is None:
+            import sae_lens.distributed_streaming as ds
 
+        self._streaming_create_consumer_multi_base(cfg, ds)
+        self._streaming_wrap_consumer_multi(ds)
+
+    def _streaming_create_consumer_multi_base(
+        self,
+        cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG],
+        ds: Any,
+    ) -> None:
         self.sae_by_hook: dict[str, Any] = {}
         self.base_sae_by_hook: dict[str, TrainingSAE[Any]] = {}
         self.multi_hook_sae = None
         if self.sae_pp_size > 1 and dist.is_initialized():
-            import sae_lens.distributed_v2 as v2_mod
             from sae_lens.distributed_v2 import hooks_for_pp_rank
 
             self._pp_hook_names = hooks_for_pp_rank(
-                v2_mod.get_sae_pp_rank(), self.sae_pp_size, self.hook_names
+                ds.get_sae_pp_rank(), self.sae_pp_size, self.hook_names
             )
         else:
             self._pp_hook_names = list(self.hook_names)
 
-        raw_sae_by_hook: dict[str, TrainingSAE[Any]] = {}
         for idx, hook_name in enumerate(self._pp_hook_names):
             seed = (
                 cfg.seed
@@ -2600,9 +2715,17 @@ class LanguageModelSAETrainingRunner:
             )
 
             self.base_sae_by_hook[hook_name] = sae
-            raw_sae_by_hook[hook_name] = sae
 
-        if cfg.multi_sae_distributed_architecture == "unified_multi_hook":
+    def _streaming_wrap_consumer_multi(self, ds: Any) -> None:
+        raw_sae_by_hook = dict(self.base_sae_by_hook)
+        self.sae_by_hook = {}
+        self.multi_hook_sae = None
+        tp_group = ds.get_sae_tp_group() if self.sae_tp_size > 1 else None
+        for sae in raw_sae_by_hook.values():
+            if hasattr(sae, "_tp_group"):
+                sae._tp_group = tp_group
+
+        if self.cfg.multi_sae_distributed_architecture == "unified_multi_hook":
             # Keep one DDP owner around the MultiHookSAE so its TP collectives
             # run inside a single forward/backward lifecycle.
             raw_multi_hook_sae = MultiHookSAE(
@@ -2679,7 +2802,10 @@ class LanguageModelSAETrainingRunner:
             },
         )
 
-    def _run_streaming_producer_loop(self) -> None:
+    def _run_streaming_producer_loop(
+        self,
+        elastic_stop_check: Any | None = None,
+    ) -> bool:
         import sae_lens.distributed_streaming as ds
         from sae_lens.util import str_to_dtype
 
@@ -2795,8 +2921,14 @@ class LanguageModelSAETrainingRunner:
 
         def _producer_stop_requested() -> bool:
             return (
-                vllm_stop_request_path is not None
-                and vllm_stop_request_path.exists()
+                (
+                    vllm_stop_request_path is not None
+                    and vllm_stop_request_path.exists()
+                )
+                or (
+                    elastic_stop_check is not None
+                    and bool(elastic_stop_check())
+                )
             )
 
         def _save_producer_state_and_ack() -> None:
@@ -2939,6 +3071,7 @@ class LanguageModelSAETrainingRunner:
         shm_logger.close()
         timing_logger.close()
         buf.close()
+        return bool(elastic_stop_check is not None and elastic_stop_check())
 
     def _run_gpu_direct_producer_loop(self) -> None:
         import sae_lens.distributed_streaming as ds
@@ -3232,6 +3365,531 @@ class LanguageModelSAETrainingRunner:
             if generate_one():
                 generated += 1
         return generated
+
+    def _elastic_attach_streaming_buffer(self) -> None:
+        if self._streaming_buffer is not None and not self._streaming_buffer._closed:
+            return
+        from sae_lens.training.shared_activation_buffer import SharedActivationBuffer
+
+        self._streaming_buffer = SharedActivationBuffer(
+            name=self._streaming_buffer_name,
+            num_chunks=self.cfg.streaming_num_chunks,
+            chunk_size_tokens=(
+                self.cfg.streaming_chunk_size_tokens * self._streaming_num_hooks
+            ),
+            d_model=self.cfg.sae.d_in,
+            num_producers=self.vllm_dp_size,
+            target_chunks=self._streaming_target_chunks,
+            create=False,
+        )
+
+    def _elastic_destroy_vllm(self) -> None:
+        # Keep the live iterator instead of reconstructing it from a coarse row
+        # counter. This preserves partial raw-text concatenation and any input
+        # batches already advanced by the generator. Only activation tails need
+        # moving off GPU while these ranks host SAE weights.
+        track_cuda = self.device.type == "cuda" and torch.cuda.is_available()
+        before_allocated = (
+            torch.cuda.memory_allocated(self.device) if track_cuda else 0
+        )
+        before_reserved = torch.cuda.memory_reserved(self.device) if track_cuda else 0
+        self._elastic_activations_store = self.activations_store
+        self._elastic_offload_store_tail()
+        self._elastic_activations_store.model = None
+        self.activations_store = None  # type: ignore[assignment]
+        close_model = getattr(self.model, "close", None)
+        if callable(close_model):
+            close_model()
+        self.model = None  # type: ignore[assignment]
+        gc.collect()
+        if track_cuda:
+            torch.cuda.empty_cache()
+        after_allocated = (
+            torch.cuda.memory_allocated(self.device) if track_cuda else 0
+        )
+        after_reserved = torch.cuda.memory_reserved(self.device) if track_cuda else 0
+        if track_cuda:
+            logger.info(
+                "[elastic rank%d] destroyed vLLM CUDA memory: allocated %.2f -> "
+                "%.2f GiB, reserved %.2f -> %.2f GiB",
+                dist.get_rank(),
+                before_allocated / (1024**3),
+                after_allocated / (1024**3),
+                before_reserved / (1024**3),
+                after_reserved / (1024**3),
+            )
+        # Never construct SAE state on top of a retained vLLM allocation.  A
+        # failed teardown is safer than violating the single-role memory bound
+        # and failing later with two resident copies of the model.
+        if before_allocated >= 1024**3 and after_allocated > before_allocated // 4:
+            raise RuntimeError(
+                "vLLM teardown retained too much CUDA memory before SAE startup: "
+                f"allocated {before_allocated / (1024**3):.2f} -> "
+                f"{after_allocated / (1024**3):.2f} GiB"
+            )
+
+    def _elastic_offload_store_tail(self) -> None:
+        store = self._elastic_activations_store
+        residual = getattr(store, "_stream_residual_gpu", None)
+        if isinstance(residual, torch.Tensor):
+            store._stream_residual_gpu = residual.detach().cpu()
+        collected = getattr(store, "_stream_collected_by_hook_gpu", None)
+        if isinstance(collected, dict):
+            store._stream_collected_by_hook_gpu = {
+                hook_name: [value.detach().cpu() for value in values]
+                for hook_name, values in collected.items()
+            }
+
+    def _elastic_restore_store_tail(self) -> None:
+        store = self._elastic_activations_store
+        residual = getattr(store, "_stream_residual_gpu", None)
+        if isinstance(residual, torch.Tensor):
+            store._stream_residual_gpu = residual.to(self.device)
+        collected = getattr(store, "_stream_collected_by_hook_gpu", None)
+        if isinstance(collected, dict):
+            store._stream_collected_by_hook_gpu = {
+                hook_name: [value.to(self.device) for value in values]
+                for hook_name, values in collected.items()
+            }
+
+    def _elastic_start_vllm(self) -> None:
+        import sae_lens.distributed_streaming as ds
+
+        self._elastic_attach_streaming_buffer()
+        if (
+            ds.is_vllm_tp_root()
+            and not self._elastic_producer_session_registered
+        ):
+            self._streaming_buffer.register_producer()
+        self._elastic_producer_session_registered = False
+        self._streaming_init_producer(self.cfg, reuse_elastic_store=True)
+
+    def _elastic_wait_for_switch_or_finish(self) -> tuple[int, int] | None:
+        controller = self._elastic_controller
+        runtime = self._elastic_runtime
+        assert controller is not None and runtime is not None
+        while True:
+            state = controller.read()
+            if state.phase == "finished":
+                return None
+            if state.phase == "failed":
+                raise RuntimeError(f"elastic streaming failed: {state.error}")
+            request = controller.requested_target(local_epoch=self._elastic_epoch)
+            if request is not None:
+                if request[1] != runtime.layout.max_sae_dp:
+                    raise RuntimeError(
+                        "an elastic vLLM rank received a non-expansion request"
+                    )
+                return request
+            time.sleep(0.25)
+
+    def _elastic_report_failure(self, exc: BaseException) -> None:
+        logger.exception(
+            "[elastic rank%d] role transition failed",
+            dist.get_rank() if dist.is_initialized() else -1,
+        )
+        controller = self._elastic_controller
+        if controller is None:
+            return
+        try:
+            state = controller.read()
+            controller.fail(
+                epoch=state.epoch,
+                error=f"rank {dist.get_rank()}: {exc!r}",
+            )
+        except Exception:
+            logger.exception("failed to publish elastic streaming failure state")
+
+    def _elastic_release_sae_wrappers(self, trainer: MultiSAETrainer) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+        if trainer._overlap_ddp_state is not None:
+            trainer._overlap_ddp_state.close()
+            trainer._overlap_ddp_state = None
+        if trainer._overlap_tp_post is not None:
+            trainer._overlap_tp_post.close()
+            trainer._overlap_tp_post = None
+        trainer.multi_hook_sae = None
+        trainer.sae_by_hook = dict(trainer.base_sae_by_hook)
+        self.multi_hook_sae = None
+        self.sae_by_hook = {}
+        gc.collect()
+
+    def _elastic_drop_sae(self) -> None:
+        self.sae_by_hook = {}
+        self.base_sae_by_hook = {}
+        self.multi_hook_sae = None
+        self.sae = None
+        self._base_sae = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _build_elastic_streaming_provider(
+        self,
+        ds: Any,
+        *,
+        logical_provider: Any | None,
+        epoch: int,
+        global_tokens: int,
+        step: int,
+    ) -> tuple[Any, Any | None]:
+        from sae_lens.training.dp_batch import balanced_token_counts
+        from sae_lens.training.exact_dp_batch_provider import (
+            ExactDataParallelBatchProvider,
+        )
+        from sae_lens.training.logical_streaming_mixer import (
+            LogicalStreamingMixingProvider,
+        )
+        from sae_lens.training.streaming_activation_provider import (
+            StreamingActivationProvider,
+        )
+        from sae_lens.util import str_to_dtype
+
+        dp_idx = ds.get_sae_dp_idx()
+        dp_group = ds.get_sae_dp_group()
+        if dp_group is None:
+            raise RuntimeError("elastic streaming requires an SAE-DP group")
+        source_global_rank = self._elastic_runtime.layout.sae_stage_ranks(
+            0, ds.get_sae_pp_rank()
+        )[ds.get_sae_tp_rank()]
+        source_dp_idx = dist.get_group_rank(dp_group, source_global_rank)
+        if dp_idx == source_dp_idx and logical_provider is None:
+            raw_provider = StreamingActivationProvider(
+                buffer=self._streaming_buffer,
+                train_batch_size_tokens=self.cfg.streaming_chunk_size_tokens,
+                prefetch_chunks=self.cfg.streaming_prefetch_chunks,
+                device=self.device,
+                sae_tp_group=(
+                    ds.get_sae_tp_group() if ds.get_sae_tp_size() > 1 else None
+                ),
+                sae_tp_rank=ds.get_sae_tp_rank(),
+                sae_tp_root_global_rank=ds.get_consumer_tp_root(),
+                d_model=self.cfg.sae.d_in,
+                dtype=str_to_dtype(self.cfg.dtype),
+                shuffle=False,
+                random_chunks=self.cfg.streaming_random_chunks,
+                mix_chunks=0,
+                mix_fraction=0.0,
+                mixing_seed=self.cfg.seed,
+                mixing_shard_index=0,
+                hook_names=self.hook_names,
+                force_multi_hook=True,
+                select_hook_names=self._pp_hook_names,
+                pp_root_group=(
+                    ds.get_sae_pp_root_group()
+                    if ds.get_sae_pp_size() > 1
+                    else None
+                ),
+                pp_root_global_rank=(
+                    ds.get_sae_pp_root_global_rank()
+                    if ds.get_sae_pp_size() > 1
+                    else None
+                ),
+                sae_dp_size=1,
+                sae_dp_idx=0,
+                sae_pp_size=ds.get_sae_pp_size(),
+                pp_rank=ds.get_sae_pp_rank(),
+            )
+            logical_counts = balanced_token_counts(
+                self._global_train_batch_size_tokens,
+                self._streaming_mixing_streams,
+            )
+            per_stream_capacity = max(
+                max(logical_counts),
+                self.cfg.streaming_mix_chunks
+                * self.cfg.streaming_chunk_size_tokens,
+            )
+            logical_provider = LogicalStreamingMixingProvider(
+                source=raw_provider,
+                global_batch_size=self._global_train_batch_size_tokens,
+                stream_count=self._streaming_mixing_streams,
+                buffer_size_per_stream=per_stream_capacity,
+                mix_fraction=(
+                    self.cfg.streaming_mix_fraction
+                    if self.cfg.streaming_mix_chunks > 0
+                    else 0.0
+                ),
+                shuffle=self.cfg.streaming_shuffle,
+                seed=self.cfg.seed,
+            )
+
+        controller = self._elastic_controller
+        assert controller is not None
+        provider = ExactDataParallelBatchProvider(
+            source=logical_provider if dp_idx == source_dp_idx else None,
+            dp_group=dp_group,
+            dp_idx=dp_idx,
+            dp_size=ds.get_sae_dp_size(),
+            device=self.device,
+            dtype=str_to_dtype(self.cfg.dtype),
+            d_model=self.cfg.sae.d_in,
+            hook_names=list(self._pp_hook_names),
+            global_training_tokens=self._global_training_tokens,
+            initial_global_tokens=global_tokens,
+            initial_step=step,
+            current_epoch=epoch,
+            reconfigure_poll=lambda: controller.requested_target(
+                local_epoch=epoch,
+                require_ready=True,
+            ),
+            source_dp_idx=source_dp_idx,
+        )
+        return provider, logical_provider
+
+    def _elastic_broadcast_base_sae_state(self, ds: Any) -> None:
+        runtime = self._elastic_runtime
+        assert runtime is not None
+        dp_group = ds.get_sae_dp_group()
+        if dp_group is None:
+            raise RuntimeError("elastic streaming requires an SAE-DP group")
+        source_global_rank = runtime.layout.sae_stage_ranks(
+            0, ds.get_sae_pp_rank()
+        )[ds.get_sae_tp_rank()]
+        with torch.no_grad():
+            for hook_name in self._pp_hook_names:
+                for tensor in self.base_sae_by_hook[hook_name].state_dict().values():
+                    dist.broadcast(
+                        tensor,
+                        src=source_global_rank,
+                        group=dp_group,
+                    )
+
+    def _build_elastic_multi_trainer(
+        self,
+        provider: Any,
+        ds: Any,
+    ) -> MultiSAETrainer:
+        trainer_cfg = self.cfg.to_sae_trainer_config()
+        trainer_cfg.total_training_samples = self._global_training_tokens
+        trainer_cfg.train_batch_size_samples = self._global_train_batch_size_tokens
+        trainer_cfg.multi_sae_tp_phase_fence_runtime_hazard = False
+        return MultiSAETrainer(
+            hook_names=list(self._pp_hook_names),
+            sae_by_hook=self.sae_by_hook,
+            base_sae_by_hook=self.base_sae_by_hook,
+            multi_hook_sae=self.multi_hook_sae,
+            data_provider=provider,
+            save_checkpoint_fn=self._streaming_save_checkpoint,
+            cfg=trainer_cfg,
+            dp_group=ds.get_sae_dp_group(),
+            token_count_weighted_dp=True,
+            sae_dp_mode="ddp",
+            backward_mode=self.cfg.multi_sae_backward_mode,
+            seed_mode=self.cfg.multi_sae_seed_mode,
+            append_logs=True,
+        )
+
+    def _elastic_switch_sae_topology(
+        self,
+        *,
+        old_trainer: MultiSAETrainer | None,
+        logical_provider: Any | None,
+        epoch: int,
+        target_sae_dp: int,
+        joining_prepared: bool = False,
+    ) -> tuple[MultiSAETrainer | None, Any | None, Any | None]:
+        from sae_lens.training.elastic_trainer_state import (
+            broadcast_multi_sae_trainer_state,
+        )
+
+        runtime = self._elastic_runtime
+        controller = self._elastic_controller
+        assert runtime is not None and controller is not None
+        layout = runtime.layout
+        layout.validate_sae_dp(target_sae_dp)
+
+        old_global_tokens = 0
+        old_step = 0
+        if old_trainer is not None:
+            old_global_tokens = old_trainer.n_training_samples
+            old_step = old_trainer.n_training_steps
+            self._elastic_release_sae_wrappers(old_trainer)
+
+        target_context = runtime.context(target_sae_dp)
+        joining_sae = target_context.is_consumer() and old_trainer is None
+        if joining_sae and not joining_prepared:
+            self._elastic_attach_streaming_buffer()
+            self._streaming_create_consumer_multi_base(self.cfg, target_context)
+
+        runtime.transition_barrier()
+
+        new_trainer: MultiSAETrainer | None = None
+        new_provider: Any | None = None
+        if target_context.is_consumer():
+            self.sae_dp_size = target_sae_dp
+            # DDP initializes from process-group rank zero, which is an elastic
+            # rank after torch.distributed sorts the expanded group. Seed every
+            # replica from the permanent live SAE before constructing DDP so a
+            # fresh elastic module cannot overwrite trained weights.
+            self._elastic_broadcast_base_sae_state(target_context)
+            self._streaming_wrap_consumer_multi(target_context)
+            new_provider, logical_provider = self._build_elastic_streaming_provider(
+                target_context,
+                logical_provider=logical_provider,
+                epoch=epoch,
+                global_tokens=old_global_tokens,
+                step=old_step,
+            )
+            new_trainer = self._build_elastic_multi_trainer(
+                new_provider, target_context
+            )
+            source_global_rank = layout.sae_stage_ranks(
+                0, target_context.get_sae_pp_rank()
+            )[target_context.get_sae_tp_rank()]
+            broadcast_multi_sae_trainer_state(
+                source=(
+                    old_trainer
+                    if dist.get_rank() == source_global_rank
+                    else None
+                ),
+                target=new_trainer,
+                group=target_context.get_sae_dp_group(),
+                source_global_rank=source_global_rank,
+                device=self.device,
+            )
+            new_provider.restore_progress(
+                global_tokens=new_trainer.n_training_samples,
+                step=new_trainer.n_training_steps,
+                epoch=epoch,
+            )
+        else:
+            # Register the replacement producer before publishing the smaller
+            # SAE topology. Consumers can then block for it without observing
+            # a transient all-producers-finished state as EOF.
+            self._elastic_attach_streaming_buffer()
+            if runtime.is_elastic_vllm_tp_root():
+                self._streaming_buffer.register_producer()
+            self._elastic_producer_session_registered = True
+            self._elastic_drop_sae()
+
+        runtime.transition_barrier()
+        coordinator_rank = layout.permanent_sae_ranks[0]
+        if dist.get_rank() == coordinator_rank:
+            controller.commit(epoch=epoch, active_sae_dp=target_sae_dp)
+        runtime.transition_barrier()
+        self._elastic_epoch = epoch
+        self._elastic_active_sae_dp = target_sae_dp
+        return new_trainer, new_provider, logical_provider
+
+    def _run_elastic_streaming(self) -> TrainingSAE[Any] | None:
+        runtime = self._elastic_runtime
+        controller = self._elastic_controller
+        assert runtime is not None and controller is not None
+        layout = runtime.layout
+
+        if runtime.is_permanent_vllm():
+            try:
+                self._run_streaming_producer_loop()
+            except BaseException as exc:
+                self._elastic_report_failure(exc)
+                raise
+            return None
+
+        trainer: MultiSAETrainer | None = None
+        provider: Any | None = None
+        logical_provider: Any | None = None
+        role = "vllm" if runtime.is_elastic() else "sae"
+        if role == "sae":
+            context = runtime.context(layout.min_sae_dp)
+            provider, logical_provider = self._build_elastic_streaming_provider(
+                context,
+                logical_provider=None,
+                epoch=0,
+                global_tokens=0,
+                step=0,
+            )
+            trainer = self._build_elastic_multi_trainer(provider, context)
+
+        try:
+            while True:
+                if role == "vllm":
+                    def _join_sae_requested() -> bool:
+                        state = controller.read()
+                        if state.phase in ("finished", "failed"):
+                            return True
+                        return (
+                            state.phase == "switching"
+                            and state.epoch > self._elastic_epoch
+                            and state.target_sae_dp == layout.max_sae_dp
+                        )
+
+                    switched = self._run_streaming_producer_loop(
+                        elastic_stop_check=_join_sae_requested
+                    )
+                    request = (
+                        controller.requested_target(local_epoch=self._elastic_epoch)
+                        if switched
+                        else self._elastic_wait_for_switch_or_finish()
+                    )
+                    if request is None:
+                        return None
+                    self._elastic_destroy_vllm()
+                    target_context = runtime.context(request[1])
+                    self._elastic_attach_streaming_buffer()
+                    self._streaming_create_consumer_multi_base(
+                        self.cfg, target_context
+                    )
+                    # Permanent SAE ranks keep training while the expensive
+                    # vLLM teardown and fresh SAE construction happen here.
+                    runtime.elastic_barrier()
+                    if dist.get_rank() == layout.elastic_ranks[0]:
+                        controller.mark_ready(epoch=request[0])
+                    runtime.elastic_barrier()
+                    trainer, provider, logical_provider = (
+                        self._elastic_switch_sae_topology(
+                            old_trainer=None,
+                            logical_provider=None,
+                            epoch=request[0],
+                            target_sae_dp=request[1],
+                            joining_prepared=True,
+                        )
+                    )
+                    role = "sae"
+                    continue
+
+                assert trainer is not None and provider is not None
+                signal.signal(signal.SIGINT, interrupt_callback)
+                signal.signal(signal.SIGTERM, interrupt_callback)
+                trainer.fit(stop_after_step_check=provider.poll_reconfigure)
+                if not trainer.last_fit_stopped_for_reconfigure:
+                    finish_state = controller.finish(epoch=self._elastic_epoch)
+                    if finish_state.phase == "switching":
+                        # A request won the control-file lock during the final
+                        # optimizer step. Wait for any expansion preparation,
+                        # then honor it before collective final model saving.
+                        while not provider.poll_reconfigure():
+                            state = controller.read()
+                            if state.phase == "failed":
+                                raise RuntimeError(
+                                    f"elastic streaming failed: {state.error}"
+                                )
+                            time.sleep(0.05)
+                        trainer.last_fit_stopped_for_reconfigure = True
+                    else:
+                        if self.cfg.output_path is not None:
+                            trainer.save_final(self.cfg.output_path)
+                        if self._streaming_buffer is not None:
+                            self._streaming_buffer.close()
+                        first_hook = self._pp_hook_names[0]
+                        return self.base_sae_by_hook[first_hook]
+
+                request = provider.pending_reconfigure
+                if request is None:
+                    raise RuntimeError("trainer stopped without a cutover descriptor")
+                trainer, provider, logical_provider = self._elastic_switch_sae_topology(
+                    old_trainer=trainer,
+                    logical_provider=logical_provider,
+                    epoch=request[0],
+                    target_sae_dp=request[1],
+                )
+                if trainer is None:
+                    if self._streaming_buffer is not None:
+                        self._streaming_buffer.close()
+                    self._elastic_start_vllm()
+                    role = "vllm"
+        except BaseException as exc:
+            self._elastic_report_failure(exc)
+            raise
 
     def _run_streaming_consumer_loop(self) -> TrainingSAE[Any]:
         import sae_lens.distributed_streaming as ds

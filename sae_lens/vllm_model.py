@@ -40,6 +40,7 @@ Not supported (inside FlashAttention kernel, unreachable by forward hooks):
 
 from __future__ import annotations
 
+import gc
 import io
 import json
 import logging
@@ -80,6 +81,26 @@ try:
 except ImportError:
     LLM = None  # type: ignore[assignment,misc]
     SamplingParams = None  # type: ignore[assignment,misc]
+
+
+def _release_module_cuda_storage(model: nn.Module) -> tuple[int, int]:
+    """Replace CUDA parameter/buffer storage after an engine is destroyed."""
+    tensors = list(model.parameters()) + list(model.buffers())
+    seen: set[int] = set()
+    released_tensors = 0
+    released_bytes = 0
+    with torch.no_grad():
+        for tensor in tensors:
+            if id(tensor) in seen or tensor.device.type != "cuda":
+                continue
+            seen.add(id(tensor))
+            released_tensors += 1
+            released_bytes += tensor.numel() * tensor.element_size()
+            # Do not offload a dead role's weights to host memory. Replacing
+            # TensorImpl storage also handles references retained by C++ code
+            # that Python's cyclic GC cannot see.
+            tensor.data = torch.empty(0, dtype=tensor.dtype, device="cpu")
+    return released_tensors, released_bytes
 
 
 def _get_vllm_tp_device_group() -> dist.ProcessGroup | None:
@@ -923,6 +944,7 @@ class HookedVLLMModel:
             )
         self.tokenizer = tokenizer
         self.model_name = model_name
+        self._closed = False
         self._generation_lock = threading.RLock()
         self.allow_cold_reconfigure = bool(allow_cold_reconfigure)
         self._cold_reconfigure_mbt_capacity: int | None = None
@@ -1073,6 +1095,129 @@ class HookedVLLMModel:
             if explicit_device is not None
             else torch.device("cuda")
         )
+
+    def close(self) -> None:
+        """Destroy an in-process vLLM worker without destroying TP groups.
+
+        vLLM's in-process shutdown stops worker activity but deliberately keeps
+        the executor and model runner object graph intact.  That is useful at
+        interpreter shutdown, but it retains model weights and KV tensors when
+        this process is about to change roles.  Explicitly detach that graph so
+        the CUDA allocations can be returned before an SAE is constructed.
+        """
+        if self._closed:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+
+        llm = getattr(self, "llm", None)
+        llm_engine = getattr(llm, "llm_engine", None)
+        core_client = getattr(llm_engine, "engine_core", None)
+        engine_core = getattr(core_client, "engine_core", None)
+        executor = getattr(engine_core, "model_executor", None)
+        worker_wrapper = getattr(executor, "driver_worker", None)
+        worker = getattr(worker_wrapper, "worker", None)
+        model_runner = getattr(worker, "model_runner", None)
+
+        if core_client is not None:
+            core_client.shutdown()
+
+        async_output_thread = getattr(executor, "async_output_thread", None)
+        if async_output_thread is not None:
+            async_output_thread.shutdown(wait=True, cancel_futures=True)
+            executor.async_output_thread = None
+
+        if model_runner is not None:
+            model = getattr(model_runner, "model", None)
+            for handle in getattr(model, "_sae_handles", ()):
+                handle.remove()
+            for handle in getattr(model, "_sae_vllm_memory_handles", ()):
+                handle.remove()
+            for attr in (
+                "_sae_captures",
+                "_sae_handles",
+                "_sae_vllm_memory_records",
+                "_sae_vllm_memory_handles",
+            ):
+                if model is not None and hasattr(model, attr):
+                    delattr(model, attr)
+
+            if isinstance(model, nn.Module):
+                released_tensors, released_bytes = _release_module_cuda_storage(model)
+                logger.info(
+                    "Released CUDA storage for %d vLLM parameter/buffer tensors "
+                    "(%.2f GiB)",
+                    released_tensors,
+                    released_bytes / (1024**3),
+                )
+
+            model_runner.model = None
+            for attr in ("kv_caches", "attn_groups"):
+                value = getattr(model_runner, attr, None)
+                if hasattr(value, "clear"):
+                    value.clear()
+            model_runner.cross_layers_kv_cache = None
+            model_runner.cross_layers_attn_backend = None
+            encoder_cache = getattr(model_runner, "encoder_cache", None)
+            if hasattr(encoder_cache, "clear"):
+                encoder_cache.clear()
+            static_forward_context = getattr(
+                getattr(model_runner, "compilation_config", None),
+                "static_forward_context",
+                None,
+            )
+            if hasattr(static_forward_context, "clear"):
+                static_forward_context.clear()
+
+            # GPUModelRunner owns more CUDA state than its public ``model`` and
+            # KV-cache fields (input buffers, sampled outputs, attention
+            # metadata, optional compilation state, and backend workspaces).
+            # This runner will never be reused after a role change, so sever
+            # every remaining instance reference instead of trying to mirror
+            # vLLM's evolving list of internal fields.
+            model_runner.__dict__.clear()
+
+        if worker is not None:
+            worker.__dict__.clear()
+        if worker_wrapper is not None:
+            worker_wrapper.__dict__.clear()
+        if executor is not None:
+            executor.__dict__.clear()
+        if engine_core is not None:
+            engine_core.__dict__.clear()
+        if core_client is not None:
+            core_client.engine_core = None
+        if llm_engine is not None:
+            llm_engine.engine_core = None
+        if llm is not None:
+            llm.llm_engine = None
+        if hasattr(self, "llm"):
+            del self.llm
+        global _CUDA_IPC_PINNED
+        _CUDA_IPC_PINNED = {}
+        # vLLM's supports_kw() is an unbounded lru_cache keyed by callables.
+        # Runtime protocol checks pass bound ``model.__init__`` and
+        # ``model.forward`` methods into it, so the cache otherwise roots the
+        # entire model instance after engine shutdown. This cache is
+        # process-local; clearing it on an elastic rank cannot affect a
+        # permanent vLLM rank in another process.
+        from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
+        from vllm.utils.func_utils import supports_kw
+
+        supports_kw.cache_clear()
+        # get_rope() caches module instances, including their CUDA
+        # cos_sin_cache buffer. The storage release above intentionally empties
+        # that buffer, so a later cold start must build a fresh RoPE module.
+        _ROPE_DICT.clear()
+        self._closed = True
+        # Drop the locals that rooted the now-detached vLLM graph before asking
+        # the caching allocator to return its blocks to the CUDA driver.
+        del model_runner, worker, worker_wrapper, executor, engine_core
+        if "model" in locals():
+            del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _external_reconfigure_group(self) -> dist.ProcessGroup | None:
         if not self._is_external_launcher:

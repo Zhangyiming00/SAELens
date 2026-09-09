@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import math
 import os
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -489,6 +491,77 @@ def test_explicit_vllm_mp_backend_preserved_for_tp2(monkeypatch):
     )
 
     assert instances[0].kwargs["distributed_executor_backend"] == "mp"
+
+
+def test_close_detaches_inprocess_model_and_kv_state(monkeypatch):
+    import sae_lens.vllm_model as vllm_model_module
+    from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
+    from vllm.utils.func_utils import supports_kw
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    cache_clear = MagicMock(wraps=supports_kw.cache_clear)
+    monkeypatch.setattr(supports_kw, "cache_clear", cache_clear)
+    _ROPE_DICT[("close-test",)] = object()  # type: ignore[assignment]
+    hook_handle = MagicMock()
+    memory_handle = MagicMock()
+    raw_model = SimpleNamespace(
+        _sae_captures={"hook": [torch.ones(1)]},
+        _sae_handles=[hook_handle],
+        _sae_vllm_memory_records=[{"allocated": 1}],
+        _sae_vllm_memory_handles=[memory_handle],
+    )
+    static_forward_context = {"layer": object()}
+    model_runner = SimpleNamespace(
+        model=raw_model,
+        kv_caches=[torch.ones(1)],
+        attn_groups=[[object()]],
+        cross_layers_kv_cache=torch.ones(1),
+        cross_layers_attn_backend=object(),
+        encoder_cache={"item": torch.ones(1)},
+        compilation_config=SimpleNamespace(
+            static_forward_context=static_forward_context
+        ),
+    )
+    worker = SimpleNamespace(model_runner=model_runner)
+    worker_wrapper = SimpleNamespace(worker=worker)
+    output_thread = MagicMock()
+    executor = SimpleNamespace(
+        driver_worker=worker_wrapper,
+        async_output_thread=output_thread,
+    )
+    engine_core = SimpleNamespace(
+        model_executor=executor,
+        scheduler=object(),
+        structured_output_manager=object(),
+    )
+    core_client = SimpleNamespace(engine_core=engine_core, shutdown=MagicMock())
+    llm_engine = SimpleNamespace(engine_core=core_client)
+    llm = SimpleNamespace(llm_engine=llm_engine)
+    model = object.__new__(HookedVLLMModel)
+    model._closed = False
+    model.device = torch.device("cpu")
+    model.llm = llm
+    vllm_model_module._CUDA_IPC_PINNED = {"hook": torch.ones(1)}
+
+    model.close()
+
+    core_client.shutdown.assert_called_once_with()
+    output_thread.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+    hook_handle.remove.assert_called_once_with()
+    memory_handle.remove.assert_called_once_with()
+    assert model_runner.__dict__ == {}
+    assert static_forward_context == {}
+    assert worker.__dict__ == {}
+    assert worker_wrapper.__dict__ == {}
+    assert executor.__dict__ == {}
+    assert engine_core.__dict__ == {}
+    assert core_client.engine_core is None
+    assert llm_engine.engine_core is None
+    assert llm.llm_engine is None
+    assert not hasattr(model, "llm")
+    cache_clear.assert_called_once_with()
+    assert not _ROPE_DICT
+    assert vllm_model_module._CUDA_IPC_PINNED == {}
 
 
 # ---------------------------------------------------------------------------

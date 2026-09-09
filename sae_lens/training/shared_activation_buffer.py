@@ -306,9 +306,21 @@ class SharedActivationBuffer:
             self._state.flush()
 
     def signal_done(self) -> None:
-        """Increment done_count to indicate this producer has finished."""
+        """Finish one registered producer session."""
         with self._locked():
             self._header[1] += 1
+            self._header.flush()
+
+    def register_producer(self) -> None:
+        """Register a replacement producer session before it starts writing.
+
+        ``num_producers`` and ``done_count`` count sessions rather than stable
+        ranks. An elastic producer finishes its old session before becoming an
+        SAE and registers a new session when it later returns. Consequently a
+        temporary role change cannot make an abandoned producer prevent EOF.
+        """
+        with self._locked():
+            self._header[0] += 1
             self._header.flush()
 
     def request_consumer_stop(self) -> None:
@@ -533,7 +545,12 @@ class SharedActivationBuffer:
             counts[state.name.lower()] += 1
             if state == ChunkState.READY:
                 ready_indices.append(i)
-        return {"counts": counts, "ready_indices": ready_indices}
+        return {
+            "counts": counts,
+            "ready_indices": ready_indices,
+            "producer_sessions": int(self._header[0]),
+            "finished_producer_sessions": int(self._header[1]),
+        }
 
     # ------------------------------------------------------------------
     # Lifecycle

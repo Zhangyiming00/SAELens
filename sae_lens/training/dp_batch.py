@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 
-def balanced_token_counts(tokens: int, replicas: int) -> tuple[int, ...]:
-    """Partition ``tokens`` exactly, with any remainder on the last ranks."""
+def balanced_token_counts(
+    tokens: int, replicas: int, step: int = 0
+) -> tuple[int, ...]:
+    """Partition tokens exactly and rotate remainder ownership by step."""
     if tokens < 0:
         raise ValueError(f"tokens must be >= 0, got {tokens}")
     if replicas < 1:
         raise ValueError(f"replicas must be >= 1, got {replicas}")
+    if step < 0:
+        raise ValueError(f"step must be >= 0, got {step}")
     quotient, remainder = divmod(tokens, replicas)
-    return (quotient,) * (replicas - remainder) + (quotient + 1,) * remainder
+    counts = [quotient] * replicas
+    for offset in range(remainder):
+        counts[(replicas - remainder + step + offset) % replicas] += 1
+    return tuple(counts)
 
 
 def local_token_budget(

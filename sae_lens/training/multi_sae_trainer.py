@@ -7,6 +7,7 @@ import math
 import os
 import threading
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
@@ -634,6 +635,7 @@ class MultiSAETrainer:
         quiesce_ack_path: Path | str | None = None,
         quiesce_drain_ack_path: Path | str | None = None,
         quiesce_finished_ack_path: Path | str | None = None,
+        stop_after_step_check: Callable[[], bool] | None = None,
     ) -> dict[str, TrainingSAE[Any]]:
         pbar = tqdm(total=self.cfg.total_training_samples, desc="Training Multi SAE")
         self._start_device_sampler()
@@ -641,6 +643,7 @@ class MultiSAETrainer:
         quiesce_checkpoint_now = False
         quiesce_checkpoint_saved = False
         quiesce_drain_acked = False
+        stopped_for_reconfigure = False
 
         def _touch_if_metric_writer(path: Path | str | None) -> None:
             if path is not None and self._is_metric_writer_rank():
@@ -682,6 +685,13 @@ class MultiSAETrainer:
             self.n_training_samples < self.cfg.total_training_samples
             or quiesce_draining
         ):
+            if (
+                not quiesce_draining
+                and stop_after_step_check is not None
+                and stop_after_step_check()
+            ):
+                stopped_for_reconfigure = True
+                break
             _maybe_start_quiesce_drain()
             if quiesce_checkpoint_now:
                 _ack_drain_done()
@@ -722,7 +732,14 @@ class MultiSAETrainer:
             }
             self._memory_current_scaled_batch_by_hook = scaled_batch_by_hook
             self._record_memory_phase("after_scale_to_device")
-            self.n_training_samples += local_n
+            previous_samples = self.n_training_samples
+            if getattr(self.data_provider, "tracks_global_progress", False):
+                self.n_training_samples = int(
+                    self.data_provider.global_tokens_consumed
+                )
+            else:
+                self.n_training_samples += local_n
+            progress_samples = self.n_training_samples - previous_samples
 
             self._maybe_synchronize_timing()
             sae_t0 = time.perf_counter()
@@ -759,7 +776,7 @@ class MultiSAETrainer:
             self.n_training_steps += 1
             self.lr_scheduler.step()
             self._checkpoint_if_needed()
-            pbar.update(local_n)
+            pbar.update(progress_samples)
             if self.n_training_steps % 8 == 0 and outputs:
                 avg_loss = sum(_unwrap_item(o.loss) for o in outputs.values()) / len(
                     outputs
@@ -802,7 +819,12 @@ class MultiSAETrainer:
         if quiesce_draining:
             _ack_drain_done()
             _save_quiesce_checkpoint()
-        if self.cfg.save_final_checkpoint and not quiesce_checkpoint_saved:
+        self.last_fit_stopped_for_reconfigure = stopped_for_reconfigure
+        if (
+            self.cfg.save_final_checkpoint
+            and not quiesce_checkpoint_saved
+            and not stopped_for_reconfigure
+        ):
             self.save_checkpoint(checkpoint_name=f"final_{self.n_training_samples}")
         if self._overlap_tp_post is not None:
             self._overlap_tp_post.close()
