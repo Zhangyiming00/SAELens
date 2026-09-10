@@ -225,6 +225,14 @@ def predict(
     foreign_context_mb: float = _FOREIGN_CONTEXT_MB,
     backward_slack_mb: float = 64.0,
     trainer_buf_mb: float = 2.0,
+    streaming_enabled: bool = False,
+    streaming_mix_chunks: int = 0,
+    streaming_chunk_size_tokens: int = 0,
+    streaming_mix_fraction: float | None = None,
+    streaming_mixing_streams: int = 0,
+    streaming_buffer_size_tokens: int | None = None,
+    streaming_prefetch_chunks: int = 0,
+    streaming_source_rank: bool = False,
 ) -> Prediction:
     """Return phase peaks in MiB for the fullest SAE PP rank.
 
@@ -243,6 +251,22 @@ def predict(
         raise ValueError("dp_mode must be ddp, fsdp, or manual")
     if not 0 <= mixing_fraction <= 1:
         raise ValueError("mixing_fraction must be in [0, 1]")
+    if streaming_mix_fraction is not None and not 0 <= streaming_mix_fraction <= 1:
+        raise ValueError("streaming_mix_fraction must be in [0, 1]")
+    if streaming_mix_chunks < 0:
+        raise ValueError("streaming_mix_chunks must be >= 0")
+    if streaming_chunk_size_tokens < 0:
+        raise ValueError("streaming_chunk_size_tokens must be >= 0")
+    if streaming_mixing_streams < 0:
+        raise ValueError("streaming_mixing_streams must be >= 0")
+    if streaming_prefetch_chunks < 0:
+        raise ValueError("streaming_prefetch_chunks must be >= 0")
+    if streaming_buffer_size_tokens is not None and streaming_buffer_size_tokens < 1:
+        raise ValueError("streaming_buffer_size_tokens must be >= 1")
+    if streaming_mix_chunks > 0 and streaming_chunk_size_tokens < 1:
+        raise ValueError(
+            "streaming_chunk_size_tokens must be >= 1 when mix_chunks > 0"
+        )
     if min(d_in, d_sae, batch_tokens, tp, dp_size) < 1:
         raise ValueError("dimensions, batch_tokens, tp, and dp_size must be >= 1")
     if mode == "ordinary" and min(vllm_tp, store_batch_size_prompts, context_size) < 1:
@@ -259,6 +283,15 @@ def predict(
         raise ValueError("require total_hooks >= local_hooks >= 1")
     if d_sae % tp:
         raise ValueError(f"d_sae={d_sae} must be divisible by tp={tp}")
+
+    streaming_active = bool(
+        streaming_enabled
+        or streaming_mix_chunks
+        or streaming_chunk_size_tokens
+        or streaming_buffer_size_tokens is not None
+    )
+    if streaming_mix_fraction is None:
+        streaming_mix_fraction = mixing_fraction
 
     db = _DTYPE_BYTES[dtype]
     local_batch_tokens = math.ceil(batch_tokens / dp_size)
@@ -363,6 +396,14 @@ def predict(
     endpoint_pack_mb = 0.0
     mixing_buffer_mb = 0.0
     data_fetch_peak = 0.0
+    streaming_mixer_mb = 0.0
+    streaming_prefetch_mb = 0.0
+    streaming_refill_mb = 0.0
+    streaming_shuffle_mb = 0.0
+    streaming_resident_mb = 0.0
+    streaming_data_fetch_mb = 0.0
+    streaming_capacity_tokens = 0
+    streaming_stream_count = 0
     if mode == "ordinary":
         store_tokens = store_batch_size_prompts * context_size
         producer_capture_mb = total_hooks * store_tokens * d_in * db / MB
@@ -415,6 +456,51 @@ def predict(
         backward_peak += ordinary_resident_mb
         optimizer_peak += ordinary_resident_mb
 
+    if streaming_active and streaming_source_rank:
+        streaming_stream_count = streaming_mixing_streams or max(1, dp_size)
+        logical_batch_tokens = math.ceil(batch_tokens / streaming_stream_count)
+        streaming_capacity_tokens = max(
+            logical_batch_tokens,
+            streaming_buffer_size_tokens or 0,
+            streaming_mix_chunks * streaming_chunk_size_tokens,
+        )
+        element_mb = d_in * db / MB
+        source_hooks = total_hooks
+        streaming_mixer_mb = (
+            streaming_stream_count
+            * streaming_capacity_tokens
+            * source_hooks
+            * element_mb
+        )
+        streaming_prefetch_mb = (
+            streaming_prefetch_chunks
+            * streaming_chunk_size_tokens
+            * source_hooks
+            * element_mb
+        )
+        streaming_refill_mb = (
+            source_hooks
+            * (streaming_capacity_tokens + logical_batch_tokens)
+            * element_mb
+        )
+        has_streaming_shuffle = (
+            streaming_mix_chunks > 0 or streaming_buffer_size_tokens is not None
+        )
+        if has_streaming_shuffle and streaming_mix_fraction > 0:
+            streaming_shuffle_mb = streaming_mixer_mb
+        streaming_resident_mb = streaming_mixer_mb + streaming_prefetch_mb
+        streaming_data_fetch_mb = (
+            streaming_resident_mb + streaming_refill_mb + streaming_shuffle_mb
+        )
+        persistent += streaming_resident_mb
+        forward_peak += streaming_resident_mb
+        backward_peak += streaming_resident_mb
+        optimizer_peak += streaming_resident_mb
+        data_fetch_peak = max(
+            data_fetch_peak,
+            persistent + streaming_refill_mb + streaming_shuffle_mb,
+        )
+
     nccl_peers = max(0, tp - 1) + max(0, dp_size - 1)
     if mode == "ordinary":
         nccl_peers += max(0, vllm_tp - 1)
@@ -423,6 +509,10 @@ def predict(
     phases = []
     if mode == "ordinary":
         phases.append(PhasePrediction("data_fetch", data_fetch_peak, runtime_residual))
+    elif streaming_data_fetch_mb > 0:
+        phases.append(
+            PhasePrediction("data_fetch", data_fetch_peak, runtime_residual)
+        )
     phases.extend(
         [
             PhasePrediction("forward", forward_peak, runtime_residual),
@@ -486,6 +576,15 @@ def predict(
             "vllm_workspace": vllm_workspace_mb,
             "producer_transient": producer_transient_mb,
             "endpoint_pack": endpoint_pack_mb,
+            "streaming_source_rank": 1.0 if streaming_source_rank else 0.0,
+            "streaming_stream_count": float(streaming_stream_count),
+            "streaming_capacity_tokens": float(streaming_capacity_tokens),
+            "streaming_mixer": streaming_mixer_mb,
+            "streaming_prefetch": streaming_prefetch_mb,
+            "streaming_refill": streaming_refill_mb,
+            "streaming_shuffle": streaming_shuffle_mb,
+            "streaming_resident": streaming_resident_mb,
+            "streaming_data_fetch": streaming_data_fetch_mb,
         },
         overhead={
             "pool_fragmentation": pool_fragmentation,
@@ -533,6 +632,18 @@ def _format_table(
             f"  vLLM workspace   {p.components['vllm_workspace']:9.1f}",
             f"  endpoint pack    {p.components['endpoint_pack']:9.1f}",
             f"  fetch transient  {p.components['producer_transient']:9.1f}",
+        ]
+    if p.components["streaming_resident"] > 0:
+        lines += [
+            "",
+            "Exact streaming source-rank buffers (MB):",
+            f"  stream count     {p.components['streaming_stream_count']:9.0f}",
+            f"  capacity tokens  {p.components['streaming_capacity_tokens']:9.0f}",
+            f"  mixer storage     {p.components['streaming_mixer']:9.1f}",
+            f"  prefetch          {p.components['streaming_prefetch']:9.1f}",
+            f"  refill concat     {p.components['streaming_refill']:9.1f}",
+            f"  shuffle copy      {p.components['streaming_shuffle']:9.1f}",
+            f"  data-fetch peak   {p.components['streaming_data_fetch']:9.1f}",
         ]
     lines += [
         "",
@@ -616,6 +727,22 @@ def main() -> None:
     ap.add_argument("--foreign-context-mb", type=float, default=_FOREIGN_CONTEXT_MB)
     ap.add_argument("--legacy-retain-previous-outputs", action="store_true")
     ap.add_argument(
+        "--streaming-enabled",
+        action="store_true",
+        help="include exact streaming buffers in the estimate",
+    )
+    ap.add_argument("--streaming-mix-chunks", type=int, default=0)
+    ap.add_argument("--streaming-chunk-size-tokens", type=int, default=0)
+    ap.add_argument("--streaming-mix-fraction", type=float, default=None)
+    ap.add_argument("--streaming-mixing-streams", type=int, default=0)
+    ap.add_argument("--streaming-buffer-size-tokens", type=int, default=None)
+    ap.add_argument("--streaming-prefetch-chunks", type=int, default=0)
+    ap.add_argument(
+        "--streaming-source-rank",
+        action="store_true",
+        help="include source-rank logical mixer buffers",
+    )
+    ap.add_argument(
         "--gpu-vram",
         type=float,
         default=None,
@@ -648,6 +775,14 @@ def main() -> None:
         vllm_activation_bytes=args.vllm_activation_bytes,
         foreign_cuda_contexts=args.foreign_cuda_contexts,
         foreign_context_mb=args.foreign_context_mb,
+        streaming_enabled=args.streaming_enabled,
+        streaming_mix_chunks=args.streaming_mix_chunks,
+        streaming_chunk_size_tokens=args.streaming_chunk_size_tokens,
+        streaming_mix_fraction=args.streaming_mix_fraction,
+        streaming_mixing_streams=args.streaming_mixing_streams,
+        streaming_buffer_size_tokens=args.streaming_buffer_size_tokens,
+        streaming_prefetch_chunks=args.streaming_prefetch_chunks,
+        streaming_source_rank=args.streaming_source_rank,
     )
     print(
         f"Config: d_in={args.d_in} d_sae={args.d_sae} B={args.batch} k={args.k} "

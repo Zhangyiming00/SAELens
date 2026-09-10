@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import signal
 import time
 from collections import deque
@@ -158,27 +159,39 @@ class AutoSwitchPolicy:
         rates: ThroughputRates,
         production_complete: bool = False,
     ) -> int | None:
-        growing = (
-            rates.fill_ratio >= self.high_watermark
-            and rates.net_tokens_per_s >= self.min_rate_gap
+        rates_tied = math.isclose(
+            rates.vllm_tokens_per_s,
+            rates.sae_tokens_per_s,
+            rel_tol=1e-6,
+            abs_tol=1e-6,
+        )
+        producer_faster = (
+            rates.net_tokens_per_s >= self.min_rate_gap
             and rates.vllm_tokens_per_s
             >= rates.sae_tokens_per_s * self.min_rate_ratio
             and rates.vllm_tokens_per_s > 0
         )
-        draining = (
-            not production_complete
-            and rates.fill_ratio <= self.low_watermark
-            and -rates.net_tokens_per_s >= self.min_rate_gap
+        consumer_faster = (
+            -rates.net_tokens_per_s >= self.min_rate_gap
             and rates.sae_tokens_per_s
             >= rates.vllm_tokens_per_s * self.min_rate_ratio
             and rates.sae_tokens_per_s > 0
         )
+        high_pressure = (
+            rates.fill_ratio >= self.high_watermark
+            and (producer_faster or rates_tied)
+        )
+        low_pressure = (
+            not production_complete
+            and rates.fill_ratio <= self.low_watermark
+            and (consumer_faster or rates_tied)
+        )
 
-        if active_sae_dp == min_sae_dp and growing:
+        if active_sae_dp == min_sae_dp and high_pressure:
             self.growing_samples += 1
         else:
             self.growing_samples = 0
-        if active_sae_dp == max_sae_dp and draining:
+        if active_sae_dp == max_sae_dp and low_pressure:
             self.draining_samples += 1
         else:
             self.draining_samples = 0
@@ -221,6 +234,60 @@ def _controller(path: Path) -> ElasticStreamingController:
     return ElasticStreamingController(path, layout)
 
 
+def _wait_for_auto_startup(
+    args: argparse.Namespace,
+) -> tuple[ElasticStreamingController, SharedBufferMonitor] | None:
+    deadline = time.monotonic() + args.startup_timeout
+    waiting_reported = False
+    last_reason = "control file does not exist"
+    while True:
+        try:
+            controller = _controller(args.control_path)
+        except FileNotFoundError:
+            controller = None
+
+        if controller is not None:
+            state = controller.read()
+            if state.phase == "failed":
+                raise RuntimeError(f"elastic streaming failed: {state.error}")
+            if state.phase == "finished":
+                print("elastic streaming run already finished")
+                return None
+            if (
+                state.buffer_name
+                and state.buffer_num_chunks > 0
+                and state.buffer_chunk_size_tokens > 0
+            ):
+                try:
+                    monitor = SharedBufferMonitor(state, args.shm_base_dir)
+                except FileNotFoundError as exc:
+                    last_reason = f"streaming buffer files are not visible yet: {exc}"
+                else:
+                    if waiting_reported:
+                        print(
+                            "streaming buffer ready: "
+                            f"name={state.buffer_name} "
+                            f"slots={state.buffer_num_chunks} "
+                            f"chunk_tokens={state.buffer_chunk_size_tokens}"
+                        )
+                    return controller, monitor
+            else:
+                last_reason = "control state has no streaming buffer metadata yet"
+
+        if not waiting_reported:
+            print(
+                f"waiting for elastic streaming buffer at {args.control_path} "
+                f"(timeout={args.startup_timeout:g}s)"
+            )
+            waiting_reported = True
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "elastic streaming buffer did not become ready within "
+                f"{args.startup_timeout:g}s: {last_reason}"
+            )
+        time.sleep(args.poll_interval)
+
+
 def _append_log(path: Path, event: str, **fields: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as handle:
@@ -228,9 +295,12 @@ def _append_log(path: Path, event: str, **fields: object) -> None:
         handle.write("\n")
 
 
-def _run_auto(args: argparse.Namespace, controller: ElasticStreamingController) -> None:
+def _run_auto(
+    args: argparse.Namespace,
+    controller: ElasticStreamingController,
+    monitor: SharedBufferMonitor,
+) -> None:
     state = controller.read()
-    monitor = SharedBufferMonitor(state, args.shm_base_dir)
     history: deque[BufferSample] = deque()
     policy = AutoSwitchPolicy(
         low_watermark=args.low_watermark,
@@ -355,9 +425,9 @@ def _run_auto(args: argparse.Namespace, controller: ElasticStreamingController) 
 
         if target is not None:
             reason = (
-                "high-and-growing"
+                "high-buffer-pressure"
                 if target == controller.layout.max_sae_dp
-                else "low-and-draining"
+                else "low-buffer-pressure"
             )
             _append_log(
                 log_path,
@@ -425,6 +495,7 @@ def main() -> None:
     auto.add_argument("--min-rate-ratio", type=float, default=1.05)
     auto.add_argument("--min-rate-gap", type=float, default=0.0)
     auto.add_argument("--cooldown-seconds", type=float, default=60.0)
+    auto.add_argument("--startup-timeout", type=float, default=600.0)
     auto.add_argument("--switch-timeout", type=float, default=600.0)
     auto.add_argument("--max-switches", type=int, default=0)
     auto.add_argument("--dry-run", action="store_true")
@@ -436,20 +507,27 @@ def main() -> None:
         if (
             args.poll_interval <= 0
             or args.rate_window_seconds <= 0
+            or args.startup_timeout <= 0
             or args.switch_timeout <= 0
         ):
             parser.error(
-                "poll interval, rate window, and switch timeout must be positive"
+                "poll interval, rate window, startup timeout, and switch timeout "
+                "must be positive"
             )
         if args.cooldown_seconds < 0 or args.max_switches < 0:
             parser.error("cooldown and max switches must be non-negative")
 
+    if args.command == "auto":
+        startup = _wait_for_auto_startup(args)
+        if startup is None:
+            return
+        controller, monitor = startup
+        _run_auto(args, controller, monitor)
+        return
+
     controller = _controller(args.control_path)
     if args.command == "status":
         print(json.dumps(controller.read().__dict__, indent=2, sort_keys=True))
-        return
-    if args.command == "auto":
-        _run_auto(args, controller)
         return
 
     requested = controller.request(args.sae_dp)

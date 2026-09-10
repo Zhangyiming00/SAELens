@@ -20,7 +20,6 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim import Adam
 from tqdm.auto import tqdm
 
 from sae_lens import __version__
@@ -45,6 +44,14 @@ from sae_lens.saes.sae import (
     TrainStepOutput,
 )
 from sae_lens.training.activation_scaler import ActivationScaler
+from sae_lens.training.ddp_zero_optimizer import (
+    build_adam_optimizer,
+    clear_optimizer_state,
+    consolidate_optimizer_state,
+    is_zero_optimizer,
+    optimizer_state_by_parameter,
+    set_optimizer_parameter_state,
+)
 from sae_lens.training.optim import CoefficientScheduler, get_lr_scheduler
 from sae_lens.training.step_window_profiler import StepWindowProfiler
 from sae_lens.training.tp_checkpoint import (
@@ -263,14 +270,16 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
         # Optimizer is constructed over self.sae.parameters() so that in FSDP mode
         # it sees FSDP's managed parameter views; in manual mode self.sae == _base_sae.
-        self.optimizer = Adam(
+        self.optimizer = build_adam_optimizer(
             sae.parameters(),
-            lr=cfg.lr,
-            betas=(
-                cfg.adam_beta1,
-                cfg.adam_beta2,
-            ),
-            **_adam_optimizer_kwargs_from_env(),
+            adam_kwargs={
+                "lr": cfg.lr,
+                "betas": (cfg.adam_beta1, cfg.adam_beta2),
+                **_adam_optimizer_kwargs_from_env(),
+            },
+            zero_redundancy=getattr(cfg, "ddp_zero_optimizer", False),
+            ddp_enabled=self._is_ddp,
+            dp_group=self.dp_group,
         )
         assert cfg.lr_end is not None  # this is set in config post-init
         self.lr_scheduler = get_lr_scheduler(
@@ -508,6 +517,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         tp_group = getattr(self._base_sae, "_tp_group", None)
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
+        if is_zero_optimizer(self.optimizer):
+            consolidate_optimizer_state(self.optimizer, to=0)
         if dp_rank != 0 and not self._is_fsdp:
             return
         checkpoint_path = None
@@ -744,8 +755,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
     def _build_named_optimizer_state_for_save(self) -> dict[str, dict[str, Any]]:
         optimizer_state_by_name: dict[str, dict[str, Any]] = {}
+        state_by_parameter = optimizer_state_by_parameter(self.optimizer)
         for name, param in self._base_sae.named_parameters():
-            state = self.optimizer.state.get(param)
+            state = state_by_parameter.get(id(param))
             if not state:
                 continue
             optimizer_state_by_name[name] = {
@@ -764,7 +776,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self._base_sae.process_named_optimizer_state_for_loading(
             optimizer_state_by_name
         )
-        self.optimizer.state.clear()
+        clear_optimizer_state(self.optimizer)
 
         named_params = dict(self._base_sae.named_parameters())
         for name, state in optimizer_state_by_name.items():
@@ -784,7 +796,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                     )
                 else:
                     loaded_state[key] = deepcopy(value)
-            self.optimizer.state[param] = loaded_state
+            set_optimizer_parameter_state(self.optimizer, param, loaded_state)
 
     def _train_step(
         self,

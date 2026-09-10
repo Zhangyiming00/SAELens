@@ -47,18 +47,23 @@ Add the following options to a normal `run_sae_runner_gpu.py` invocation:
 
 ```bash
 torchrun --standalone --nproc-per-node=8 run_sae_runner_gpu.py \
-  --streaming-mode \
+  --elastic-streaming \
   --streaming-dp-batch-mode exact \
   --sae-dp-mode ddp \
   --vllm-tp-size 2 \
   --sae-tp-size 1 \
   --sae-pp-size 2 \
-  --elastic-streaming-control-path /tmp/sae-elastic/control.json \
   --elastic-permanent-vllm-dp-size 1 \
   --elastic-permanent-sae-dp-size 1 \
   --hook-names model.layers.8,model.layers.16 \
   ...
 ```
+
+`--elastic-streaming` (short form `-es`) enables streaming implicitly, so it
+does not need to be combined with `--streaming-mode`. The elastic control path
+defaults to `/tmp/sae-elastic/control.json`; override it with
+`--elastic-streaming-control-path` when multiple jobs need separate control
+files. Setting a control path by itself does not enable elastic streaming.
 
 The elastic layout determines the initial `--vllm-dp-size` and
 `--sae-dp-size`; values supplied for those two arguments are replaced. Training
@@ -90,8 +95,8 @@ python scripts/elastic_streaming_control.py \
 
 ## Automatic switching
 
-Run the controller as a separate process after the workers have created the
-control file:
+Run the controller as a separate process; it may be started before or after the
+training workers:
 
 ```bash
 python -u scripts/elastic_streaming_control.py \
@@ -103,14 +108,20 @@ python -u scripts/elastic_streaming_control.py \
   --cooldown-seconds 60
 ```
 
+The controller waits up to 600 seconds for the control file, buffer metadata,
+and SHM files to become ready. Use `--startup-timeout` to change that limit;
+starting the controller before the training workers is supported.
+
 The default policy has two symmetric decisions:
 
-- At minimum SAE DP, buffer occupancy must be at least 75%, and vLLM
-  throughput must exceed SAE throughput by at least 5% for three consecutive
-  samples. It then moves all elastic ranks to SAE.
-- At maximum SAE DP, occupancy must be at most 25%, and SAE throughput must
-  exceed vLLM throughput by at least 5% for three consecutive samples. It then
-  moves all elastic ranks back to vLLM.
+- At minimum SAE DP, buffer occupancy must be at least 75%, and either vLLM
+  throughput exceeds SAE throughput by at least 5% or the two rates are tied
+  under producer backpressure. After three consecutive samples it moves all
+  elastic ranks to SAE.
+- At maximum SAE DP, occupancy must be at most 25%, and either SAE throughput
+  exceeds vLLM throughput by at least 5% or the two rates are tied while
+  consumers wait for data. After three consecutive samples it moves all
+  elastic ranks back to vLLM.
 
 Rates use a 10-second sliding window by default. `--min-rate-gap` can require an
 additional absolute token/s difference. `--switch-timeout` detects a cutover
@@ -168,6 +179,101 @@ the old buffer storage is released without invalidating that cache, a cold
 restart reuses the emptied buffer and fails on its first rotary-embedding
 forward. Cache invalidation affects only the elastic process, never a permanent
 vLLM rank.
+
+## Multi-hook memory model and the 4-hook OOM
+
+The OOM in a four-hook exact-DP run is a source-rank data-fetch peak, not a
+four-hook SAE graph that grows forever. The exact provider keeps the logical
+mixing state on one source rank (the rank selected from the SAE-DP group). That
+rank therefore owns the GPU tensors below; other SAE-DP ranks receive an exact
+slice and do not own the logical mixer.
+
+The analytic model is implemented in
+`sae_lens/autoconfig/phase_memory_model.py`. A source-rank estimate can be
+generated without starting a distributed job:
+
+```python
+from sae_lens.autoconfig.phase_memory_model import (
+    SAEPhaseMemoryConfig,
+    estimate_phase_memory,
+)
+
+estimate = estimate_phase_memory(
+    SAEPhaseMemoryConfig(
+        d_in=4096,
+        d_sae=65536,
+        num_hooks=4,
+        train_batch_size_tokens=2048,
+        dtype="fp32",
+        streaming_enabled=True,
+        streaming_mix_chunks=8,
+        streaming_chunk_size_tokens=8192,
+        streaming_prefetch_chunks=2,
+        streaming_source_rank=True,
+    )
+)
+print(estimate.peak_mb, estimate.components["streaming"])
+```
+
+The calibrated per-rank predictor exposes the same source-rank terms from the
+command line. Its streaming flags are off by default, so existing v4 reports
+are unchanged:
+
+```bash
+python scripts/predict_sae_memory.py \
+  --d-in 4096 --d-sae 65536 --batch 2048 --dtype fp32 \
+  --hooks 4 --tp 1 --dp-size 1 --dp-mode ddp \
+  --streaming-enabled --streaming-source-rank \
+  --streaming-mix-chunks 8 --streaming-chunk-size-tokens 8192 \
+  --streaming-prefetch-chunks 2
+```
+
+For `H` hooks, element size `D` bytes, logical stream count `S`, and mixer
+capacity `C` tokens per stream, the important terms are:
+
+```text
+C = max(ceil(global_batch / S), explicit_buffer, mix_chunks * chunk_tokens)
+mixer storage         = S * C * H * d_in * D
+prefetch/reinterleave = prefetch_chunks * chunk_tokens * H * d_in * D
+refill concat peak    = H * (C + ceil(global_batch / S)) * d_in * D
+shuffle copy          = mixer storage  (when mix_fraction > 0)
+```
+
+In the diagnostic run, `H=4`, `d_in=4096`, `D=4`, `S=1`, and
+`8 * 8192 = 65536` tokens. The mixer backing tensor alone is therefore 4 GiB;
+two prefetched chunks add 1 GiB. During refill, `_cat_batches` creates a new
+tensor before the old one is released. With 36,864 rows, one hook's temporary
+tensor is `36864 * 4096 * 4 = 576 MiB`, which is the allocation named in the
+CUDA exception. The shuffle path can create another full-buffer copy. These
+are avoidable buffer peaks, and are independent of whether SAE forward is
+sequential or combined.
+
+The `forward_bytes`, `backward_bytes`, and `optimizer_bytes` fields include
+the source rank's resident streaming buffers. `peak_bytes` additionally takes
+the data-fetch refill/shuffle peak. `reserved but unallocated` memory from the
+CUDA caching allocator is intentionally not counted as a live tensor; it is a
+fragmentation/high-water diagnostic. The model also captures the actual
+multi-hook SAE terms: parameters and Adam states scale with `num_hooks`, while
+TP divides only the `d_sae` dimensions and DDP bucket storage is added only
+when `gradient_as_bucket_view=False`.
+
+The runtime phase profiler follows exact-provider `_source` links, logical
+mixer generator locals, and the reinterleaved provider `_pool`, so
+`data_provider_buffers_mb` now exposes these root-owned tensors instead of
+silently placing them in `unattributed_allocated_mb`.
+
+For the reported failure, the practical mitigations are:
+
+- set `--streaming-mix-chunks 0` when temporal mixing is not required; this
+  removes the 65,536-token logical mixer and leaves only a one-batch queue;
+- keep `PYTORCH_ALLOC_CONF=expandable_segments:True` for long runs, so the
+  allocator is less likely to fail a contiguous refill allocation because of
+  reserved-block fragmentation;
+- reduce `--streaming-chunk-size-tokens`, `--streaming-prefetch-chunks`, or the
+  global training batch if the source rank still has insufficient headroom;
+- treat rank-local source ownership as intentional. Moving or eliminating the
+  logical mixer requires changing exact-DP semantics, not merely changing the
+  root rank label.
 
 ## Current constraints
 

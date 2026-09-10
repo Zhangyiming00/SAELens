@@ -8,12 +8,22 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from sae_lens.training.ddp_zero_optimizer import (
+    clear_optimizer_parameter_state,
+    optimizer_state_by_parameter,
+    set_optimizer_parameter_state,
+)
+
 
 def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> list[torch.Tensor]:
-    return [parameter for group in optimizer.param_groups for parameter in group["params"]]
+    return [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
 
 
-def broadcast_optimizer_state(
+def _broadcast_optimizer_group_options(
     *,
     source: torch.optim.Optimizer | None,
     target: torch.optim.Optimizer,
@@ -21,15 +31,9 @@ def broadcast_optimizer_state(
     source_global_rank: int,
     device: torch.device,
 ) -> None:
-    """Populate ``target`` from one live optimizer without a CPU checkpoint."""
     is_source = dist.get_rank() == source_global_rank
     if is_source and source is None:
         raise ValueError("source optimizer is required on source_global_rank")
-
-    source_parameters = _optimizer_parameters(source) if source is not None else []
-    target_parameters = _optimizer_parameters(target)
-    if is_source and len(source_parameters) != len(target_parameters):
-        raise ValueError("source and target optimizer parameter counts differ")
 
     group_options: list[dict[str, Any]] | None = None
     if is_source:
@@ -46,14 +50,73 @@ def broadcast_optimizer_state(
         device=device,
     )
     received_options = object_payload[0]
+    if not isinstance(received_options, list):
+        raise RuntimeError(
+            "missing optimizer parameter-group options during hot switch"
+        )
     if len(received_options) != len(target.param_groups):
         raise RuntimeError("optimizer parameter-group counts differ during hot switch")
     for target_group, options in zip(target.param_groups, received_options):
         target_group.update(options)
 
+
+def broadcast_optimizer_state(
+    *,
+    source: torch.optim.Optimizer | None,
+    target: torch.optim.Optimizer,
+    group: dist.ProcessGroup,
+    source_global_rank: int,
+    device: torch.device,
+    source_parameters: list[torch.Tensor] | None = None,
+    target_parameters: list[torch.Tensor] | None = None,
+    broadcast_group_options: bool = True,
+    consume_source_state: bool = False,
+) -> None:
+    """Populate ``target`` from one live optimizer without a CPU checkpoint."""
+    is_source = dist.get_rank() == source_global_rank
+    if is_source and source is None:
+        raise ValueError("source optimizer is required on source_global_rank")
+
+    if source_parameters is None:
+        source_parameters = _optimizer_parameters(source) if source is not None else []
+    if target_parameters is None:
+        target_parameters = _optimizer_parameters(target)
+    if is_source and len(source_parameters) != len(target_parameters):
+        raise ValueError("source and target optimizer parameter counts differ")
+
+    if is_source:
+        assert source is not None
+        source_parameter_ids = {
+            id(parameter) for parameter in _optimizer_parameters(source)
+        }
+        if any(
+            id(parameter) not in source_parameter_ids
+            for parameter in source_parameters
+        ):
+            raise ValueError("source parameters are not owned by the source optimizer")
+        source_state_by_parameter = optimizer_state_by_parameter(source)
+    else:
+        source_state_by_parameter = {}
+    target_parameter_ids = {
+        id(parameter) for parameter in _optimizer_parameters(target)
+    }
+    if any(
+        id(parameter) not in target_parameter_ids for parameter in target_parameters
+    ):
+        raise ValueError("target parameters are not owned by the target optimizer")
+
+    if broadcast_group_options:
+        _broadcast_optimizer_group_options(
+            source=source,
+            target=target,
+            group=group,
+            source_global_rank=source_global_rank,
+            device=device,
+        )
+
     for parameter_idx, target_parameter in enumerate(target_parameters):
         source_state = (
-            source.state[source_parameters[parameter_idx]]
+            source_state_by_parameter.get(id(source_parameters[parameter_idx]))
             if is_source and source is not None
             else None
         )
@@ -74,6 +137,8 @@ def broadcast_optimizer_state(
             group=group,
             device=device,
         )
+        if state_payload[0] is None:
+            continue
         target_state: dict[str, Any] = {}
         for key, is_tensor, dtype, shape, value in state_payload[0]:
             if not is_tensor:
@@ -90,7 +155,78 @@ def broadcast_optimizer_state(
                 group=group,
             )
             target_state[key] = tensor
-        target.state[target_parameter] = target_state
+        set_optimizer_parameter_state(target, target_parameter, target_state)
+        # During an elastic switch the old and replacement trainers coexist on
+        # the permanent SAE rank.  Releasing each old Adam entry as soon as it
+        # has been sent prevents that rank from retaining the complete old
+        # optimizer while the replacement optimizer grows.  Merely clearing
+        # the optimizer is insufficient here: this lookup also owns references
+        # to every state tensor.
+        if consume_source_state and is_source:
+            source_parameter = source_parameters[parameter_idx]
+            source_state_by_parameter.pop(id(source_parameter), None)
+            assert source is not None
+            clear_optimizer_parameter_state(source, source_parameter)
+
+
+def _broadcast_trainer_optimizer_state(
+    *,
+    source: Any | None,
+    target: Any,
+    group: dist.ProcessGroup,
+    source_global_rank: int,
+    device: torch.device,
+) -> None:
+    """Transfer optimizer state across aggregate/per-hook overlap topologies."""
+    is_source = dist.get_rank() == source_global_rank
+    if is_source and source is None:
+        raise ValueError("source trainer is required on source_global_rank")
+
+    # The scheduler is attached to the aggregate optimizer in both modes. Its
+    # current LR and other group options therefore remain the canonical control
+    # state even while per-hook optimizers own the live Adam moments.
+    _broadcast_optimizer_group_options(
+        source=source.optimizer if is_source else None,
+        target=target.optimizer,
+        group=group,
+        source_global_rank=source_global_rank,
+        device=device,
+    )
+
+    for hook_name in target.hook_names:
+        if is_source:
+            assert source is not None
+            if hook_name not in source.base_sae_by_hook:
+                raise ValueError(f"source trainer is missing hook {hook_name!r}")
+            source_optimizer = source._overlap_optimizer_by_hook.get(
+                hook_name,
+                source.optimizer,
+            )
+            source_parameters = list(
+                source.base_sae_by_hook[hook_name].parameters()
+            )
+        else:
+            source_optimizer = None
+            source_parameters = None
+
+        target_optimizer = target._overlap_optimizer_by_hook.get(
+            hook_name,
+            target.optimizer,
+        )
+        target_parameters = list(target.base_sae_by_hook[hook_name].parameters())
+        broadcast_optimizer_state(
+            source=source_optimizer,
+            target=target_optimizer,
+            group=group,
+            source_global_rank=source_global_rank,
+            device=device,
+            source_parameters=source_parameters,
+            target_parameters=target_parameters,
+            # Aggregate options were copied from the scheduler-owned optimizer
+            # above. Per-hook optimizers need their own options initialized.
+            broadcast_group_options=target_optimizer is not target.optimizer,
+            consume_source_state=True,
+        )
 
 
 def _broadcast_tensor_dict(
@@ -169,26 +305,13 @@ def broadcast_multi_sae_trainer_state(
     if state["cuda_rng_state"] is not None:
         torch.cuda.set_rng_state(state["cuda_rng_state"].cpu(), device=device)
 
-    broadcast_optimizer_state(
-        source=source.optimizer if is_source else None,
-        target=target.optimizer,
+    _broadcast_trainer_optimizer_state(
+        source=source,
+        target=target,
         group=group,
         source_global_rank=source_global_rank,
         device=device,
     )
-    for hook_name, target_optimizer in target._overlap_optimizer_by_hook.items():
-        source_optimizer = (
-            source._overlap_optimizer_by_hook[hook_name]
-            if is_source and source is not None
-            else None
-        )
-        broadcast_optimizer_state(
-            source=source_optimizer,
-            target=target_optimizer,
-            group=group,
-            source_global_rank=source_global_rank,
-            device=device,
-        )
 
     _broadcast_tensor_dict(
         source=source.act_freq_scores_by_hook if is_source else None,

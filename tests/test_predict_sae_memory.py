@@ -410,6 +410,35 @@ def test_ordinary_model_accounts_for_endpoint_pack_and_contexts():
     assert with_foreign.step_peak_driver_mb > 28_000
 
 
+def test_exact_streaming_source_rank_accounts_for_multihook_buffers():
+    mod = _load_predictor()
+    common = dict(
+        d_in=4096,
+        d_sae=65536,
+        batch_tokens=2048,
+        k=128,
+        dtype="fp32",
+        hooks=4,
+        tp=1,
+        dp_size=1,
+        dp_mode="ddp",
+        streaming_enabled=True,
+        streaming_mix_chunks=8,
+        streaming_chunk_size_tokens=8192,
+        streaming_prefetch_chunks=2,
+    )
+    source = mod.predict(streaming_source_rank=True, **common)
+    non_source = mod.predict(streaming_source_rank=False, **common)
+
+    assert source.components["streaming_capacity_tokens"] == pytest.approx(65536)
+    assert source.components["streaming_mixer"] == pytest.approx(4096)
+    assert source.components["streaming_prefetch"] == pytest.approx(1024)
+    assert source.components["streaming_resident"] == pytest.approx(5120)
+    assert source.components["streaming_data_fetch"] > source.components["streaming_resident"]
+    assert non_source.components["streaming_resident"] == 0
+    assert source.step_peak_allocated_mb > non_source.step_peak_allocated_mb
+
+
 def test_model_uses_fullest_rank_for_uneven_global_dp_batch():
     mod = _load_predictor()
     uneven = mod.predict(

@@ -26,7 +26,7 @@ from safetensors.torch import load_file, save_file
 from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim import Adam
+from torch.optim import Optimizer
 from tqdm.auto import tqdm
 
 from sae_lens.constants import (
@@ -46,6 +46,14 @@ from sae_lens.training.ddp_overlap_v2 import (
     TPPostSharedMemory,
     apply_clip_coef_,
     tp_post_cpu_shm_prepare_clip,
+)
+from sae_lens.training.ddp_zero_optimizer import (
+    build_adam_optimizer,
+    clear_optimizer_state,
+    consolidate_optimizer_state,
+    local_optimizer_parameter_state,
+    optimizer_state_by_parameter,
+    set_optimizer_parameter_state,
 )
 from sae_lens.training.multi_hook_sae import MultiHookSAE
 from sae_lens.training.optim import get_lr_scheduler
@@ -188,7 +196,14 @@ class MultiSAETrainer:
             _adam_kwargs["foreach"] = True
         elif _adam_impl == "forloop":
             _adam_kwargs["foreach"] = False
-        self.optimizer = Adam(params, **_adam_kwargs)
+        use_zero_optimizer = bool(getattr(cfg, "ddp_zero_optimizer", False))
+        self.optimizer = build_adam_optimizer(
+            params,
+            adam_kwargs=_adam_kwargs,
+            zero_redundancy=use_zero_optimizer,
+            ddp_enabled=self._is_ddp,
+            dp_group=self.dp_group,
+        )
 
         # Experimental per-hook DP-reduction -> optimizer overlap.  The raw
         # MultiHookSAE remains the state-dict owner, while each child executes
@@ -221,7 +236,7 @@ class MultiSAETrainer:
             and self._is_ddp
             and self._dp_world_size() > 1
         )
-        self._overlap_optimizer_by_hook: dict[str, Adam] = {}
+        self._overlap_optimizer_by_hook: dict[str, Optimizer] = {}
         self._overlap_optimizer_done_by_hook: dict[str, torch.cuda.Event] = {}
         self._overlap_post_ready_by_hook: dict[str, torch.cuda.Event] = {}
         self._overlap_ddp_state: DDPOptimizerOverlapState | None = None
@@ -276,8 +291,12 @@ class MultiSAETrainer:
 
             for hook_name in self.hook_names:
                 base_sae = self.base_sae_by_hook[hook_name]
-                self._overlap_optimizer_by_hook[hook_name] = Adam(
-                    list(base_sae.parameters()), **_adam_kwargs
+                self._overlap_optimizer_by_hook[hook_name] = build_adam_optimizer(
+                    list(base_sae.parameters()),
+                    adam_kwargs=_adam_kwargs,
+                    zero_redundancy=use_zero_optimizer,
+                    ddp_enabled=True,
+                    dp_group=self.dp_group,
                 )
                 self._overlap_optimizer_done_by_hook[hook_name] = torch.cuda.Event(
                     blocking=False, interprocess=False
@@ -1807,6 +1826,7 @@ class MultiSAETrainer:
         dp_rank = self._dp_rank()
         tp_rank = self._tp_rank()
         dp_size = self._dp_world_size()
+        self.consolidate_zero_optimizer_state(to=0)
         if self._is_fsdp:
             self._save_fsdp_raw_optimizer_state(checkpoint_path)
             optimizer_state: dict[str, Any] = {
@@ -2004,6 +2024,7 @@ class MultiSAETrainer:
 
     def _build_named_optimizer_state_for_save(self) -> dict[str, dict[str, dict[str, Any]]]:
         optimizer_state_by_hook: dict[str, dict[str, dict[str, Any]]] = {}
+        state_by_optimizer: dict[int, dict[int, dict[str, Any]]] = {}
         for hook_name in self.hook_names:
             base_sae = self.base_sae_by_hook[hook_name]
             hook_state: dict[str, dict[str, Any]] = {}
@@ -2011,8 +2032,14 @@ class MultiSAETrainer:
                 hook_name,
                 self.optimizer,
             )
+            optimizer_id = id(state_optimizer)
+            if optimizer_id not in state_by_optimizer:
+                state_by_optimizer[optimizer_id] = optimizer_state_by_parameter(
+                    state_optimizer
+                )
+            state_by_parameter = state_by_optimizer[optimizer_id]
             for name, param in base_sae.named_parameters():
-                state = state_optimizer.state.get(param)
+                state = state_by_parameter.get(id(param))
                 if not state:
                     continue
                 hook_state[name] = {
@@ -2031,9 +2058,9 @@ class MultiSAETrainer:
         *,
         already_processed: bool = False,
     ) -> None:
-        self.optimizer.state.clear()
+        clear_optimizer_state(self.optimizer)
         for optimizer in self._overlap_optimizer_by_hook.values():
-            optimizer.state.clear()
+            clear_optimizer_state(optimizer)
         for hook_name in self.hook_names:
             base_sae = self.base_sae_by_hook[hook_name]
             state_optimizer = self._overlap_optimizer_by_hook.get(
@@ -2062,7 +2089,17 @@ class MultiSAETrainer:
                         )
                     else:
                         loaded_state[key] = deepcopy(value)
-                state_optimizer.state[param] = loaded_state
+                set_optimizer_parameter_state(state_optimizer, param, loaded_state)
+
+    def consolidate_zero_optimizer_state(self, *, to: int) -> None:
+        """Gather active ZeRO optimizer shards on one DP-group rank."""
+        optimizers = (
+            list(self._overlap_optimizer_by_hook.values())
+            if self._overlap_optimizer_by_hook
+            else [self.optimizer]
+        )
+        for optimizer in optimizers:
+            consolidate_optimizer_state(optimizer, to=to)
 
     def _load_checkpoint_models(self, checkpoint_path: Path) -> None:
         if self.multi_sae_distributed_architecture == "unified_multi_hook":
@@ -2489,7 +2526,10 @@ class MultiSAETrainer:
         - GpuStreamingActivationProvider: ``_pool_by_hook`` and
           ``_serving_by_hook`` (dicts) plus ``_chunk_buffer`` (list of dicts)
         - StreamingActivationProvider: ``_mixing_pool`` (a single tensor)
+          and ``_pool`` (the current reinterleaved multi-hook tensor)
         - GpuDirectDataProvider: wraps another provider in ``_inner``
+        - Exact/logical streaming providers: chain through ``_source`` and
+          retain mixer tensors in generator frame locals
 
         Reuses the shared ``seen`` set, so a buffer tensor that is the *same
         object* as an already-counted batch tensor is not double counted; the
@@ -2501,18 +2541,39 @@ class MultiSAETrainer:
         provider: Any = self.data_provider
         total = 0
         visited: set[int] = set()
-        while provider is not None and id(provider) not in visited:
+        pending: list[Any] = [provider]
+        while pending:
+            provider = pending.pop()
+            if provider is None or id(provider) in visited:
+                continue
             visited.add(id(provider))
             for attr in (
                 "_pool_by_hook",
                 "_serving_by_hook",
                 "_chunk_buffer",
                 "_mixing_pool",
+                "_pool",
             ):
                 value = getattr(provider, attr, None)
                 if value is not None:
                     total += self._tensor_tree_bytes(value, seen)
-            provider = getattr(provider, "_inner", None)
+            for attr in ("_inner", "_source"):
+                child = getattr(provider, attr, None)
+                if child is not None:
+                    pending.append(child)
+
+            # ``mixing_buffer`` is a generator. Its storage/serving tensors are
+            # locals in the suspended generator frame rather than attributes
+            # on LogicalStreamingMixingProvider, so include those locals here.
+            mixers = getattr(provider, "_mixers", None)
+            if mixers is not None:
+                for mixer in mixers:
+                    frame = getattr(mixer, "gi_frame", None)
+                    if frame is not None:
+                        for name in ("storage_buffer", "serving_buffer", "new_activations"):
+                            value = frame.f_locals.get(name)
+                            if value is not None:
+                                total += self._tensor_tree_bytes(value, seen)
         return total
 
     def _component_memory_stats_mb(self) -> dict[str, float]:
@@ -2531,7 +2592,7 @@ class MultiSAETrainer:
                     param_bytes += self._tensor_tree_bytes(param, seen)
                 if param.grad is not None and param.grad.device.type == "cuda":
                     grad_bytes += self._tensor_tree_bytes(param.grad, seen)
-                state = state_optimizer.state.get(param, {})
+                state = local_optimizer_parameter_state(state_optimizer, param)
                 optimizer_state_bytes += self._tensor_tree_bytes(state, seen)
 
         trainer_buffer_values: list[Any] = [

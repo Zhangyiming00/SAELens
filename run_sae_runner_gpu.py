@@ -25,6 +25,14 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Elastic role changes rebuild large SAE/vLLM allocation patterns in one
+# process.  Expandable segments let PyTorch grow/reuse those segments instead
+# of stranding enough free memory across non-contiguous allocator blocks to
+# fail a later 512 MiB SAE backward allocation.  Respect an explicit operator
+# choice when the variable is already set.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.distributed as dist
 from transformers import AutoConfig
@@ -49,13 +57,13 @@ def parse_args() -> argparse.Namespace:
     # 2. SAE parameters
     parser.add_argument("--hook-name", "--hook", default="blocks.21.hook_resid_post")
     parser.add_argument("--hook-names", "--hooks",
-        default="blocks.21.hook_resid_post,blocks.31.hook_resid_post",
+        default="blocks.16.hook_resid_post,blocks.21.hook_resid_post,blocks.26.hook_resid_post,blocks.31.hook_resid_post",
         help="Comma-separated hook names for multi-layer independent SAE training.",
     )
     parser.add_argument("--d-sae", type=int, default=32768)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--training-tokens", type=int, default=2048 * 4096)
-    parser.add_argument("--train-batch-size-tokens", type=int, default=2048)
+    parser.add_argument("--train-batch-size-tokens", type=int, default=4096)
     parser.add_argument("--dead-feature-window", type=int, default=1000,
         help=(
             "Training steps before a feature is considered dead for TopK aux loss. "
@@ -76,6 +84,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fsdp", "-fsdp", action="store_true", help="sae dp mode, fsdp")
     parser.add_argument("--streaming-mode", "--streaming", action="store_true", default=False,
         help="Enable streaming_mode v1 (vLLM producers + SAE consumers via /dev/shm).",
+    )
+    parser.add_argument(
+        "--elastic-streaming", "-es", action="store_true", default=False,
+        help=(
+            "Enable streaming mode with in-process elastic DP hot switching; "
+            "--streaming-mode is implied."
+        ),
     )
     parser.add_argument("--elastic-permanent-vllm-dp-size", "-evdp", type=int, default=None,
         help="Number of vLLM DP replicas whose role never changes.",
@@ -102,7 +117,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     # 4.2 Buffer parameters (streaming)
-    parser.add_argument("--streaming-chunk-size-tokens", type=int, default=8192,
+    parser.add_argument("--streaming-chunk-size-tokens", type=int, default=4096,
         help="Tokens per shared-memory chunk in streaming_mode.",
     )
     parser.add_argument(
@@ -113,13 +128,13 @@ def parse_args() -> argparse.Namespace:
             "global batch exactly across physical SAE-DP."
         ),
     )
-    parser.add_argument("--streaming-num-chunks", type=int, default=32,
+    parser.add_argument("--streaming-num-chunks", type=int, default=96,
         help="Number of shared-memory chunk slots in streaming_mode.",
     )
     parser.add_argument("--streaming-prefetch-chunks", type=int, default=2,
         help="Max chunks to acquire per consumer refill in streaming_mode.",
     )
-    parser.add_argument("--streaming-mix-chunks", type=int, default=8,
+    parser.add_argument("--streaming-mix-chunks", type=int, default=4,
         help=(
             "Consumer-local rolling mixing window in shared-memory chunks. "
             "Set 0 to disable and serve each prefetch pool directly."
@@ -315,6 +330,13 @@ def parse_args() -> argparse.Namespace:
         help="Fail fast on invalid DDP config combinations instead of fallback.",
     )
     parser.add_argument(
+        "--ddp-zero-optimizer", action="store_true", default=False,
+        help=(
+            "Shard Adam state and parameter updates across SAE DDP ranks with "
+            "ZeroRedundancyOptimizer. Disabled by default."
+        ),
+    )
+    parser.add_argument(
         "--fsdp-backward-prefetch", default="backward_pre",
         choices=["backward_pre", "backward_post", "none"],
         help=(
@@ -374,18 +396,23 @@ def parse_args() -> argparse.Namespace:
         help="Disable both the final checkpoint and final SAE save.",
     )
     parser.add_argument("--resume-from-checkpoint", default=None)
-    parser.add_argument("--elastic-streaming-control-path", type=str, default="/tmp/saelens_control_state.json",
+    parser.add_argument(
+        "--elastic-streaming-control-path",
+        type=str,
+        default="/tmp/sae-elastic/control.json",
         help=(
-            "Enable in-process streaming DP hot switching and store its manual "
-            "control state at this path. This is separate from topology-supervisor."
+            "Path for elastic streaming control state (default: "
+            "/tmp/sae-elastic/control.json). This is separate from "
+            "topology-supervisor."
         ),
     )
     parser.add_argument(
-        "--control-state-path", type=str, default="/tmp/saelens_topology_control.json",
+        "--control-state-path", type=str, default=None,
         help=(
             "Path to control_state.json written by topology_supervisor.py. "
             "When provided, topology (vllm_tp, vllm_dp, sae_tp), buffer_name, "
             "and checkpoint_path are read from this file and override CLI args."
+            "/tmp/saelens_topology_control.json"
         ),
     )
 
@@ -544,6 +571,9 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args(argv)
 
+    if args.elastic_streaming:
+        args.streaming_mode = True
+
     shortcut_modes = []
     if args.ddp:
         shortcut_modes.append("ddp")
@@ -592,6 +622,9 @@ def parse_args() -> argparse.Namespace:
     elif args.sae_dp_mode is None:
         args.sae_dp_mode = shortcut_mode or "ddp"
 
+    if args.ddp_zero_optimizer and args.sae_dp_mode != "ddp":
+        parser.error("--ddp-zero-optimizer requires --sae-dp-mode ddp")
+
     if args.no_save_final:
         args.save_final_checkpoint = False
         args.no_save_final_sae = True
@@ -605,6 +638,31 @@ def _resolve_device() -> str:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     return f"cuda:{local_rank}"
+
+
+def _validate_streaming_world_size(
+    args: argparse.Namespace,
+    *,
+    world_size: int,
+    vllm_tp_size: int,
+    sae_tp_size: int,
+) -> None:
+    expected_world_size = (
+        vllm_tp_size * args.vllm_dp_size
+        + sae_tp_size * args.sae_dp_size * args.sae_pp_size
+    )
+    valid_world_sizes = (
+        (expected_world_size,)
+        if args.elastic_streaming
+        else (1, expected_world_size)
+    )
+    if world_size not in valid_world_sizes:
+        mode = "elastic_streaming" if args.elastic_streaming else "streaming_mode"
+        raise ValueError(
+            f"{mode}: WORLD_SIZE={world_size} does not match "
+            "vllm_tp*vllm_dp + sae_tp*sae_dp*sae_pp_size = "
+            f"{expected_world_size}."
+        )
 
 
 def _cleanup_topology_runner_shm() -> int:
@@ -980,13 +1038,9 @@ def main() -> None:
             args.use_shard_routing = True
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     elastic_layout = None
-    if args.elastic_streaming_control_path is not None:
+    if args.elastic_streaming:
         from sae_lens.elastic_streaming import ElasticStreamingLayout
 
-        if not args.streaming_mode:
-            raise ValueError(
-                "--elastic-streaming-control-path requires --streaming-mode"
-            )
         if args.control_state_path is not None:
             raise ValueError(
                 "elastic streaming is independent of --control-state-path and "
@@ -1040,15 +1094,12 @@ def main() -> None:
         hook_names = None
     if args.streaming_mode:
         args.use_shard_routing = False
-        expected_world_size = (
-            vllm_tp_size * args.vllm_dp_size
-            + sae_tp_size * args.sae_dp_size * args.sae_pp_size
+        _validate_streaming_world_size(
+            args,
+            world_size=world_size,
+            vllm_tp_size=vllm_tp_size,
+            sae_tp_size=sae_tp_size,
         )
-        if world_size not in (1, expected_world_size):
-            raise ValueError(
-                f"streaming_mode: WORLD_SIZE={world_size} does not match "
-                f"vllm_tp*vllm_dp + sae_tp*sae_dp*sae_pp_size = {expected_world_size}."
-            )
         if args.sae_pp_size > 1:
             if hook_names is None or len(hook_names) < args.sae_pp_size:
                 raise ValueError(
@@ -1237,7 +1288,7 @@ def main() -> None:
         model_from_pretrained_kwargs={
             "tensor_parallel_size": vllm_tp_size,
             "max_model_len": args.max_model_len,
-            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "gpu_memory_utilization": 0.5,
         },
         vllm_max_num_batched_tokens=args.max_num_batched_tokens,
         hook_name=args.hook_name,
@@ -1293,6 +1344,7 @@ def main() -> None:
         multi_sae_distributed_architecture=args.multi_sae_distributed_architecture,
         multi_sae_tp_phase_fence=args.multi_sae_tp_phase_fence,
         multi_sae_optimizer_overlap=args.multi_sae_optimizer_overlap,
+        ddp_zero_optimizer=args.ddp_zero_optimizer,
         ddp_broadcast_buffers=args.ddp_broadcast_buffers,
         ddp_find_unused_parameters=args.ddp_find_unused_parameters,
         ddp_gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,
@@ -1382,6 +1434,8 @@ def main() -> None:
         print(f"  ddp_bucket_cap_mb={args.ddp_bucket_cap_mb}")
     if args.ddp_config_strict:
         print("  ddp_config_strict=True")
+    if args.ddp_zero_optimizer:
+        print("  ddp_zero_optimizer=True")
     if args.sae_dp_mode == "fsdp":
         print(f"  fsdp_backward_prefetch={args.fsdp_backward_prefetch}")
         print(f"  fsdp_forward_prefetch={args.fsdp_forward_prefetch}")
@@ -1459,7 +1513,9 @@ def main() -> None:
         streaming_mode=args.streaming_mode,
         quiesce_dir=quiesce_dir,
         sae_pp_size=args.sae_pp_size,
-        elastic_streaming_control_path=args.elastic_streaming_control_path,
+        elastic_streaming_control_path=(
+            args.elastic_streaming_control_path if args.elastic_streaming else None
+        ),
         elastic_permanent_vllm_dp_size=args.elastic_permanent_vllm_dp_size,
         elastic_permanent_sae_dp_size=args.elastic_permanent_sae_dp_size,
     )

@@ -780,6 +780,11 @@ class LanguageModelSAETrainingRunner:
                 "runs without data-parallel communication."
             )
             self.cfg.sae_dp_mode = "ddp"
+        if (
+            getattr(self.cfg, "ddp_zero_optimizer", False)
+            and self.cfg.sae_dp_mode != "ddp"
+        ):
+            raise ValueError("ddp_zero_optimizer requires sae_dp_mode='ddp'")
         self.vllm_dp_size = vllm_dp_size
         self.use_shard_routing = use_shard_routing
 
@@ -3703,6 +3708,19 @@ class LanguageModelSAETrainingRunner:
         if old_trainer is not None:
             old_global_tokens = old_trainer.n_training_samples
             old_step = old_trainer.n_training_steps
+            if old_trainer.dp_group is not None:
+                old_source_global_rank = layout.sae_stage_ranks(
+                    0, old_trainer._pp_rank()
+                )[old_trainer._tp_rank()]
+                old_source_dp_rank = dist.get_group_rank(
+                    old_trainer.dp_group, old_source_global_rank
+                )
+                # All ranks in the old DP group participate before elastic
+                # ranks leave it. The permanent SAE rank retains the gathered
+                # state for transfer into the replacement optimizer topology.
+                old_trainer.consolidate_zero_optimizer_state(
+                    to=old_source_dp_rank
+                )
             self._elastic_release_sae_wrappers(old_trainer)
 
         target_context = runtime.context(target_sae_dp)

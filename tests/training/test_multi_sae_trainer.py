@@ -1443,6 +1443,17 @@ def test_data_provider_buffer_bytes_handles_single_mixing_pool(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_data_provider_buffer_bytes_handles_reinterleaved_pool(
+    tmp_path: Path,
+) -> None:
+    trainer = _build_trainer(tmp_path, total_samples=BATCH, n_batches=1)
+    trainer.data_provider = SimpleNamespace(
+        _pool=torch.zeros(7, D_IN, device="cuda")
+    )
+    assert trainer._data_provider_buffer_bytes(set()) == 7 * D_IN * 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_data_provider_buffer_bytes_recurses_into_inner(tmp_path: Path) -> None:
     trainer = _build_trainer(tmp_path, total_samples=BATCH, n_batches=1)
     # GpuDirectDataProvider wraps an inner provider; buffers live on _inner.

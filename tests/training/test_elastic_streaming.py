@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -8,13 +10,17 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from run_sae_runner_gpu import _validate_streaming_world_size, parse_args
 from sae_lens.elastic_streaming import (
     ElasticDistributedRuntime,
     ElasticStreamingController,
     ElasticStreamingLayout,
 )
 from sae_lens.llm_sae_training_runner import LanguageModelSAETrainingRunner
-from sae_lens.training.elastic_trainer_state import broadcast_optimizer_state
+from sae_lens.training.elastic_trainer_state import (
+    broadcast_multi_sae_trainer_state,
+    broadcast_optimizer_state,
+)
 from sae_lens.training.exact_dp_batch_provider import ExactDataParallelBatchProvider
 from sae_lens.training.multi_sae_trainer import MultiSAETrainer
 from sae_lens.training.shared_activation_buffer import SharedActivationBuffer
@@ -23,8 +29,61 @@ from scripts.elastic_streaming_control import (
     BufferSample,
     SharedBufferMonitor,
     ThroughputRates,
+    _wait_for_auto_startup,
     calculate_rates,
 )
+
+
+def test_elastic_streaming_cli_implies_streaming_and_uses_default_control_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["run_sae_runner_gpu.py", "-es"])
+
+    args = parse_args()
+
+    assert args.elastic_streaming is True
+    assert args.streaming_mode is True
+    assert args.elastic_streaming_control_path == "/tmp/sae-elastic/control.json"
+
+
+def test_plain_streaming_does_not_enable_elastic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_sae_runner_gpu.py", "--streaming-mode"],
+    )
+
+    args = parse_args()
+
+    assert args.streaming_mode is True
+    assert args.elastic_streaming is False
+    assert args.elastic_streaming_control_path == "/tmp/sae-elastic/control.json"
+
+
+def test_elastic_streaming_world_size_has_no_single_process_exception() -> None:
+    args = SimpleNamespace(
+        elastic_streaming=True,
+        vllm_dp_size=2,
+        sae_dp_size=2,
+        sae_pp_size=1,
+    )
+
+    with pytest.raises(ValueError, match=r"elastic_streaming: WORLD_SIZE=1"):
+        _validate_streaming_world_size(
+            args,
+            world_size=1,
+            vllm_tp_size=2,
+            sae_tp_size=2,
+        )
+
+    _validate_streaming_world_size(
+        args,
+        world_size=8,
+        vllm_tp_size=2,
+        sae_tp_size=2,
+    )
 
 
 def test_requested_eight_rank_layout_keeps_permanent_roles() -> None:
@@ -98,6 +157,56 @@ def test_control_publishes_buffer_monitoring_metadata(tmp_path: Path) -> None:
     assert configured.buffer_name == "test_buffer"
     assert configured.buffer_num_chunks == 32
     assert configured.buffer_chunk_size_tokens == 4096
+
+
+def test_auto_startup_waits_for_buffer_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control_path = tmp_path / "control.json"
+    layout = ElasticStreamingLayout(4, 1, 1, 1, 1, 2, 1)
+    controller = ElasticStreamingController(control_path, layout)
+    controller.initialize()
+    buffer = SharedActivationBuffer(
+        name="delayed_auto_buffer",
+        num_chunks=2,
+        chunk_size_tokens=4,
+        d_model=2,
+        num_producers=2,
+        target_chunks=4,
+        create=True,
+        base_dir=str(tmp_path),
+        dtype=torch.float32,
+    )
+    sleep_calls = 0
+
+    def publish_metadata(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        controller.configure_buffer_monitoring(
+            buffer_name="delayed_auto_buffer",
+            num_chunks=2,
+            chunk_size_tokens=4,
+        )
+
+    monkeypatch.setattr(
+        "scripts.elastic_streaming_control.time.sleep",
+        publish_metadata,
+    )
+    args = SimpleNamespace(
+        control_path=control_path,
+        startup_timeout=10.0,
+        poll_interval=0.01,
+        shm_base_dir=tmp_path,
+    )
+    try:
+        startup = _wait_for_auto_startup(args)
+        assert startup is not None
+        _, monitor = startup
+        assert monitor.chunk_size_tokens == 4
+        assert sleep_calls == 1
+    finally:
+        buffer.destroy()
 
 
 def test_buffer_flow_rates_match_occupancy_delta() -> None:
@@ -204,7 +313,7 @@ def test_auto_switch_policy_requires_stable_rate_and_watermark() -> None:
     ) == 2
 
 
-def test_auto_switch_policy_resets_on_unstable_sample() -> None:
+def test_auto_switch_policy_resets_when_watermark_is_not_met() -> None:
     policy = AutoSwitchPolicy(
         low_watermark=0.25,
         high_watermark=0.75,
@@ -213,15 +322,44 @@ def test_auto_switch_policy_resets_on_unstable_sample() -> None:
         min_rate_gap=0.0,
     )
     growing = ThroughputRates(10.0, 0.8, 1_200.0, 900.0, 300.0)
-    flat = ThroughputRates(10.0, 0.8, 1_000.0, 1_000.0, 0.0)
+    below_watermark = ThroughputRates(10.0, 0.5, 1_000.0, 1_000.0, 0.0)
 
     assert policy.observe(
         active_sae_dp=2, min_sae_dp=2, max_sae_dp=3, rates=growing
     ) is None
     assert policy.observe(
-        active_sae_dp=2, min_sae_dp=2, max_sae_dp=3, rates=flat
+        active_sae_dp=2,
+        min_sae_dp=2,
+        max_sae_dp=3,
+        rates=below_watermark,
     ) is None
     assert policy.growing_samples == 0
+
+
+def test_auto_switch_policy_allows_rate_tie_at_watermarks() -> None:
+    policy = AutoSwitchPolicy(
+        low_watermark=0.25,
+        high_watermark=0.75,
+        stable_samples=2,
+        min_rate_ratio=1.05,
+        min_rate_gap=100.0,
+    )
+    full_and_tied = ThroughputRates(10.0, 1.0, 1_000.0, 1_000.0, 0.0)
+
+    assert policy.observe(
+        active_sae_dp=2, min_sae_dp=2, max_sae_dp=3, rates=full_and_tied
+    ) is None
+    assert policy.observe(
+        active_sae_dp=2, min_sae_dp=2, max_sae_dp=3, rates=full_and_tied
+    ) == 3
+
+    low_and_tied = ThroughputRates(10.0, 0.05, 800.0, 800.0, 0.0)
+    assert policy.observe(
+        active_sae_dp=3, min_sae_dp=2, max_sae_dp=3, rates=low_and_tied
+    ) is None
+    assert policy.observe(
+        active_sae_dp=3, min_sae_dp=2, max_sae_dp=3, rates=low_and_tied
+    ) == 2
 
 
 def test_auto_switch_policy_does_not_restart_vllm_after_production() -> None:
@@ -602,3 +740,136 @@ def test_optimizer_state_is_transferred_without_checkpoint(monkeypatch) -> None:
                 assert torch.equal(source_state[name], target_state[name])
             else:
                 assert source_state[name] == target_state[name]
+
+
+@pytest.mark.parametrize(
+    ("source_overlap", "target_overlap"),
+    [(False, True), (True, False)],
+)
+def test_trainer_state_transfer_converts_optimizer_topology(
+    monkeypatch: pytest.MonkeyPatch,
+    source_overlap: bool,
+    target_overlap: bool,
+) -> None:
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dist, "broadcast", lambda *_args, **_kwargs: None)
+
+    class Stateful:
+        def __init__(self) -> None:
+            self.loaded: dict[str, object] = {}
+
+        def state_dict(self) -> dict[str, object]:
+            return dict(self.loaded)
+
+        def load_state_dict(self, state: dict[str, object]) -> None:
+            self.loaded = dict(state)
+
+    def make_trainer(*, overlap: bool, lr: float) -> SimpleNamespace:
+        modules = {
+            "hook_0": torch.nn.Linear(3, 2),
+            "hook_1": torch.nn.Linear(3, 2),
+        }
+        all_parameters = [
+            parameter
+            for module in modules.values()
+            for parameter in module.parameters()
+        ]
+        optimizer = torch.optim.Adam(all_parameters, lr=lr)
+        overlap_optimizers = (
+            {
+                name: torch.optim.Adam(module.parameters(), lr=lr)
+                for name, module in modules.items()
+            }
+            if overlap
+            else {}
+        )
+        return SimpleNamespace(
+            hook_names=list(modules),
+            base_sae_by_hook=modules,
+            optimizer=optimizer,
+            _overlap_optimizer_by_hook=overlap_optimizers,
+            n_training_samples=128,
+            n_training_steps=7,
+            lr_scheduler=Stateful(),
+            grad_scaler=Stateful(),
+            activation_scaler_by_hook={
+                name: SimpleNamespace(scaling_factor=1.5) for name in modules
+            },
+            n_frac_active_samples_by_hook={name: 3 for name in modules},
+            _pending_sample_count_by_hook={name: 4 for name in modules},
+            _pending_step_count_by_hook={name: 5 for name in modules},
+            checkpoint_thresholds=[256],
+            _t_ready=time.time() - 10.0,
+            act_freq_scores_by_hook={
+                name: torch.ones(2) for name in modules
+            },
+            n_forward_passes_since_fired_by_hook={
+                name: torch.ones(2, dtype=torch.long) for name in modules
+            },
+            _pending_did_fire_max_by_hook={
+                name: torch.ones(2, dtype=torch.bool) for name in modules
+            },
+        )
+
+    source = make_trainer(overlap=source_overlap, lr=0.0123)
+    target = make_trainer(overlap=target_overlap, lr=1.0)
+    for hook_name, module in source.base_sae_by_hook.items():
+        optimizer = source._overlap_optimizer_by_hook.get(
+            hook_name,
+            source.optimizer,
+        )
+        module(torch.ones(4, 3)).sum().backward()
+        if source_overlap:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+    if not source_overlap:
+        source.optimizer.step()
+        source.optimizer.zero_grad(set_to_none=True)
+
+    expected_state_by_hook = {}
+    for hook_name, module in source.base_sae_by_hook.items():
+        optimizer = source._overlap_optimizer_by_hook.get(hook_name, source.optimizer)
+        expected_state_by_hook[hook_name] = [
+            {
+                key: value.detach().clone() if torch.is_tensor(value) else value
+                for key, value in optimizer.state[parameter].items()
+            }
+            for parameter in module.parameters()
+        ]
+
+    broadcast_multi_sae_trainer_state(
+        source=source,
+        target=target,
+        group=MagicMock(),
+        source_global_rank=0,
+        device=torch.device("cpu"),
+    )
+
+    assert target.optimizer.param_groups[0]["lr"] == pytest.approx(0.0123)
+    for hook_name in source.hook_names:
+        source_optimizer = source._overlap_optimizer_by_hook.get(
+            hook_name,
+            source.optimizer,
+        )
+        target_optimizer = target._overlap_optimizer_by_hook.get(
+            hook_name,
+            target.optimizer,
+        )
+        if target_overlap:
+            assert target_optimizer.param_groups[0]["lr"] == pytest.approx(0.0123)
+        for expected_state, target_parameter in zip(
+            expected_state_by_hook[hook_name],
+            target.base_sae_by_hook[hook_name].parameters(),
+        ):
+            target_state = target_optimizer.state[target_parameter]
+            assert expected_state.keys() == target_state.keys()
+            for name in expected_state:
+                if isinstance(expected_state[name], torch.Tensor):
+                    assert torch.equal(expected_state[name], target_state[name])
+                else:
+                    assert expected_state[name] == target_state[name]
+    # Elastic transfer consumes the obsolete trainer incrementally so its Adam
+    # moments cannot overlap the replacement optimizer's full growth.
+    source_optimizers = {source.optimizer, *source._overlap_optimizer_by_hook.values()}
+    assert all(not optimizer.state for optimizer in source_optimizers)

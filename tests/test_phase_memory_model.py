@@ -255,6 +255,58 @@ def test_bf16_halves_dtype_scaled_terms():
     )
 
 
+def test_streaming_source_rank_models_multihook_mixer_peak():
+    e = estimate_phase_memory(
+        SAEPhaseMemoryConfig(
+            d_in=4096,
+            d_sae=65536,
+            num_hooks=4,
+            train_batch_size_tokens=2048,
+            dtype="fp32",
+            streaming_enabled=True,
+            streaming_mix_chunks=8,
+            streaming_chunk_size_tokens=8192,
+            streaming_prefetch_chunks=2,
+            streaming_source_rank=True,
+        )
+    )
+    streaming = e.components["streaming"]
+    assert streaming["capacity_tokens"] == pytest.approx(65536)
+    assert streaming["mixing_storage"] == pytest.approx(4 * 1024**3)
+    assert streaming["prefetch"] == pytest.approx(1024**3)
+    assert streaming["data_provider_buffers"] == pytest.approx(5 * 1024**3)
+    assert streaming["data_fetch_peak"] > streaming["data_provider_buffers"]
+    assert e.peak_bytes >= streaming["data_fetch_peak"]
+
+    non_source = estimate_phase_memory(
+        SAEPhaseMemoryConfig(
+            d_in=4096,
+            d_sae=65536,
+            num_hooks=4,
+            train_batch_size_tokens=2048,
+            streaming_enabled=True,
+            streaming_mix_chunks=8,
+            streaming_chunk_size_tokens=8192,
+            streaming_prefetch_chunks=2,
+        )
+    )
+    assert non_source.components["streaming"]["data_provider_buffers"] == 0
+
+    no_mix = estimate_phase_memory(
+        SAEPhaseMemoryConfig(
+            d_in=4096,
+            d_sae=65536,
+            num_hooks=4,
+            train_batch_size_tokens=2048,
+            streaming_enabled=True,
+            streaming_chunk_size_tokens=8192,
+            streaming_source_rank=True,
+        )
+    )
+    assert no_mix.components["streaming"]["capacity_tokens"] == pytest.approx(2048)
+    assert no_mix.components["streaming"]["shuffle_copy"] == 0
+
+
 def test_invalid_config_raises():
     with pytest.raises(ValueError):
         SAEPhaseMemoryConfig(d_in=4096, d_sae=65535, tp_size=2)  # not divisible

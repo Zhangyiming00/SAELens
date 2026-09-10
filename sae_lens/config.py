@@ -355,6 +355,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     ] = "unified_multi_hook"
     multi_sae_tp_phase_fence: Literal["auto", "always", "off"] = "auto"
     multi_sae_optimizer_overlap: Literal["off", "on", "non_tp_only"] = "off"
+    ddp_zero_optimizer: bool = False
     ddp_broadcast_buffers: bool | None = None
     ddp_find_unused_parameters: bool | None = None
     ddp_gradient_as_bucket_view: bool | None = None
@@ -806,6 +807,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             multi_sae_distributed_architecture=self.multi_sae_distributed_architecture,
             multi_sae_tp_phase_fence=self.multi_sae_tp_phase_fence,
             multi_sae_optimizer_overlap=self.multi_sae_optimizer_overlap,
+            ddp_zero_optimizer=self.ddp_zero_optimizer,
             total_training_samples=self.total_training_tokens,
             device=self.device,
             autocast=self.autocast,
@@ -1124,6 +1126,7 @@ class SAETrainerConfig:
     ] = "unified_multi_hook"
     multi_sae_tp_phase_fence: Literal["auto", "always", "off"] = "auto"
     multi_sae_optimizer_overlap: Literal["off", "on", "non_tp_only"] = "off"
+    ddp_zero_optimizer: bool = False
     # Runtime-only hint filled by LanguageModelSAETrainingRunner.  It is true
     # when producer and SAE roles share this rank, so auto fence can protect a
     # cross-process-group handoff without exposing another CLI knob.
