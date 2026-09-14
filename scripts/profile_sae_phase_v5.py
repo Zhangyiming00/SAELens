@@ -10,7 +10,7 @@ both run, producing:
     <output>/device_history_rank{N}.jsonl         (~1 Hz device-used timeline)
 
 TP=1:
-    python3 scripts/profile_sae_phase_v5.py --output-path results/memory_model/sae_phase_v5/tp1
+    torchrun --standalone --nproc_per_node=1 scripts/profile_sae_phase_v5.py --output-path results/memory_model/sae_phase_v5/tp1
 
 TP=2 (sharded SAEs across 2 GPUs):
     torchrun --nproc_per_node=2 scripts/profile_sae_phase_v5.py \
@@ -27,7 +27,8 @@ import torch
 import torch.distributed as dist
 
 from sae_lens.config import LoggingConfig, SAETrainerConfig
-from sae_lens.saes.topk_sae import TopKTrainingSAE, TopKTrainingSAEConfig
+from sae_lens.saes.megatron_topk_sae import MegatronTopKSAE
+from sae_lens.saes.topk_sae import TopKTrainingSAEConfig
 from sae_lens.training.multi_sae_trainer import MultiSAETrainer
 
 DTYPE = {"float32": torch.float32, "bfloat16": torch.bfloat16}
@@ -57,9 +58,7 @@ def make_data_provider(
     # Fresh CPU tensors per step (the trainer moves them to device in
     # after_scale_to_device), mirroring how real activations stream in.
     for _ in range(n_steps):
-        yield {
-            hook: torch.randn(batch, d_in, dtype=dtype) for hook in hook_names
-        }
+        yield {hook: torch.randn(batch, d_in, dtype=dtype) for hook in hook_names}
 
 
 def build_saes(
@@ -72,8 +71,8 @@ def build_saes(
     device: torch.device,
     dtype: torch.dtype,
     tp_group: dist.ProcessGroup | None,
-) -> dict[str, TopKTrainingSAE]:
-    saes: dict[str, TopKTrainingSAE] = {}
+) -> dict[str, MegatronTopKSAE]:
+    saes: dict[str, MegatronTopKSAE] = {}
     for hook in hook_names:
         cfg = TopKTrainingSAEConfig(
             d_in=d_in,
@@ -85,10 +84,7 @@ def build_saes(
             apply_b_dec_to_input=True,
             rescale_acts_by_decoder_norm=True,
         )
-        if tp_group is not None:
-            sae = TopKTrainingSAE.from_config_sharded(cfg, tp_group)
-        else:
-            sae = TopKTrainingSAE(cfg)
+        sae = MegatronTopKSAE(cfg, tp_group=tp_group)
         sae.to(device=device, dtype=dtype)
         sae.train()
         saes[hook] = sae
@@ -108,10 +104,8 @@ def main() -> None:
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    tp_group: dist.ProcessGroup | None = None
-    if world_size > 1:
-        dist.init_process_group(backend="nccl")
-        tp_group = dist.new_group(list(range(world_size)), backend="nccl")
+    dist.init_process_group(backend="nccl")
+    tp_group = dist.group.WORLD
 
     hook_names = [f"blocks.{21 + 10 * i}.hook_resid_post" for i in range(args.hooks)]
 

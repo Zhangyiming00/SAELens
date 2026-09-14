@@ -2875,6 +2875,12 @@ def _optimizer_state_shard_dim(
 ) -> int | None:
     if state_value.ndim == 0:
         return None
+    # On disk Megatron SAEs export native SAELens names and axes. Runtime
+    # _tp_param_shard_dims() describes different names and transposed weights.
+    if hasattr(base_sae, "checkpoint_layout"):
+        if param_name not in base_sae.checkpoint_layout:
+            raise ValueError(f"Unexpected SAELens optimizer parameter: {param_name}")
+        return base_sae.checkpoint_layout[param_name][1]
     return _tp_param_shard_dims(base_sae).get(param_name)
 
 
@@ -2936,7 +2942,9 @@ def _load_hook_optimizer_state_safetensors(
             dtype_str = str(sl.get_dtype())
             dtype = str_to_dtype(dtype_map.get(dtype_str, dtype_str.lower()))
             shard_dim = (
-                _optimizer_state_shard_dim(param_name, torch.empty(shape), base_sae)
+                _optimizer_state_shard_dim(
+                    param_name, torch.empty(shape, device="meta"), base_sae
+                )
                 if tp_size > 1
                 else None
             )
@@ -2964,4 +2972,10 @@ def _load_hook_optimizer_state_safetensors(
                 item["state_name"]
             ] = item["value"]
 
+    if hasattr(base_sae, "checkpoint_layout"):
+        # The trainer calls this loader with already_processed=True. Convert
+        # the local native slices here, including TP1, exactly once.
+        base_sae.process_named_optimizer_state_for_loading(
+            optimizer_state, already_sharded=True
+        )
     return optimizer_state

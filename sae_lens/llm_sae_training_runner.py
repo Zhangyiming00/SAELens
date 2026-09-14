@@ -1251,25 +1251,30 @@ class LanguageModelSAETrainingRunner:
         else:
             self.sae = None
 
-        # _create_training_sae already shards under TP>1; the legacy
-        # "init full then shard_weights" branch only applies to override_sae,
-        # which we still allow callers to pass in pre-built (e.g. tests).
-        if (
-            self.sae is not None
-            and self.sae_tp_size > 1
-            and override_sae is not None
-        ):
-            if self.use_shard_routing:
-                import sae_lens.distributed_v2 as v2_mod
-                tp_group = v2_mod.get_sae_tp_group()
-            else:
-                tp_group = get_tp_group()
-            if (
-                tp_group is not None
-                and hasattr(self.sae, "shard_weights")
-                and getattr(self.sae, "_tp_group", None) is None
-            ):
-                self.sae.shard_weights(tp_group)
+        if self.sae is not None and override_sae is not None:
+            from sae_lens.saes.megatron_topk_sae import MegatronTopKSAE
+            from sae_lens.saes.topk_sae import TopKTrainingSAEConfig
+
+            if type(override_sae.cfg) is TopKTrainingSAEConfig:
+                if self.cfg.sae_dp_mode == "fsdp":
+                    raise NotImplementedError(
+                        "MegatronTopKSAE FSDP clipping and checkpoints are not integrated; "
+                        "use sae_dp_mode='ddp'."
+                    )
+                if not isinstance(override_sae, MegatronTopKSAE):
+                    # Import legacy/library objects only at the weight boundary.
+                    # Their forward implementation never enters the trainer.
+                    tp_group = self._multi_sae_tp_group()
+                    converted = MegatronTopKSAE(
+                        override_sae.cfg,
+                        tp_group=self._resolve_megatron_tp_group(tp_group),
+                    )
+                    converted.import_saelens_state_dict(override_sae.state_dict())
+                    self.sae = converted
+                elif override_sae.tp_size != self.sae_tp_size:
+                    raise ValueError("Override SAE TP size must match the runner")
+            elif self.sae_tp_size > 1:
+                raise NotImplementedError("SAE TP requires MegatronTopKSAE")
 
         # _base_sae is always the raw module before any torch DP wrapper.
         # SAE compilation must happen on this module before FSDP wrapping; training
@@ -1351,33 +1356,37 @@ class LanguageModelSAETrainingRunner:
         resume_checkpoint_path: str | None = None,
         hook_metadata_overrides: dict[str, Any] | None = None,
     ) -> TrainingSAE[Any]:
-        """Single SAE-construction code path used by every runner entry point.
+        """Construct TopK training with Megatron modules at every TP size.
 
-        TP=1: behaves exactly like the legacy ``temporary_seed +
-        TrainingSAE.from_dict/load_from_disk + .to(device)`` sequence.
-
-        TP>1: TopK-only. Calls ``TopKTrainingSAE.from_config_sharded`` so each
-        rank only ever materializes its local shard of W_enc/W_dec/b_enc; the
-        legacy "full init then shard_weights" path is not used. Pretrained or
-        resume checkpoints are read via the TP slice loader (only the local
-        rank's slice ever lands on the device).
+        SAELens checkpoint layouts are converted only at load/save boundaries.
+        Other SAE architectures retain their existing non-TP implementations.
         """
-        from sae_lens.saes.topk_sae import TopKTrainingSAE, TopKTrainingSAEConfig
+        from sae_lens.saes.megatron_topk_sae import MegatronTopKSAE
+        from sae_lens.saes.topk_sae import TopKTrainingSAEConfig
 
         cfg_dict = self.cfg.get_training_sae_cfg_dict()
         sae_cfg = TrainingSAEConfig.from_dict(cfg_dict)
 
         is_tp = tp_group is not None and dist.get_world_size(tp_group) > 1
-        if is_tp and not isinstance(sae_cfg, TopKTrainingSAEConfig):
+        is_megatron = type(sae_cfg) is TopKTrainingSAEConfig
+        if is_tp and not is_megatron:
             raise NotImplementedError(
                 f"sae_tp_size>1 only supports TopK; got {type(sae_cfg).__name__}"
             )
 
         sae_cfg.device = device
+        if is_megatron:
+            if getattr(self.cfg, "sae_dp_mode", None) == "fsdp":
+                raise NotImplementedError(
+                    "MegatronTopKSAE currently supports DDP, not FSDP. "
+                    "Use sae_dp_mode='ddp' until FSDP clipping and checkpoint "
+                    "conversion are integrated."
+                )
+            tp_group = self._resolve_megatron_tp_group(tp_group)
         with temporary_seed(seed):
-            if is_tp:
+            if is_megatron:
                 assert isinstance(sae_cfg, TopKTrainingSAEConfig)
-                sae = TopKTrainingSAE.from_config_sharded(sae_cfg, tp_group)  # type: ignore[arg-type]
+                sae = MegatronTopKSAE(sae_cfg, tp_group=tp_group)
             elif from_pretrained_path is not None:
                 sae = TrainingSAE.load_from_disk(from_pretrained_path, device)
             else:
@@ -1390,12 +1399,39 @@ class LanguageModelSAETrainingRunner:
             for key, value in hook_metadata_overrides.items():
                 setattr(sae.cfg.metadata, key, value)
 
-        if is_tp and from_pretrained_path is not None:
+        if is_megatron and from_pretrained_path is not None:
             sae.load_weights_from_checkpoint(from_pretrained_path)
         if resume_checkpoint_path is not None:
             sae.load_weights_from_checkpoint(resume_checkpoint_path)
 
         return sae
+
+    def _resolve_megatron_tp_group(self, tp_group):
+        if tp_group is not None:
+            return tp_group
+        if not dist.is_initialized():
+            if not all(
+                key in os.environ
+                for key in ("RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")
+            ):
+                raise RuntimeError(
+                    "Megatron SAE requires torch.distributed, including TP1. "
+                    "Launch with torchrun --standalone --nproc-per-node=1."
+                )
+            # torchrun supplies rendezvous variables; it does not initialize
+            # torch.distributed inside the worker. The ordinary TP1 path has
+            # skipped the runner's multi-rank initialization above.
+            device = torch.device(self.cfg.device)
+            if device.type == "cuda":
+                torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+            dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
+        if dist.get_world_size() == 1:
+            return dist.group.WORLD
+        if not hasattr(self, "_megatron_singleton_tp_group"):
+            self._megatron_singleton_tp_group = dist.new_group(
+                [dist.get_rank()], use_local_synchronization=True
+            )
+        return self._megatron_singleton_tp_group
 
     def _multi_sae_tp_group(self) -> "dist.ProcessGroup | None":
         if self.sae_tp_size <= 1:

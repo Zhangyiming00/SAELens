@@ -15,11 +15,14 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sae_lens.saes.jumprelu_sae import JumpReLUTrainingSAE
+from sae_lens.saes.megatron_topk_sae import MegatronTopKSAE
 from sae_lens.saes.topk_sae import TopKTrainingSAE
 from tests.helpers import build_jumprelu_sae_training_cfg, build_topk_sae_training_cfg
 
 
-def _save_full_and_reference(tmp_dir: Path, dtype: str) -> tuple[Path, torch.Tensor, torch.Tensor]:
+def _save_full_and_reference(
+    tmp_dir: Path, dtype: str
+) -> tuple[Path, torch.Tensor, torch.Tensor]:
     cfg = build_topk_sae_training_cfg(d_in=32, d_sae=64, k=8, dtype=dtype)
     sae = TopKTrainingSAE(cfg)
     # Make params non-trivial.
@@ -47,29 +50,31 @@ def _worker(
 ) -> None:
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-    tp_group = dist.new_group(list(range(world_size)), backend="gloo")
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    tp_group = dist.group.WORLD
 
     cfg = build_topk_sae_training_cfg(**cfg_kwargs)
-    sae = TopKTrainingSAE.from_config_sharded(cfg, tp_group)
+    cfg.device = f"cuda:{rank}"
+    sae = MegatronTopKSAE(cfg, tp_group=tp_group)
 
     # Local W_dec/W_enc/b_enc must be shard-shaped before load.
     pre_shapes = (
-        tuple(sae.W_dec.data.shape),
-        tuple(sae.W_enc.data.shape),
-        tuple(sae.b_enc.data.shape),
+        tuple(sae.decoder.weight.shape),
+        tuple(sae.encoder.weight.shape),
+        tuple(sae.encoder.bias.shape),
     )
 
     sae.load_weights_from_checkpoint(ckpt_dir)
 
     post_shapes = (
-        tuple(sae.W_dec.data.shape),
-        tuple(sae.W_enc.data.shape),
-        tuple(sae.b_enc.data.shape),
+        tuple(sae.decoder.weight.shape),
+        tuple(sae.encoder.weight.shape),
+        tuple(sae.encoder.bias.shape),
     )
 
-    x = torch.load(x_path)
-    y_ref = torch.load(y_ref_path)
+    x = torch.load(x_path).to(cfg.device)
+    y_ref = torch.load(y_ref_path).to(cfg.device)
     with torch.no_grad():
         y = sae(x)
 
@@ -81,6 +86,9 @@ def _worker(
 
 @pytest.mark.parametrize("tp_size", [2, 4])
 def test_load_weights_tp_round_trip(tmp_path: Path, tp_size: int):
+    if torch.cuda.device_count() < tp_size:
+        pytest.skip(f"Megatron TP{tp_size} needs {tp_size} CUDA GPUs")
+    pytest.importorskip("megatron.core")
     cfg_kwargs = dict(d_in=32, d_sae=64, k=8, dtype="float32")
     ckpt_dir, x, y_ref = _save_full_and_reference(tmp_path, dtype="float32")
     x_path = tmp_path / "x.pt"
@@ -108,10 +116,14 @@ def test_load_weights_tp_round_trip(tmp_path: Path, tp_size: int):
     assert len(results) == tp_size
 
     s = cfg_kwargs["d_sae"] // tp_size
-    expected_pre = ((s, 32), (32, s), (s,))
+    expected_pre = ((32, s), (s, 32), (s,))
     for rank, pre, post, allclose in results:
-        assert pre == expected_pre, f"rank {rank}: pre-load shapes {pre} != {expected_pre}"
-        assert post == expected_pre, f"rank {rank}: post-load shapes {post} != {expected_pre}"
+        assert pre == expected_pre, (
+            f"rank {rank}: pre-load shapes {pre} != {expected_pre}"
+        )
+        assert post == expected_pre, (
+            f"rank {rank}: post-load shapes {post} != {expected_pre}"
+        )
         assert allclose, f"rank {rank}: TP forward did not match full reference"
 
 
@@ -131,7 +143,9 @@ def test_load_weights_tp_rejects_non_allowlisted_arch(tmp_path: Path):
     dist.get_world_size = lambda _group=None: 2  # type: ignore[assignment]
     try:
         sae._tp_group = _StubGroup()  # type: ignore[assignment]
-        with pytest.raises(NotImplementedError, match="TP slice load is only supported"):
+        with pytest.raises(
+            NotImplementedError, match="TP slice load is only supported"
+        ):
             sae.load_weights_from_checkpoint(str(tmp_path))
     finally:
         dist.is_initialized = orig_initialized  # type: ignore[assignment]

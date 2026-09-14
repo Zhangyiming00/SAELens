@@ -367,6 +367,105 @@ The SAE training runner can also be run from the command line via the `sae_lens.
 python -m sae_lens.sae_training_runner --help
 ```
 
+## SAE tensor parallelism with Megatron Core
+
+The TopK training runner constructs `MegatronTopKSAE` for TP1 and larger TP
+sizes. Install `pip install -e '.[megatron]'` (Megatron Core 0.16.1). Launch
+through `torchrun`, including a one-process launch for TP1. There is no TP
+backend selector or custom TP autograd fallback. Other SAE architectures keep
+their existing serial library implementations; the serial `TopKTrainingSAE`
+base remains for those library subclasses and is not the runner's TopK backend.
+
+| Component | Implementation / storage |
+| --- | --- |
+| Encoder | `ColumnParallelLinear`, `encoder.weight [local_d_sae, d_in]` |
+| Global TopK | Full-width Megatron gather, then SAE TopK/ReLU |
+| Decoder | `RowParallelLinear`, `decoder.weight [d_in, local_d_sae]` |
+| Encoder bias | `encoder.bias [local_d_sae]` |
+| Decoder bias | Replicated `b_dec [d_in]` |
+
+Decoder feature norms are computed along dimension 0. Initialization reproduces
+SAELens' Kaiming distribution, decoder initial norms, and initial encoder values.
+SAELens weight transposes occur at initialization and checkpoint boundaries.
+The decoder always uses the Megatron module; sparse activations are densified
+before it. Fused `main_grad` accumulation and sequence parallelism are disabled
+in this first static implementation.
+
+The encoder uses standard Megatron input-gradient reduction. Consequently every
+rank already has the complete `b_dec` gradient, including its encoder and decoder
+contributions. `sync_tensor_parallel_gradients()` is a no-op. There is no decoder
+bias gradient scaling or compensating TP reduction. Gradient clipping computes
+the norm of one logical SAE, counting its replicated bias only once.
+
+### Independent native reference and static acceptance
+
+The semantic reference is upstream [SAELens v6.37.6](https://github.com/decoderesearch/SAELens/tree/69c4c62b0dc24e5ba23fc773a0286149514b4a23).
+`tests/native_reference` contains the pinned upstream wheel, SHA256 manifest,
+fixed initial weights/activation batches, and FP32 training snapshots generated
+on CPU. The manifest records the generating device and PyTorch version. GPU
+acceptance first replays the independent upstream model on CUDA against these
+snapshots; CPU results alone do not establish multi-GPU correctness.
+The generator extracts and imports that wheel in an isolated Python process and
+asserts the imported path. It never imports this checkout's SAE implementation.
+Both implementations explicitly load the same initial weights.
+
+```bash
+# Reproduce the native single-GPU oracle from the stored weights and batches.
+.venv/bin/python -I tests/native_reference/generate.py --device cuda:0 --check
+
+# Run real TP1/2/4 and retain reports; --output must be a new directory.
+.venv/bin/python scripts/validate_megatron_sae_static.py \
+  --output results/megatron_static_acceptance --with-trainers
+```
+
+Acceptance covers H=1, four combinations of decoder-norm rescaling and input
+bias centering, and six Adam steps per combination. Dead masks cover None,
+zero, few, many, and all features. It compares hidden preactivations, TopK
+activations, reconstruction, every loss, every parameter gradient before and
+after clipping, gradient norm, updated weights, and Adam step/first/second
+moments. The manifest locks FP32, Adam settings and per-SAE clipping at 1.0.
+Absolute/relative tolerances are `3e-6` / `3e-5` for FP32 arithmetic order.
+Per-rank reports record maximum absolute errors, including replicated `b_dec`.
+
+Weight files use SAELens names and shapes. `import_saelens_state_dict()` accepts
+full native weights; `load_weights_from_checkpoint()` reads only the local
+native slices and converts them. `export_saelens_state_dict()` and `save_model()`
+collect shards and export native weights. All TP ranks must participate in save
+and export calls. `save_inference_model()` also folds decoder norms using the
+native rule. In-memory `state_dict()` and Adam storage use Megatron names/layouts.
+The test checks a checkpoint reload midway through training and the subsequent
+updates, plus loading an exported model with the SAELens inference loader.
+
+`--with-trainers` adds the actual `SAETrainer` and `MultiSAETrainer` paths with
+ordinary PyTorch DDP and Adam: TP1×DP4, TP2×DP2, TP4×DP1; one SAE and two
+independent hooks; per-hook wrappers and a unified wrapper. Every step splits
+the same global batch of 11 tokens across DP replicas (3/3/3/2 at DP4 and 6/5
+at DP2). Token weighting, per-SAE clipping, all Adam moments and six weight
+updates are checked against the native full-batch oracle. The real trainer
+saves after step three, reloads weights and optimizer from disk, and continues.
+This tests fixed-topology resume, not elastic membership changes.
+
+Local CPU checks can be run with:
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/saes/test_megatron_sae_boundaries.py \
+  tests/saes/test_megatron_sae_native_reference.py \
+  tests/saes/test_megatron_sae_trainers.py
+```
+
+The CPU model tests use actual Megatron modules with a singleton fake process
+group (no communication); GPU tests require real NCCL. A skipped GPU test is
+not acceptance. The command-line acceptance runner fails when four CUDA devices
+are unavailable and only writes `status: passed` after all requested checks.
+
+FSDP is rejected during model construction: its clipping and export contracts
+have not been adapted to this layout. Megatron DDP plus Distributed Optimizer,
+SAE placement, streaming, wavefront, optimizer overlap, and elastic membership
+still need their staged integration and GPU acceptance. The new model currently
+reports wavefront as unsupported and runs serial hook forwards. Obsolete
+kernel-wrapper tests have been replaced with the module and trainer tests.
+
 ## Logging to Weights and Biases
 
 For any real training run, you should be logging to Weights and Biases (WandB). This will allow you to track your training progress and compare different runs. To enable WandB, set `log_to_wandb=True`. The `wandb_project` parameter in the config controls the project name in WandB. You can also control the logging frequency with `wandb_log_frequency` and `eval_every_n_wandb_logs`.

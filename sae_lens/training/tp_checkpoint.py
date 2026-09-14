@@ -144,6 +144,11 @@ def load_tp_sharded_state_dict(
     call ``process_state_dict_for_loading`` afterwards: the tensors returned
     here are already at shard shape.
     """
+    if hasattr(base_sae, "load_saelens_checkpoint_shard"):
+        if base_sae._tp_group is not tp_group:
+            raise ValueError("Checkpoint TP group must match the Megatron SAE")
+        return base_sae.load_saelens_checkpoint_shard(filepath)
+
     tp_rank = dist.get_rank(tp_group)
     tp_size = dist.get_world_size(tp_group)
     shard_dims = tp_param_shard_dims(base_sae)

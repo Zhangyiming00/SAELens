@@ -1,0 +1,102 @@
+{
+  "version": "6.37.6",
+  "commit": "69c4c62b0dc24e5ba23fc773a0286149514b4a23",
+  "wheel_sha256": "651789edfb1c905291aaec39fab3e3709d8cb09caa1e1c9f2c139b1a939075e1",
+  "torch_version": "2.10.0+cpu",
+  "device": "cpu",
+  "tf32": false,
+  "adam": {
+    "lr": 0.0003,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0.0,
+    "amsgrad": false,
+    "foreach": false,
+    "fused": false
+  },
+  "clip_norm": 1.0,
+  "clip_scope": "one SAE",
+  "configs": [
+    {
+      "d_in": 16,
+      "d_sae": 32,
+      "dtype": "float32",
+      "device": "cpu",
+      "apply_b_dec_to_input": false,
+      "normalize_activations": "none",
+      "reshape_activations": "none",
+      "metadata": {
+        "sae_lens_version": "6.37.6",
+        "sae_lens_training_version": "6.37.6"
+      },
+      "decoder_init_norm": 0.7,
+      "k": 4,
+      "use_sparse_activations": false,
+      "aux_loss_coefficient": 0.13,
+      "rescale_acts_by_decoder_norm": false,
+      "architecture": "topk"
+    },
+    {
+      "d_in": 16,
+      "d_sae": 32,
+      "dtype": "float32",
+      "device": "cpu",
+      "apply_b_dec_to_input": true,
+      "normalize_activations": "none",
+      "reshape_activations": "none",
+      "metadata": {
+        "sae_lens_version": "6.37.6",
+        "sae_lens_training_version": "6.37.6"
+      },
+      "decoder_init_norm": 0.7,
+      "k": 4,
+      "use_sparse_activations": false,
+      "aux_loss_coefficient": 0.13,
+      "rescale_acts_by_decoder_norm": false,
+      "architecture": "topk"
+    },
+    {
+      "d_in": 16,
+      "d_sae": 32,
+      "dtype": "float32",
+      "device": "cpu",
+      "apply_b_dec_to_input": false,
+      "normalize_activations": "none",
+      "reshape_activations": "none",
+      "metadata": {
+        "sae_lens_version": "6.37.6",
+        "sae_lens_training_version": "6.37.6"
+      },
+      "decoder_init_norm": 0.7,
+      "k": 4,
+      "use_sparse_activations": false,
+      "aux_loss_coefficient": 0.13,
+      "rescale_acts_by_decoder_norm": true,
+      "architecture": "topk"
+    },
+    {
+      "d_in": 16,
+      "d_sae": 32,
+      "dtype": "float32",
+      "device": "cpu",
+      "apply_b_dec_to_input": true,
+      "normalize_activations": "none",
+      "reshape_activations": "none",
+      "metadata": {
+        "sae_lens_version": "6.37.6",
+        "sae_lens_training_version": "6.37.6"
+      },
+      "decoder_init_norm": 0.7,
+      "k": 4,
+      "use_sparse_activations": false,
+      "aux_loss_coefficient": 0.13,
+      "rescale_acts_by_decoder_norm": true,
+      "architecture": "topk"
+    }
+  ],
+  "inputs_sha256": "b5b0da72a242eecfe15aafb85184c091358a992bc8c82408c8d02e24fce4e8f3",
+  "golden_sha256": "d2789a4f4069317873fafe74b4de460c2365482070bf557b0dc738079de91b2a"
+}

@@ -16,7 +16,9 @@ import torch
 import torch.distributed as dist
 
 from sae_lens.config import DTYPE_MAP
-from sae_lens.saes.sae import TrainStepInput, TrainingSAE, TrainingSAEConfig
+from sae_lens.saes.megatron_topk_sae import MegatronTopKSAE
+from sae_lens.saes.sae import TrainingSAE, TrainingSAEConfig, TrainStepInput
+from sae_lens.saes.topk_sae import TopKTrainingSAEConfig
 from sae_lens.training.multi_sae_trainer import _load_tp_sharded_state_dict
 
 
@@ -36,9 +38,14 @@ def _init_dist() -> tuple[int, int, torch.device]:
     return rank, world_size, device
 
 
-def _make_sae(hook_dir: Path, device: torch.device) -> TrainingSAE:
+def _make_sae(hook_dir: Path, device: torch.device, *, tp_group=None) -> TrainingSAE:
     cfg_dict = json.loads((hook_dir / "cfg.json").read_text())
     cfg = TrainingSAEConfig.from_dict(cfg_dict)
+    if tp_group is not None:
+        if type(cfg) is not TopKTrainingSAEConfig:
+            raise ValueError("Megatron TP checkpoint diagnostic requires a TopK SAE")
+        cfg.device = str(device)
+        return MegatronTopKSAE(cfg, tp_group=tp_group)
     sae = TrainingSAE.from_dict(cfg.to_dict())
     sae.to(device)
     return sae
@@ -86,9 +93,7 @@ def main() -> None:
         x_cpu = torch.randn(args.batch_tokens, d_in, generator=gen, dtype=torch.float32)
         x = x_cpu.to(device=device, dtype=dtype)
 
-        tp_sae = _make_sae(hook_dir, device)
-        if hasattr(tp_sae, "shard_weights"):
-            tp_sae.shard_weights(dist.group.WORLD)
+        tp_sae = _make_sae(hook_dir, device, tp_group=dist.group.WORLD)
         state_dict = _load_tp_sharded_state_dict(
             hook_dir / "sae_weights.safetensors",
             tp_sae,
@@ -108,8 +113,16 @@ def main() -> None:
             serial_sae.eval()
             serial_out = serial_sae.training_forward_pass(_train_input(x))
             serial_mse = serial_out.losses["mse_loss"].detach().float()
-            max_abs = (serial_out.sae_out.detach().float() - tp_out.sae_out.detach().float()).abs().max()
-            mean_abs = (serial_out.sae_out.detach().float() - tp_out.sae_out.detach().float()).abs().mean()
+            max_abs = (
+                (serial_out.sae_out.detach().float() - tp_out.sae_out.detach().float())
+                .abs()
+                .max()
+            )
+            mean_abs = (
+                (serial_out.sae_out.detach().float() - tp_out.sae_out.detach().float())
+                .abs()
+                .mean()
+            )
             print(
                 json.dumps(
                     {

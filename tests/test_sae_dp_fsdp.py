@@ -256,69 +256,6 @@ def _ddp_worker(
         dist.destroy_process_group()
 
 
-def _tp2_ddp2_worker(
-    rank: int,
-    world_size: int,
-    d_in: int,
-    d_sae: int,
-    k: int,
-    state_dict: dict[str, torch.Tensor],
-    x_per_dp_rank: list[torch.Tensor],
-    result_list: list,
-    port: int,
-    save_dir: str,
-) -> None:
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-    try:
-        tp_groups = [
-            dist.new_group([0, 1], backend="gloo"),
-            dist.new_group([2, 3], backend="gloo"),
-        ]
-        dp_groups = [
-            dist.new_group([0, 2], backend="gloo"),
-            dist.new_group([1, 3], backend="gloo"),
-        ]
-        dp_rank = rank // 2
-        tp_rank = rank % 2
-        tp_group = tp_groups[dp_rank]
-        dp_group = dp_groups[tp_rank]
-
-        sae = _make_sae(d_in=d_in, d_sae=d_sae, k=k)
-        sae.load_state_dict(state_dict)
-        sae.shard_weights(tp_group)
-        ddp_sae = DDP(sae, process_group=dp_group)
-        trainer = SAETrainer(
-            cfg=_make_trainer_cfg(
-                total_training_samples=x_per_dp_rank[dp_rank].shape[0] * 2,
-                train_batch_size_samples=x_per_dp_rank[dp_rank].shape[0],
-            ),
-            sae=ddp_sae,
-            base_sae=sae,
-            data_provider=mock.MagicMock(),
-            dp_group=dp_group,
-        )
-        trainer._train_step(ddp_sae, x_per_dp_rank[dp_rank])
-
-        if dist.get_rank(dp_group) == 0:
-            trainer._save_model(Path(save_dir))
-        dist.barrier()
-
-        saved_shapes = None
-        saved_keys = None
-        if rank == 0:
-            saved_state = load_file(Path(save_dir) / SAE_WEIGHTS_FILENAME)
-            saved_keys = sorted(saved_state.keys())
-            saved_shapes = {name: tuple(value.shape) for name, value in saved_state.items()}
-
-        params = {
-            name: param.detach().clone()
-            for name, param in trainer.base_sae.named_parameters()
-        }
-        result_list.append((rank, params, saved_keys, saved_shapes))
-    finally:
-        dist.destroy_process_group()
 
 
 def _fsdp_resume_worker(
@@ -1605,50 +1542,6 @@ def test_ddp_single_step_matches_full_batch_reference_and_saves_base_keys(
             assert saved_mode == "ddp"
 
 
-def test_ddp_supports_tp_sharded_sae_and_saves_full_weight_shapes(
-    tmp_path: Path,
-) -> None:
-    d_in, d_sae, k = 8, 16, 4
-    world_size = 4
-    sae_ref = _make_sae(d_in=d_in, d_sae=d_sae, k=k)
-    state_dict = {name: value.clone() for name, value in sae_ref.state_dict().items()}
-    x_per_dp_rank = [torch.randn(4, d_in), torch.randn(4, d_in)]
-
-    manager = mp.Manager()
-    result_list = manager.list()
-    mp.spawn(
-        _tp2_ddp2_worker,
-        args=(
-            world_size,
-            d_in,
-            d_sae,
-            k,
-            state_dict,
-            x_per_dp_rank,
-            result_list,
-            _find_free_port(),
-            str(tmp_path),
-        ),
-        nprocs=world_size,
-        join=True,
-    )
-    results = sorted(result_list, key=lambda item: item[0])
-    assert len(results) == world_size
-    params_by_rank = {rank: params for rank, params, _, _ in results}
-
-    for name in ("W_enc", "W_dec", "b_enc"):
-        torch.testing.assert_close(params_by_rank[0][name], params_by_rank[2][name])
-        torch.testing.assert_close(params_by_rank[1][name], params_by_rank[3][name])
-    for rank in range(1, world_size):
-        torch.testing.assert_close(params_by_rank[0]["b_dec"], params_by_rank[rank]["b_dec"])
-
-    expected_keys = sorted(state_dict.keys())
-    expected_shapes = {name: tuple(value.shape) for name, value in state_dict.items()}
-    for _, _, saved_keys, saved_shapes in results:
-        if saved_keys is not None:
-            assert saved_keys == expected_keys
-            assert all(not key.startswith("module.") for key in saved_keys)
-            assert saved_shapes == expected_shapes
 
 
 def test_unified_multi_hook_ddp_single_root_matches_reference_and_saves_per_hook_weights(

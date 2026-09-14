@@ -422,21 +422,14 @@ def tp_post_cpu_shm_prepare_clip(
     *,
     max_norm: float = 1.0,
 ) -> float:
-    """Synchronize replicated TP grads and compute the TP-global clip factor."""
+    """Compute the TP-global clip factor from already synchronized gradients.
+
+    Megatron's encoder completes the replicated bias gradient in backward.
+    Reducing that gradient here would count it once per TP rank.
+    """
 
     shard_dims = sae._tp_param_shard_dims()
     with torch.no_grad():
-        for name, param in sae.named_parameters():
-            if param.grad is None or shard_dims.get(name) is not None:
-                continue
-            host = param.grad.detach().float().cpu().numpy().reshape(-1)
-            reduced = reducer.reduce_vector_sum(host)
-            param.grad.copy_(
-                torch.from_numpy(reduced)
-                .to(param.grad.device, dtype=param.grad.dtype)
-                .view_as(param.grad)
-            )
-
         local_sq = 0.0
         tp_rank = dist.get_rank(sae._tp_group) if sae._tp_group is not None else 0
         for name, param in sae.named_parameters():
