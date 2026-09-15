@@ -63,6 +63,8 @@ def test_runner_cleans_groups_and_preserves_callers_world(tmp_path, failure):
                     config(), override_model=MagicMock()
                 )
             assert len(dist.distributed_c10d._world.pg_map) > len(before)
+            # Equal local batches still need coordinated routing after filtering.
+            assert runner.activations_store._synchronize_buffer_batches is True
             if failure == "run":
                 with (
                     patch.object(
@@ -117,9 +119,12 @@ def _mixed_failure_worker(rank, rendezvous, output, failed_rank, phase):
                 sae_dp_size=1,
             )
 
+        observed_waits = []
+
         def fail_or_wait():
             monitor = runner.sae_runtime.failure_monitor
             if phase == "backward" and rank < 2:
+                monitor.backward_wait_observer = observed_waits.append
                 domain = runner.sae_runtime.require_local().domain
                 for _ in range(3):
                     monitor.complete_backward(domain, "test_hook")
@@ -144,6 +149,11 @@ def _mixed_failure_worker(rank, rendezvous, output, failed_rank, phase):
             runner.run()
         assert set(dist.distributed_c10d._world.pg_map) == before
         assert not routing._initialized
+        if phase == "backward" and rank < 2:
+            assert all(w["completed"] for w in observed_waits[:3])
+            assert all(0 <= w["sleep_s"] <= w["elapsed_s"] for w in observed_waits)
+            if rank == 1:
+                assert len(observed_waits) == 4 and not observed_waits[-1]["completed"]
         Path(output, f"rank{rank}.json").write_text(
             json.dumps(
                 dict(

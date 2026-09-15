@@ -1217,7 +1217,10 @@ class LanguageModelSAETrainingRunner:
 
         self.activations_store._runner_controls_producers = self.sae_runtime is not None
         self.activations_store._synchronize_buffer_batches = (
-            self.sae_runtime is not None and cfg.routing_dp_batch_mode == "exact"
+            # Filtering can leave different row counts even with equal local
+            # batches. Every consumer of the shared routing loop must refill
+            # together, including TP followers and other hook placements.
+            self.sae_runtime is not None
             and self.sae_active and not self.cached_activations_only
         )
 

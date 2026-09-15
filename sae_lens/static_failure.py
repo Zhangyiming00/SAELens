@@ -79,6 +79,9 @@ class StaticFailureMonitor:
         self._send_sequence = {}
         self._recv_sequence = 0
         self._training_sequences = {}
+        # Optional profiling callback. Disabled in ordinary training, so no
+        # clock reads or per-poll timing are added unless explicitly observed.
+        self.backward_wait_observer = None
         self._thread = threading.Thread(
             target=self._monitor, name="sae-failure", daemon=True
         )
@@ -176,16 +179,35 @@ class StaticFailureMonitor:
         name = json.dumps([domain.name, hook])
         sequence = self._training_sequences.get(name, 0) + 1
         self._training_sequences[name] = sequence
-        self.check()
-        self.store.set(f"backward/{name}/{self.rank}", str(sequence))
-        keys = [f"backward/{name}/{rank}" for rank in domain.ranks]
-        while True:
+        observer = self.backward_wait_observer
+        started = time.perf_counter() if observer is not None else 0.0
+        polls = 0
+        sleep_s = 0.0
+        completed = False
+        try:
             self.check()
-            if self.store.check(keys) and all(
-                int(self.store.get(key)) >= sequence for key in keys
-            ):
-                return
-            self._stop.wait(0.005)
+            self.store.set(f"backward/{name}/{self.rank}", str(sequence))
+            keys = [f"backward/{name}/{rank}" for rank in domain.ranks]
+            while True:
+                self.check()
+                if self.store.check(keys) and all(
+                    int(self.store.get(key)) >= sequence for key in keys
+                ):
+                    completed = True
+                    return
+                if observer is not None:
+                    polls += 1
+                    before_sleep = time.perf_counter()
+                self._stop.wait(0.005)
+                if observer is not None:
+                    sleep_s += time.perf_counter() - before_sleep
+        finally:
+            if observer is not None:
+                observer(
+                    dict(domain=domain.name, hook=hook, sequence=sequence,
+                         elapsed_s=time.perf_counter() - started,
+                         poll_sleeps=polls, sleep_s=sleep_s, completed=completed)
+                )
 
     def finish(self):
         self.check()

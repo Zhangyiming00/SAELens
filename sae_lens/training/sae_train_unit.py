@@ -9,6 +9,7 @@ from typing import Any
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 
+from sae_lens.profiling import cuda_nvtx_range
 from sae_lens.sae_runtime import SAERuntime
 
 
@@ -55,9 +56,10 @@ class SAETrainUnit:
         scaler.scale(loss).backward()
         monitor = getattr(self.parallel_context, "failure_monitor", None)
         if monitor is not None:
-            monitor.complete_backward(
-                self.parallel_context.require_local().domain, self.hook_name
-            )
+            with cuda_nvtx_range(f"sae:{self.hook_name}:backward_ready_wait"):
+                monitor.complete_backward(
+                    self.parallel_context.require_local().domain, self.hook_name
+                )
 
     def check_failure(self):
         monitor = getattr(self.parallel_context, "failure_monitor", None)

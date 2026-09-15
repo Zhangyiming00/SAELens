@@ -97,8 +97,11 @@ buffer 前过滤；不会把词表 ID 转成低精度浮点数。
 例如 global batch 4096、DP3 的本地 batch 为 1365/1365/1366。各 rank 保存
 `trainer_runtime_rankN.pt`，恢复自己的 token 进度与计数余数；checkpoint 目录名
 和触发阈值统一使用 global token 数，runner 配置也保存原始 global batch。
-exact 模式每次 buffer 补充后对可提供的训练批次数取全体 SAE rank 的最小值，
-保证本地 batch 大小或过滤行数不同的副本仍同时进入下一次静态路由。
+所有共同推进静态 routing 的 equal/exact 消费者，每次 buffer 补充后都对可提供的
+训练批次数取全体 SAE rank 的最小值，包括 TP follower 与各 hook placement。
+即使 equal 的本地 batch 大小相同，特殊 token 过滤后仍可能出现 64/63 行；因此
+必须一起决定是否继续补 buffer，避免一个副本进入训练、另一个进入数据通信。
+独立缓存读取和尚未迁移的 streaming 不使用此静态路由同步。
 shuffle 和保留区的算法不变，暂时多出的激活保留在本地 buffer。
 
 每个 placement 的 DP0/TP0 另存 `placement_state_N.pt`，包含该 placement
@@ -114,6 +117,13 @@ NCCL 通信组，以及归属这些组的 vLLM PyNccl communicator；等待 prod
 均已返回，再进入后续 hook 或梯度处理；避免一个成员抛出 autograd 异常时，
 其他成员仍继续提交 CUDA 更新。该同步边界不包含 producer-only rank，
 不同 placement 不为此互相等待。vLLM 通信入口和训练单元在失败后拒绝继续通信。
+该握手保留 5 ms 轮询间隔，并在正常运行时执行；5 ms 不是每次调用的固定成本。
+`sae:<hook>:backward_ready_wait` NVTX 区间可单独观察这段 CPU 等待。可选的
+`runtime.failure_monitor.backward_wait_observer` 回调报告 elapsed_s、实际睡眠次数、
+sleep_s 和 completed；默认不启用时不读取这些计时钟，也不存储逐次统计。
+等待包含成员到达时间差、Store 访问和睡眠，属于既有 backward/SAE 耗时的子集，
+不能作为可直接相加的 GPU 阶段或移除同步后必然获得的加速。跨 hook overlap 接入前
+需要重新安排这一同步边界，并保留失败退出验收。
 成功结束使用可检查失败的完成握手。此机制处理 run 阶段捕获到的 Python 异常，
 不提供进程被 SIGKILL、节点失联、初始化中途失效或硬件故障后的弹性恢复保证。
 
@@ -144,6 +154,7 @@ scheduler 状态。`--empty-steps` 在真实 mixer 输出之后注入一个空�
 .venv/bin/python scripts/validate_sae_runner_static.py --output results/exact_dp3_new --layout dp3 --batch-mode exact --global-batch 4096
 .venv/bin/python scripts/validate_sae_runner_static.py --output results/placement_amp_new --layout placement --hooks 2 --placement-amp
 .venv/bin/python scripts/validate_sae_runner_static.py --output results/failure_new --layout prefix --hooks 2 --failure consumer_backward
+.venv/bin/python scripts/validate_sae_runner_static.py --output results/equal_uneven_new --uneven-filter
 ```
 
 故障点还可选 `consumer_wait`、`producer_generate`。验收要求所有进程自行报告
@@ -154,6 +165,22 @@ scheduler 状态。`--empty-steps` 在真实 mixer 输出之后注入一个空�
 恢复瞬间状态与后续更新，不再使用有歧义的 `exact_resume` 字段。DP3 后续更新
 允许 `rtol=1e-6, atol=1e-7` 的浮点误差，输入、LR、scaler 与恢复瞬间状态仍要求
 逐位一致；这些数值验收不能替代性能测试。
+
+`--uneven-filter` 使用真实 token 数据，让两个 DP 副本每轮分别保留 64/63 行，
+buffer 阈值 64、本地 equal batch 16；验证 H=1/H=2 同步补 buffer、续训和退出。
+
+同步性能基线入口：
+
+```bash
+.venv/bin/python scripts/benchmark_sae_runner_static.py --output results/sync_baseline_new --hooks 2
+```
+
+默认使用真实 vLLM TP4、SAE TP2×DP2、global batch 4096（equal 本地 2048）、
+d_sae=16384、FP32、16 步预热和三个连续 16 步窗口。窗口包含生成、过滤、routing、
+buffer 与训练，仅在窗口边界同步 CUDA；关闭逐步输入哈希、检查点和额外日志。
+默认观察 backward 等待，可用 `--no-observe-backward` 测量关闭可选观察器的同一训练；
+这两个设置都保留失败握手及其 5 ms 轮询。报告逐 rank/hook 分布和各窗口吞吐，
+不把跨 rank 的等待时间求和后与单个窗口时间比较。该基线尚不是旧训练路径对比。
 
 ## 原生参考与拓扑回归
 

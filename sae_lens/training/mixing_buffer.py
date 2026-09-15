@@ -95,8 +95,9 @@ def mixing_buffer(
             if ready else 0
         )
         if synchronize_batch_count is not None:
-            # Uneven DP batches must refill together. Agree before shuffling,
-            # including when this rank has not accumulated a full buffer yet.
+            # Consumers of a shared routing loop must refill together, even
+            # with equal batch sizes: token filtering can leave uneven rows.
+            # Agree before shuffling, including ranks below the buffer threshold.
             num_serving_batches = synchronize_batch_count(num_serving_batches)
         if num_serving_batches:
             with cuda_nvtx_range("mixing_buffer:shuffle"):

@@ -96,23 +96,26 @@ def test_load_weights_tp_round_trip(tmp_path: Path, tp_size: int):
     torch.save(x, x_path)
     torch.save(y_ref, y_path)
 
-    manager = mp.Manager()
-    result_list = manager.list()
-    mp.spawn(
-        _worker,
-        args=(
-            tp_size,
-            str(ckpt_dir),
-            cfg_kwargs,
-            str(x_path),
-            str(y_path),
-            29950 + tp_size,
-            result_list,
-        ),
-        nprocs=tp_size,
-        join=True,
-    )
-    results = sorted(list(result_list), key=lambda r: r[0])
+    # A forked Manager inherits the parent's Gloo objects from earlier tests.
+    # Their destructors can try to join threads which do not exist in that
+    # child, crashing the manager and surfacing as EOFError in the workers.
+    with mp.get_context("spawn").Manager() as manager:
+        result_list = manager.list()
+        mp.spawn(
+            _worker,
+            args=(
+                tp_size,
+                str(ckpt_dir),
+                cfg_kwargs,
+                str(x_path),
+                str(y_path),
+                29950 + tp_size,
+                result_list,
+            ),
+            nprocs=tp_size,
+            join=True,
+        )
+        results = sorted(list(result_list), key=lambda r: r[0])
     assert len(results) == tp_size
 
     s = cfg_kwargs["d_sae"] // tp_size

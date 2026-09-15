@@ -53,6 +53,7 @@ def _worker(
     global_batch=32,
     placement_amp=False,
     failure=None,
+    uneven_filter=False,
 ):
     os.environ.update(
         RANK=str(rank),
@@ -85,13 +86,18 @@ def _worker(
 
     directory = Path(directory)
     phase = "resume" if resume else "continuous"
+    # The equal runner expects local batch/token counts, unlike exact mode.
+    # For the uneven-filter regression reproduce precisely local batch 16.
+    cfg_batch = global_batch // 2 if uneven_filter and batch_mode == "equal" else global_batch
+    checkpoint_tokens = cfg_batch * 3
     hooks = [f"blocks.{i}.hook_resid_post" for i in (21, 26)[:hook_count]]
     # Pretokenized, deterministic local rows exercise vLLM prefill and real
     # activation extraction without network or dataset download variability.
     dataset = Dataset.from_dict(
         {
             "tokens": [
-                [1000] + [1001 + ((i * 37 + j) % 1999) for j in range(31)]
+                ([1000] if not uneven_filter or i % 4 == 2 else [1001])
+                + [1001 + ((i * 37 + j) % 1999) for j in range(31)]
                 for i in range(256)
             ]
         }
@@ -122,9 +128,9 @@ def _worker(
         store_batch_size_prompts=192 if global_batch == 4096 else 4,
         n_batches_in_buffer=64
         if global_batch == 4096
-        else (2 if batch_mode == "exact" else 4),
-        training_tokens=global_batch * 6,
-        train_batch_size_tokens=global_batch,
+        else (2 if batch_mode == "exact" or uneven_filter else 4),
+        training_tokens=cfg_batch * 6,
+        train_batch_size_tokens=cfg_batch,
         routing_dp_batch_mode=batch_mode,
         activations_mixing_fraction=0.5,
         device=f"cuda:{rank}",
@@ -148,7 +154,7 @@ def _worker(
         save_timing_every_n_steps=0,
         save_memory_every_n_steps=0,
         logger=LoggingConfig(log_to_wandb=False),
-        resume_from_checkpoint=str(directory / "checkpoints" / str(global_batch * 3))
+        resume_from_checkpoint=str(directory / "checkpoints" / str(checkpoint_tokens))
         if resume
         else None,
     )
@@ -344,7 +350,10 @@ def _worker(
                     distributed_v2.get_routing_table(), runtime.local.dp_rank
                 )
                 expected = sum(
-                    sum(i % 32 != 0 for i in range(r.row_start, r.row_end))
+                    sum(
+                        not (i % 32 == 0 and (not uneven_filter or i // 32 % 4 == 2))
+                        for i in range(r.row_start, r.row_end)
+                    )
                     for r in routes
                 )
                 assert sample.shape == (
@@ -423,6 +432,7 @@ def main():
     parser.add_argument("--batch-mode", choices=("equal", "exact"), default="equal")
     parser.add_argument("--global-batch", type=int, choices=(32, 4096), default=32)
     parser.add_argument("--placement-amp", action="store_true")
+    parser.add_argument("--uneven-filter", action="store_true")
     parser.add_argument(
         "--failure", choices=("consumer_wait", "producer_generate", "consumer_backward")
     )
@@ -438,6 +448,8 @@ def main():
         parser.error("empty-step acceptance uses the full TP2 x DP2 layout")
     if args.layout == "dp3" and args.batch_mode != "exact":
         parser.error("DP3 acceptance requires --batch-mode exact")
+    if args.uneven_filter and (args.layout != "full" or args.global_batch != 32):
+        parser.error("uneven filtering requires the full layout and global batch 32")
     if args.placement_amp and args.layout != "placement":
         parser.error("placement AMP requires --layout placement --hooks 2")
     if args.failure and (
@@ -507,6 +519,7 @@ def main():
                     args.global_batch,
                     args.placement_amp,
                     args.failure,
+                    args.uneven_filter,
                 ),
                 timeout=120 if args.failure else 600,
             )
@@ -647,6 +660,21 @@ def main():
                 weights_only=True,
             )
             assert a["grad_scaler"]["scale"] != b["grad_scaler"]["scale"]
+        if args.uneven_filter:
+            for phase in ("continuous", "resume"):
+                replicas = [
+                    json.loads((directory / f"{phase}_rank{rank}.json").read_text())
+                    for rank in (0, 2)
+                ]
+                assert all(x == 64 for x in replicas[0]["filtered_batch_rows"])
+                assert all(x == 63 for x in replicas[1]["filtered_batch_rows"])
+                assert all(
+                    step["local_rows"] == 16
+                    for replica in replicas for step in replica["steps"]
+                )
+                assert len(replicas[0]["filtered_batch_rows"]) == len(
+                    replicas[1]["filtered_batch_rows"]
+                )
         summary.append(
             dict(
                 hooks=hooks,
@@ -660,9 +688,10 @@ def main():
                 resumed_inputs_lr_scaler_equal=True,
                 routing_dp_batch_mode=args.batch_mode,
                 configured_global_batch=args.global_batch
-                if args.batch_mode == "exact"
+                if args.batch_mode == "exact" or args.uneven_filter
                 else None,
                 placement_amp=args.placement_amp,
+                uneven_filter=args.uneven_filter,
             )
         )
         (args.output / "summary.json").write_text(json.dumps(summary, indent=2))
