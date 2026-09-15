@@ -1153,6 +1153,10 @@ def test_run_nccl_p2p_exchange_v2_packs_only_each_endpoint_hooks(
     monkeypatch.setattr(v2, "get_producer_idx", lambda: 1)
     monkeypatch.setattr(v2, "get_sae_dp_size", lambda: 1)
     monkeypatch.setattr(v2, "get_sae_pp_size", lambda: 2)
+    from sae_lens.sae_runtime import SAEEndpoint
+
+    endpoints = [SAEEndpoint(i, str(i), i, 0, (i,), i, (f"h{i}",)) for i in range(2)]
+    monkeypatch.setattr(v2, "get_endpoint", lambda i: endpoints[i])
     monkeypatch.setattr(v2, "get_num_sae_stage_endpoints", lambda: 2)
     monkeypatch.setattr(v2, "get_producer_tp_root", lambda p: p)
     monkeypatch.setattr(v2, "get_consumer_tp_root", lambda endpoint: endpoint)
@@ -1193,6 +1197,11 @@ def test_v2_endpoint_hooks_repeat_across_dp_replicas(
     monkeypatch.setattr(v2, "get_sae_pp_size", lambda: 4)
 
     expected = [["h0", "h1"], ["h2", "h3"], ["h4"], ["h5"]]
+    from sae_lens.sae_runtime import SAEEndpoint
+
+    endpoints = [SAEEndpoint(i, str(i % 4), i % 4, i // 4, (i,), i,
+                             tuple(expected[i % 4])) for i in range(8)]
+    monkeypatch.setattr(v2, "get_endpoint", lambda i: endpoints[i])
     assert [store._v2_endpoint_hook_names(i) for i in range(4)] == expected
     assert [store._v2_endpoint_hook_names(i) for i in range(4, 8)] == expected
 
@@ -1235,6 +1244,7 @@ def test_activations_store_v2_loader_respects_train_batch_size_tokens(
     store.train_batch_size_tokens = 4
     store.activations_mixing_fraction = 0.0
     store._mixing_generator = None
+    store._mixing_state = {}
 
     def fake_iterate_filtered_activations_v2():
         yield torch.arange(12, dtype=torch.float32).view(12, 1)

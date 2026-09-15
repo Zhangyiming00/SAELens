@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import torch.distributed as dist
 
+from sae_lens.sae_runtime import SAERuntime, SAETrainingDomain
 from sae_lens.shard_routing import ShardRoute, compute_routing_table
 
 
@@ -46,6 +47,8 @@ def hooks_for_pp_rank(pp_rank: int, pp_size: int, all_hooks: list[str]) -> list[
 # Module-level state (isolated from distributed.py)
 # ---------------------------------------------------------------------------
 
+_sae_runtime: SAERuntime | None = None
+_routing_groups: list[dist.ProcessGroup] = []
 _initialized: bool = False
 _P: int = 0  # number of producers (vllm_dp_size)
 _Q: int = 0  # number of routing consumers / SAE DP replicas (sae_dp_size)
@@ -108,6 +111,14 @@ def _reset() -> None:
     global _sae_pp_root_group, _sae_pp_root_global
     global _streaming_nccl_groups, _gloo_ctrl_group, _pp_coord_groups
 
+    global _sae_runtime, _routing_groups
+    if dist.is_initialized():
+        for group in reversed(_routing_groups):
+            dist.destroy_process_group(group)
+    _routing_groups = []
+    if _sae_runtime is not None:
+        _sae_runtime.close()
+    _sae_runtime = None
     _initialized = False
     _P = _Q = _num_sae_stage_endpoints = 0
     _vllm_tp_size = _sae_tp_size = _sae_pp_size = 1
@@ -136,6 +147,15 @@ def _reset() -> None:
     _pp_coord_groups = []
 
 
+def _create_routing_group(ranks, backend):
+    if backend == "nccl" and dist.get_backend() == "gloo":
+        backend = "gloo"
+    group = dist.new_group(ranks, backend=backend)
+    if dist.get_rank() in ranks:
+        _routing_groups.append(group)
+    return group
+
+
 # ---------------------------------------------------------------------------
 # Init
 # ---------------------------------------------------------------------------
@@ -150,6 +170,8 @@ def init_distributed_v2(
     sae_pp_size: int = 1,
     use_gpu_direct: bool = False,
     build_routing_table: bool = True,
+    runtime: SAERuntime | None = None,
+    hook_names: tuple[str, ...] = (),
 ) -> None:
     """Initialize all process groups for the unified shard-routing path.
 
@@ -203,7 +225,12 @@ def init_distributed_v2(
 
     num_sae_stage_endpoints = Q * sae_pp_size
     world_size = dist.get_world_size()
-    if disjoint:
+    if runtime is not None:
+        if P * vllm_tp_size > world_size:
+            raise ValueError("Producer ranks are outside the routing world")
+        if disjoint and any(r < P * vllm_tp_size for d in runtime.domains for r in d.ranks):
+            raise ValueError("Disjoint routing cannot overlap producer and SAE ranks")
+    elif disjoint:
         expected = P * vllm_tp_size + num_sae_stage_endpoints * sae_tp_size
         assert world_size == expected, (
             f"world_size={world_size} != P*vllm_tp + sae_endpoints*sae_tp={expected} "
@@ -230,13 +257,19 @@ def init_distributed_v2(
         _producer_world_ranks[p] = ranks
         _producer_tp_root[p] = ranks[0]
 
-    # Endpoint layout: e = d * sae_pp + s, where d=DP consumer, s=PP stage.
-    consumer_offset = P * vllm_tp_size if disjoint else 0
-    for endpoint_idx in range(num_sae_stage_endpoints):
-        base = consumer_offset + endpoint_idx * sae_tp_size
-        ranks = list(range(base, base + sae_tp_size))
-        _sae_endpoint_world_ranks[endpoint_idx] = ranks
-        _sae_endpoint_tp_root[endpoint_idx] = ranks[0]
+    # Runtime owns training-domain initialization. Routing consumes actual
+    # Megatron membership reports; it never derives SAE TP/DP members.
+    global _sae_runtime
+    _sae_runtime = runtime or SAERuntime.from_layout(
+        dp_size=Q, tp_size=sae_tp_size, placement_size=sae_pp_size,
+        offset=P * vllm_tp_size if disjoint else 0, hooks=hook_names,
+        backend="gloo" if dist.get_backend() == "gloo" else "nccl",
+    )
+    if len(_sae_runtime.endpoints) != num_sae_stage_endpoints:
+        raise ValueError("SAE runtime endpoint count differs from routing configuration")
+    for endpoint in _sae_runtime.endpoints:
+        _sae_endpoint_world_ranks[endpoint.index] = list(endpoint.tp_ranks)
+        _sae_endpoint_tp_root[endpoint.index] = endpoint.receive_rank
 
     # --- Determine this rank's role by membership ---
     _is_producer = False
@@ -255,56 +288,32 @@ def init_distributed_v2(
             _producer_idx = p
             _vllm_tp_rank = ranks.index(rank)
 
-    for endpoint_idx, ranks in _sae_endpoint_world_ranks.items():
-        if rank in ranks:
-            _is_consumer = True
-            _consumer_idx = endpoint_idx // sae_pp_size
-            _sae_endpoint_idx = endpoint_idx
-            _sae_tp_rank = ranks.index(rank)
-            _sae_dp_idx = _consumer_idx
-            _sae_pp_rank = endpoint_idx % sae_pp_size
+    if _sae_runtime.local is not None:
+        context = _sae_runtime.require_local()
+        endpoint = next(e for e in _sae_runtime.endpoints if rank in e.tp_ranks)
+        _is_consumer = True
+        _consumer_idx = _sae_dp_idx = context.dp_rank
+        _sae_endpoint_idx = endpoint.index
+        _sae_tp_rank = context.tp_rank
+        _sae_pp_rank = endpoint.placement_index
+        _sae_tp_group = context.tp_group
+        _sae_tp_cpu_group = context.tp_cpu_group
+        _sae_dp_group = context.dp_group
 
     # --- Create P vLLM TP groups (NCCL) ---
     for p in range(P):
         ranks = _producer_world_ranks[p]
-        grp = dist.new_group(ranks, backend="nccl")
+        grp = _create_routing_group(ranks, backend="nccl")
         if _is_producer and _producer_idx == p:
             _vllm_tp_group = grp
-
-    # --- Create one SAE TP group per physical endpoint (DP replica x PP stage) ---
-    # The Gloo twin has exactly the same membership and is used only after FSDP
-    # has offloaded a local TP shard to CPU for checkpoint/final export.
-    for endpoint_idx in range(num_sae_stage_endpoints):
-        ranks = _sae_endpoint_world_ranks[endpoint_idx]
-        grp = dist.new_group(ranks, backend="nccl")
-        cpu_grp = dist.new_group(ranks, backend="gloo")
-        if _is_consumer and _sae_endpoint_idx == endpoint_idx:
-            _sae_tp_group = grp
-            _sae_tp_cpu_group = cpu_grp
-
-    # --- Create SAE DP groups (NCCL): one per (pp_stage, tp_rank) position ---
-    # Ranks at the same PP stage and TP position across DP replicas.
-    if Q > 0:
-        for s in range(sae_pp_size):
-            for tp_r in range(sae_tp_size):
-                dp_ranks = [
-                    _sae_endpoint_world_ranks[d * sae_pp_size + s][tp_r]
-                    for d in range(Q)
-                ]
-                grp = dist.new_group(dp_ranks, backend="nccl")
-                if _is_consumer and _sae_pp_rank == s and _sae_tp_rank == tp_r:
-                    _sae_dp_group = grp
 
     # --- Create per-DP-replica groups: all PP*TP ranks of one DP replica ---
     # Kept for existing callers that need the full replica group.
     if Q > 0:
         for d in range(Q):
-            members = [
-                _sae_endpoint_world_ranks[d * sae_pp_size + s][tp_r]
-                for s in range(sae_pp_size)
-                for tp_r in range(sae_tp_size)
-            ]
-            grp = dist.new_group(members, backend="nccl")
+            members = [r for e in _sae_runtime.endpoints if e.replica_index == d
+                       for r in e.tp_ranks]
+            grp = _create_routing_group(members, backend="nccl")
             if _is_consumer and _sae_dp_idx == d:
                 _sae_dp_replica_group = grp
                 _sae_dp_replica_root = members[0]
@@ -314,11 +323,8 @@ def init_distributed_v2(
     # different provider path and only participate in their SAE-TP broadcast.
     if Q > 0 and sae_pp_size > 1:
         for d in range(Q):
-            members = [
-                _sae_endpoint_world_ranks[d * sae_pp_size + s][0]
-                for s in range(sae_pp_size)
-            ]
-            grp = dist.new_group(members, backend="nccl")
+            members = [e.receive_rank for e in _sae_runtime.endpoints if e.replica_index == d]
+            grp = _create_routing_group(members, backend="nccl")
             if _is_consumer and _sae_dp_idx == d and _sae_tp_rank == 0:
                 _sae_pp_root_group = grp
                 _sae_pp_root_global = members[0]
@@ -337,13 +343,13 @@ def init_distributed_v2(
     # connected to its DP consumer. PP stages in the same DP replica share routes.
     if build_routing_table:
         for endpoint_idx in range(num_sae_stage_endpoints):
-            d = endpoint_idx // sae_pp_size
+            d = get_endpoint(endpoint_idx).replica_index
             sources = {r.producer_idx for r in _routing_table if r.consumer_idx == d}
             p2p_members = sorted(
                 {_sae_endpoint_tp_root[endpoint_idx]}
                 | {_producer_tp_root[p] for p in sources}
             )
-            grp = dist.new_group(p2p_members, backend="nccl")
+            grp = _create_routing_group(p2p_members, backend="nccl")
             if rank in p2p_members:
                 _sae_endpoint_p2p_groups[endpoint_idx] = grp
 
@@ -356,7 +362,7 @@ def init_distributed_v2(
                 for tp_r in range(sae_tp_size):
                     endpoint_idx = d * sae_pp_size + pp_stage
                     members.append(_sae_endpoint_world_ranks[endpoint_idx][tp_r])
-            grp = dist.new_group(members, backend="nccl")
+            grp = _create_routing_group(members, backend="nccl")
             _streaming_nccl_groups.append(grp)
             if rank in members:
                 # Store for later access by pp_stage
@@ -367,7 +373,7 @@ def init_distributed_v2(
         sae_dp_root = _sae_endpoint_world_ranks[0][0]  # First SAE endpoint's TP root
         gloo_members = [_producer_tp_root[0], sae_dp_root]
         if all(m < world_size for m in gloo_members):
-            gloo_grp = dist.new_group(gloo_members, backend="gloo")
+            gloo_grp = _create_routing_group(gloo_members, backend="gloo")
             if rank in gloo_members:
                 _gloo_ctrl_group = gloo_grp
 
@@ -383,7 +389,7 @@ def init_distributed_v2(
                     endpoint_idx = d * sae_pp_size + pp_stage
                     members.append(_sae_endpoint_tp_root[endpoint_idx])
                 if all(m < world_size for m in members):
-                    grp = dist.new_group(members, backend="nccl")
+                    grp = _create_routing_group(members, backend="nccl")
                     _pp_coord_groups.append(grp)
                     if rank in members:
                         pass
@@ -566,3 +572,104 @@ def get_pp_coord_group(pp_stage: int) -> dist.ProcessGroup | None:
     Raises IndexError if pp_stage is out of range or groups not initialized.
     """
     return _pp_coord_groups[pp_stage]
+
+
+def get_sae_runtime() -> SAERuntime | None:
+    return _sae_runtime
+
+
+def producer_helper_ranks() -> tuple[int, ...]:
+    """Ranks producing activations without a local SAE training unit."""
+    assert _sae_runtime is not None
+    consumers = {r for domain in _sae_runtime.domains for r in domain.ranks}
+    return tuple(sorted(r for members in _producer_world_ranks.values() for r in members if r not in consumers))
+
+
+def control_producer_helpers(command: str, checkpoint_path: str | None = None) -> None:
+    """Synchronous static control; the receiver map still comes from runtime."""
+    runtime = _sae_runtime
+    if runtime is None or not runtime.endpoints:
+        return
+    if dist.get_rank() != runtime.endpoints[0].receive_rank:
+        return
+    for rank in producer_helper_ranks():
+        monitor = getattr(runtime, "failure_monitor", None)
+        if monitor is not None:
+            monitor.send_command(rank, command, checkpoint_path)
+            continue
+        dist.send_object_list([(command, checkpoint_path)], dst=rank, group=runtime.control_group)
+        if command == "checkpoint":
+            reply = [None]
+            dist.recv_object_list(reply, src=rank, group=runtime.control_group)
+            if reply[0] != "saved":
+                raise RuntimeError(f"Producer rank {rank} did not finish its checkpoint")
+
+
+def wait_producer_control():
+    runtime = _sae_runtime
+    assert runtime is not None
+    monitor = getattr(runtime, "failure_monitor", None)
+    if monitor is not None:
+        return monitor.receive_command()
+    command = [None]
+    dist.recv_object_list(command, src=runtime.endpoints[0].receive_rank, group=runtime.control_group)
+    return command[0]
+
+
+def acknowledge_producer_checkpoint():
+    assert _sae_runtime is not None
+    monitor = getattr(_sae_runtime, "failure_monitor", None)
+    if monitor is not None:
+        monitor.acknowledge_checkpoint()
+        return
+    dist.send_object_list(["saved"], dst=_sae_runtime.endpoints[0].receive_rank, group=_sae_runtime.control_group)
+
+
+def get_endpoint(endpoint_idx: int):
+    if _sae_runtime is None:
+        raise RuntimeError("SAE routing has not been initialized")
+    return _sae_runtime.endpoints[endpoint_idx]
+
+
+def initialize_sae_routing(
+    *, P: int, Q: int, vllm_tp_size: int, sae_tp_size: int,
+    batch_size: int, hook_names: tuple[str, ...], sae_pp_size: int = 1,
+    disjoint: bool = False, training_domains: tuple[SAETrainingDomain, ...] | None = None,
+) -> SAERuntime:
+    """Static routing entry: initialize Megatron domains and register receiver metadata.
+
+    All routing-world ranks call this once, including producer-only ranks.
+    Activation slicing/filtering/buffering remain in ActivationsStore.
+    """
+    if _initialized:
+        raise RuntimeError("SAE routing is already initialized; close the previous runtime first")
+    if len(set(hook_names)) != len(hook_names) or (Q > 0 and not hook_names):
+        raise ValueError("Static SAE routing requires distinct, nonempty hook names")
+    runtime = None
+    if training_domains is not None:
+        assigned = tuple(h for d in training_domains for h in d.hooks)
+        if set(assigned) != set(hook_names) or len(assigned) != len(hook_names):
+            raise ValueError("Training domains must assign every hook exactly once")
+        if len(training_domains) != sae_pp_size:
+            raise ValueError("Placement count differs from training domains")
+        if any(d.tp_size != sae_tp_size or len(d.ranks) != Q * sae_tp_size for d in training_domains):
+            raise ValueError("Training domains differ from configured TP/DP sizes")
+        runtime = SAERuntime(training_domains, backend="gloo" if dist.get_backend() == "gloo" else "nccl")
+    try:
+        init_distributed_v2(
+            P=P, Q=Q, vllm_tp_size=vllm_tp_size, sae_tp_size=sae_tp_size,
+            batch_size=batch_size, sae_pp_size=sae_pp_size, disjoint=disjoint,
+            runtime=runtime, hook_names=hook_names,
+        )
+    except BaseException:
+        _reset()
+        if runtime is not None:
+            runtime.close()
+        raise
+    assert _sae_runtime is not None
+    return _sae_runtime
+
+
+def close_sae_routing() -> None:
+    """Close transport and SAE groups collectively, preserving the default world."""
+    _reset()

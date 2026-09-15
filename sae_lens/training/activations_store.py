@@ -391,6 +391,8 @@ class ActivationsStore:
         self._cached_shard_index = cached_shard_index
         self._cached_shard_count = cached_shard_count
         self._mixing_generator: torch.Generator | None = None
+        self._mixing_state: dict = {}
+        self._n_sequences_consumed = 0
         # Use a dedicated per-store generator so activation mixing order is
         # deterministic and decoupled from unrelated global RNG consumption
         # (e.g. extra model/SAE initialization paths in multi-hook runs).
@@ -836,6 +838,7 @@ class ActivationsStore:
         for _ in range(batch_size):
             try:
                 sequences.append(next(self.iterable_sequences))
+
             except StopIteration:
                 self.iterable_sequences = self._iterate_tokenized_sequences()
                 if raise_at_epoch_end:
@@ -843,6 +846,7 @@ class ActivationsStore:
                         f"Ran out of tokens in dataset after {self.n_dataset_processed} samples, beginning the next epoch."
                     )
                 sequences.append(next(self.iterable_sequences))
+            self._n_sequences_consumed += 1
 
         return torch.stack(sequences, dim=0)
 
@@ -1733,7 +1737,14 @@ class ActivationsStore:
         import sae_lens.distributed_v2 as v2
         from sae_lens.shard_routing import routes_for_consumer
 
+        monitor = getattr(v2.get_sae_runtime(), "failure_monitor", None)
+        if monitor is not None:
+            monitor.check()
         routing = v2.get_routing_table()
+        # Helper processes enter the same production cycle on demand. Filtering
+        # and restored pending batches can change how many cycles are needed.
+        if getattr(self, "_runner_controls_producers", False):
+            v2.control_producer_helpers("batch")
         i_am_producer = v2.is_producer()
         i_am_consumer = v2.is_consumer()
         i_am_consumer_root = i_am_consumer and v2.get_sae_tp_rank() == 0
@@ -1746,10 +1757,14 @@ class ActivationsStore:
         vllm_stage_t0 = time.perf_counter()
         if i_am_producer:
             local_slices, outgoing = self._run_producer_phase2_v2()
+        if monitor is not None:
+            monitor.check()
         self._add_data_timing(vllm_step_time_s=time.perf_counter() - vllm_stage_t0)
 
         transfer_t0 = time.perf_counter()
         remote_slices = self._run_nccl_p2p_exchange_v2(outgoing)
+        if monitor is not None:
+            monitor.check()
 
         assembled: torch.Tensor | dict[str, torch.Tensor] | None = None
         if i_am_consumer_root:
@@ -1814,14 +1829,14 @@ class ActivationsStore:
                     assembled = {
                         hook_name: torch.empty(
                             n_rows,
-                            self.d_in,
+                            self._v2_payload_width(),
                             dtype=self.dtype,
                             device=self.device,
                         )
                         for hook_name in self.hook_names
                     }
                 else:
-                    assembled = torch.empty(n_rows, self.d_in, dtype=self.dtype, device=self.device)
+                    assembled = torch.empty(n_rows, self._v2_payload_width(), dtype=self.dtype, device=self.device)
             with nccl_nvtx_range("nccl:shard_routing_sae_tp_broadcast", sae_tp_group):
                 with routing_phase(getattr(self, "_routing_probe", None), "sae_tp_broadcast"):
                     if isinstance(assembled, dict):
@@ -1839,8 +1854,18 @@ class ActivationsStore:
                         )
 
         if assembled is not None:
+            if getattr(self, "exclude_special_tokens", None) is not None:
+                sample = next(iter(assembled.values())) if isinstance(assembled, dict) else assembled
+                excluded = sample[:, -1].bool()
+                assembled = ({h: acts[~excluded, :-1] for h, acts in assembled.items()}
+                             if isinstance(assembled, dict) else assembled[~excluded, :-1])
             self._add_data_timing(transfer_time_s=time.perf_counter() - transfer_t0)
         return assembled
+
+    def _v2_payload_width(self):
+        # Carry one exact 0/1 exclusion flag with each row. This also works for
+        # bfloat16 payloads, without rounding vocabulary IDs during transport.
+        return self.d_in + int(getattr(self, "exclude_special_tokens", None) is not None)
 
     def _v2_payload_hook_names(self) -> list[str]:
         """Hooks carried across v2 producer/consumer P2P payloads."""
@@ -1852,9 +1877,12 @@ class ActivationsStore:
         from sae_lens.distributed_v2 import hooks_for_pp_rank
 
         all_hook_names = self._v2_payload_hook_names()
+        endpoint = v2.get_endpoint(endpoint_idx)
+        if endpoint.hooks:
+            return list(endpoint.hooks)
         pp_size = v2.get_sae_pp_size()
         return hooks_for_pp_rank(
-            endpoint_idx % pp_size,
+            endpoint.placement_index,
             pp_size,
             all_hook_names,
         )
@@ -1945,7 +1973,14 @@ class ActivationsStore:
 
         p = v2.get_producer_idx()
         with routing_phase(getattr(self, "_routing_probe", None), "vllm_generate"):
-            raw_acts, _ = self._get_raw_llm_batch_with_epoch_restart()
+            raw_acts, token_ids = self._get_raw_llm_batch_with_epoch_restart()
+        if getattr(self, "exclude_special_tokens", None) is not None:
+            sample = next(iter(raw_acts.values())) if isinstance(raw_acts, dict) else raw_acts
+            excluded = (torch.isin(token_ids, self.exclude_special_tokens.to(token_ids.device))
+                        if token_ids is not None else torch.zeros(sample.shape[0], device=sample.device, dtype=torch.bool))
+            flag = excluded.to(device=sample.device, dtype=sample.dtype).unsqueeze(-1)
+            raw_acts = ({h: torch.cat((acts, flag), dim=-1) for h, acts in raw_acts.items()}
+                        if isinstance(raw_acts, dict) else torch.cat((raw_acts, flag), dim=-1))
         p_routes = routes_for_producer(v2.get_routing_table(), p)
         payload_hook_names = self._v2_payload_hook_names()
         local_consumer_idx = v2.get_consumer_idx() if v2.is_consumer() else -1
@@ -2005,7 +2040,10 @@ class ActivationsStore:
         }
 
         for endpoint_idx in range(v2.get_num_sae_stage_endpoints()):
-            c = endpoint_idx // v2.get_sae_pp_size()
+            monitor = getattr(v2.get_sae_runtime(), "failure_monitor", None)
+            if monitor is not None:
+                monitor.check()
+            c = v2.get_endpoint(endpoint_idx).replica_index
             endpoint_hook_names = self._v2_endpoint_hook_names(endpoint_idx)
             consumer_root = v2.get_consumer_tp_root(endpoint_idx)
             consumer_routes = routes_for_consumer(v2.get_routing_table(), c)
@@ -2043,14 +2081,14 @@ class ActivationsStore:
                         if self.is_multi_hook:
                             recv_buf = torch.empty(
                                 n_rows * len(endpoint_hook_names),
-                                self.d_in,
+                                self._v2_payload_width(),
                                 dtype=self.dtype,
                                 device=self.device,
                             )
                         else:
                             recv_buf = torch.empty(
                                 n_rows,
-                                self.d_in,
+                                self._v2_payload_width(),
                                 dtype=self.dtype,
                                 device=self.device,
                             )
@@ -2122,6 +2160,7 @@ class ActivationsStore:
                 activations_loader=self._iterate_filtered_activations(),
                 mix_fraction=self.activations_mixing_fraction,
                 generator=self._mixing_generator,
+                state=self._mixing_state,
             )
 
         if v2_mod._initialized:
@@ -2131,6 +2170,11 @@ class ActivationsStore:
                 activations_loader=self._iterate_filtered_activations_v2(),
                 mix_fraction=self.activations_mixing_fraction,
                 generator=self._mixing_generator,
+                state=self._mixing_state,
+                synchronize_batch_count=(
+                    self._synchronized_serving_batches
+                    if getattr(self, "_synchronize_buffer_batches", False) else None
+                ),
             )
         return mixing_buffer(
             buffer_size=self.n_batches_in_buffer * self.training_context_size,
@@ -2138,7 +2182,17 @@ class ActivationsStore:
             activations_loader=self._iterate_filtered_activations(),
             mix_fraction=self.activations_mixing_fraction,
             generator=self._mixing_generator,
+            state=self._mixing_state,
         )
+
+    def _synchronized_serving_batches(self, count: int) -> int:
+        from sae_lens.distributed_v2 import get_sae_runtime
+
+        runtime = get_sae_runtime()
+        assert runtime is not None and runtime.training_group is not None
+        value = torch.tensor(count, dtype=torch.int64, device=self.device)
+        dist.all_reduce(value, op=dist.ReduceOp.MIN, group=runtime.training_group)
+        return int(value.item())
 
     def next_batch(self) -> torch.Tensor:
         """Get next batch, updating buffer if needed."""
@@ -2146,10 +2200,17 @@ class ActivationsStore:
 
     # ActivationsStore should be an iterator
     def __next__(self) -> torch.Tensor:
+        from sae_lens.distributed_v2 import get_sae_runtime
+
+        monitor = getattr(get_sae_runtime(), "failure_monitor", None)
+        if monitor is not None:
+            monitor.check()
         if self._dataloader is None:
             self._dataloader = self.get_data_loader()
         self._reset_current_data_timing()
         batch = next(self._dataloader)
+        if monitor is not None:
+            monitor.check()
         self._last_data_timing = dict(self._current_data_timing)
         return batch
 
@@ -2169,8 +2230,52 @@ class ActivationsStore:
         checkpoint_path.mkdir(parents=True, exist_ok=True)
         self.save(str(checkpoint_path / ACTIVATIONS_STORE_STATE_FILENAME))
 
+    def save_runtime_checkpoint(self, checkpoint_path: str | Path):
+        """Persist each rank's pending mixed activations and exact sequence cursor."""
+        from torch.utils._pytree import tree_map
+
+        checkpoint_path = Path(checkpoint_path)
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
+        state = {
+            "mixing": self._mixing_state,
+            "generator": self._mixing_generator.get_state() if self._mixing_generator is not None else torch.get_rng_state(),
+            "sequences_consumed": self._n_sequences_consumed,
+            "n_dataset_processed": self.n_dataset_processed,
+            "cached_row_idx": getattr(self, "current_row_idx", None),
+        }
+        torch.save(
+            tree_map(lambda x: x.detach().cpu() if isinstance(x, torch.Tensor) else x, state),
+            checkpoint_path / f"activation_stream_rank{dist.get_rank()}.pt",
+        )
+
     def load_from_checkpoint(self, checkpoint_path: str | Path):
         """Load the state dict from a checkpoint path"""
+        stream_path = Path(checkpoint_path) / f"activation_stream_rank{dist.get_rank() if dist.is_initialized() else 0}.pt"
+        if stream_path.exists():
+            from torch.utils._pytree import tree_map
+
+            state = torch.load(stream_path, map_location="cpu", weights_only=True)
+            if not self._consumer_only:
+                target = state["sequences_consumed"]
+                while self._n_sequences_consumed < target:
+                    try:
+                        next(self.iterable_sequences)
+                    except StopIteration:
+                        self.iterable_sequences = self._iterate_tokenized_sequences()
+                        next(self.iterable_sequences)
+                    self._n_sequences_consumed += 1
+            self.n_dataset_processed = state["n_dataset_processed"]
+            if state.get("cached_row_idx") is not None:
+                self.current_row_idx = state["cached_row_idx"]
+            self._mixing_state = tree_map(
+                lambda x: x.to(self.device) if isinstance(x, torch.Tensor) else x,
+                state["mixing"],
+            )
+            if self._mixing_generator is None:
+                self._mixing_generator = torch.Generator()
+            self._mixing_generator.set_state(state["generator"])
+            self._dataloader = None
+            return
         self.load(str(Path(checkpoint_path) / ACTIVATIONS_STORE_STATE_FILENAME))
 
     def load(self, file_path: str):

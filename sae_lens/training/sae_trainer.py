@@ -35,6 +35,7 @@ from sae_lens.constants import (
     TRAINER_STATE_FILENAME,
 )
 from sae_lens.profiling import nccl_nvtx_range
+from sae_lens.sae_runtime import SAERuntime
 from sae_lens.saes.sae import (
     T_TRAINING_SAE,
     T_TRAINING_SAE_CONFIG,
@@ -53,6 +54,19 @@ from sae_lens.training.ddp_zero_optimizer import (
     set_optimizer_parameter_state,
 )
 from sae_lens.training.optim import CoefficientScheduler, get_lr_scheduler
+from sae_lens.training.optimizer_checkpoint import (
+    load_parameter_groups,
+    restore_legacy_learning_rates,
+    save_parameter_groups,
+)
+from sae_lens.training.runtime_checkpoint import (
+    checkpoint_token_count,
+    configure_runtime_checkpoints,
+    load_runtime_trainer_state,
+    runtime_checkpoint_name,
+    save_runtime_trainer_state,
+)
+from sae_lens.training.sae_train_unit import SAETrainUnit
 from sae_lens.training.step_window_profiler import StepWindowProfiler
 from sae_lens.training.tp_checkpoint import (
     gather_tp_state_dict_to_root_cpu,
@@ -147,7 +161,17 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         token_count_weighted_dp: bool = False,
         base_sae: T_TRAINING_SAE | None = None,
         append_logs: bool = False,
+        runtime: SAERuntime | None = None,
     ) -> None:
+        self.runtime = runtime
+        self.unit: SAETrainUnit | None = None
+        if runtime is not None:
+            context = runtime.require_local()
+            if dp_group is not None and dp_group is not context.dp_group:
+                raise ValueError("Trainer DP group differs from the SAE runtime")
+            dp_group = context.dp_group
+            if getattr(cfg, "ddp_zero_optimizer", False):
+                raise ValueError("SAE runtime currently supports synchronous unsharded Adam only")
         self.sae = sae
         # base_sae is the unwrapped module when sae is an FSDP/DDP wrapper.
         # Defaults to sae itself in manual mode.
@@ -281,6 +305,17 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             ddp_enabled=self._is_ddp,
             dp_group=self.dp_group,
         )
+        if runtime is not None:
+            hooks = runtime.require_local().domain.hooks
+            self.unit = SAETrainUnit(
+                hooks[0] if hooks else "sae", self._base_sae, self.sae,
+                self.optimizer, runtime,
+            )
+            batch_total = torch.tensor(cfg.train_batch_size_samples, device=cfg.device, dtype=torch.int64)
+            if runtime.require_local().dp_group.size() > 1:
+                dist.all_reduce(batch_total, group=runtime.require_local().dp_group)
+            self._progress_batch_total = int(batch_total.item())
+            configure_runtime_checkpoints(self)
         assert cfg.lr_end is not None  # this is set in config post-init
         self.lr_scheduler = get_lr_scheduler(
             cfg.lr_scheduler_name,
@@ -303,12 +338,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
         # Setup autocast if using
         self.grad_scaler = torch.amp.GradScaler(
-            device=self.cfg.device, enabled=self.cfg.autocast
+            device=torch.device(self.cfg.device).type, enabled=self.cfg.autocast
         )
 
         if self.cfg.autocast:
             self.autocast_if_enabled = torch.autocast(
-                device_type=self.cfg.device,
+                device_type=torch.device(self.cfg.device).type,
                 dtype=torch.bfloat16,
                 enabled=self.cfg.autocast,
             )
@@ -431,7 +466,6 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             transfer_time_s = data_timing["transfer_time_s"]
             if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
                 _debug_prefix_tp(f"trainer next() done batch={tuple(batch.shape)}")
-            self.n_training_samples += batch.shape[0]
             after_data_fetch_mem = self._phase_memory_stats(
                 "after_data_fetch", peak=True
             )
@@ -445,6 +479,14 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             step_output, _dp_allreduce_time_s, memory_stats = self._train_step(
                 sae=self.sae, sae_in=scaled_batch
             )
+            if self.unit and self.token_count_weighted_dp:
+                count, self._token_count_remainder = divmod(
+                    self._last_global_tokens * self.cfg.train_batch_size_samples + getattr(self, "_token_count_remainder", 0),
+                    self._progress_batch_total,
+                )
+                self.n_training_samples += count
+            else:
+                self.n_training_samples += batch.shape[0]
             memory_stats = {**after_data_fetch_mem, **after_scale_mem, **memory_stats}
             self._maybe_synchronize_timing()
             sae_time_s = time.perf_counter() - sae_t0
@@ -462,8 +504,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             )
             self._record_memory_if_needed(memory_stats)
             self._maybe_stop_memory_timeline()
-            self._checkpoint_if_needed()
             self.n_training_steps += 1
+            self._checkpoint_if_needed()
             self._update_pbar(step_output, pbar)
 
             # Closed after per-step logging/checkpointing so the window covers
@@ -511,6 +553,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         checkpoint_name: str,
         wandb_aliases: list[str] | None = None,
     ) -> None:
+        checkpoint_name = runtime_checkpoint_name(self, checkpoint_name)
         # With TP, all ranks in DP replica 0 must participate in the save collectives,
         # but only TP rank 0 writes files. FSDP state-dict collectives require all
         # FSDP DP ranks to enter this method.
@@ -520,6 +563,13 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         if is_zero_optimizer(self.optimizer):
             consolidate_optimizer_state(self.optimizer, to=0)
         if dp_rank != 0 and not self._is_fsdp:
+            if self.unit:
+                base = self._checkpoint_base_path(checkpoint_name)
+                if base is not None:
+                    save_runtime_trainer_state(self, Path(base) / checkpoint_name)
+                    if self.save_checkpoint_fn is not None:
+                        self.save_checkpoint_fn(checkpoint_path=Path(base) / checkpoint_name)
+                    dist.barrier(group=self.unit.parallel_context.training_group)
             return
         checkpoint_path = None
         checkpoint_base_path = self._checkpoint_base_path(checkpoint_name)
@@ -535,7 +585,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                     save_file({"sparsity": self.log_feature_sparsity}, sparsity_path)
 
                 self.save_trainer_state(checkpoint_path)
-                if dp_rank == 0 and tp_rank == 0:
+                if dp_rank == 0 and tp_rank == 0 and self.unit is None:
                     _write_checkpoint_complete_marker(checkpoint_path)
 
                 if self.cfg.logger.log_to_wandb and dp_rank == 0 and tp_rank == 0:
@@ -547,8 +597,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                         wandb_aliases=wandb_aliases,
                     )
 
-        if self.save_checkpoint_fn is not None and tp_rank == 0:
+        if self.save_checkpoint_fn is not None and (tp_rank == 0 or self.unit):
             self.save_checkpoint_fn(checkpoint_path=checkpoint_path)
+        if self.unit and checkpoint_path is not None:
+            dist.barrier(group=self.unit.parallel_context.training_group)
+            if tp_rank == 0:
+                _write_checkpoint_complete_marker(checkpoint_path)
 
     def _checkpoint_base_path(self, checkpoint_name: str) -> str | None:
         if (
@@ -608,6 +662,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
     def save_trainer_state(self, checkpoint_path: Path) -> None:
         checkpoint_path.mkdir(exist_ok=True, parents=True)
+        save_runtime_trainer_state(self, checkpoint_path)
         scheduler_state_dicts = {
             name: scheduler.state_dict()
             for name, scheduler in self.coefficient_schedulers.items()
@@ -640,7 +695,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             {
                 **optimizer_state,
                 "lr_scheduler": self.lr_scheduler.state_dict(),
+                "optimizer_param_groups": save_parameter_groups(
+                    self.optimizer, self._base_sae.named_parameters()
+                ),
+                "grad_scaler": self.grad_scaler.state_dict(),
                 "n_training_samples": self.n_training_samples,
+                "token_count_remainder": getattr(self, "_token_count_remainder", 0),
                 "n_training_steps": self.n_training_steps,
                 "act_freq_scores": self.act_freq_scores,
                 "n_forward_passes_since_fired": self.n_forward_passes_since_fired,
@@ -696,7 +756,17 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             else:
                 self.optimizer.load_state_dict(state_dict["optimizer"])
             self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
+            if "optimizer_param_groups" in state_dict:
+                load_parameter_groups(
+                    self.optimizer, self._base_sae.named_parameters(),
+                    state_dict["optimizer_param_groups"],
+                )
+            else:
+                restore_legacy_learning_rates(self.optimizer, self.lr_scheduler)
+            if state_dict.get("grad_scaler"):
+                self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
         self.n_training_samples = state_dict["n_training_samples"]
+        self._token_count_remainder = state_dict.get("token_count_remainder", 0)
         self.n_training_steps = state_dict["n_training_steps"]
         self.act_freq_scores = state_dict["act_freq_scores"].to(self.cfg.device)
         self.n_forward_passes_since_fired = state_dict[
@@ -708,6 +778,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             self.coefficient_schedulers[name].load_state_dict(scheduler_state_dict)
         if "elapsed_s" in state_dict:
             self._t_ready = time.time() - state_dict["elapsed_s"]
+        if not skip_optimizer:
+            load_runtime_trainer_state(self, checkpoint_path)
 
     def _fsdp_optimizer_state_path(self, checkpoint_path: Path) -> Path:
         dp_rank = dist.get_rank(self.dp_group) if self.dp_group is not None else 0
@@ -837,8 +909,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 wandb.log(sparsity_log_dict, step=self.n_training_steps)
             self._reset_running_sparsity_stats()
 
+        local_empty = self.unit is not None and sae_in.shape[0] == 0
+        forward_input = (
+            sae_in.new_zeros((1, sae_in.shape[-1])) if local_empty else sae_in
+        )
         step_input = TrainStepInput(
-            sae_in=sae_in,
+            sae_in=forward_input,
             dead_neuron_mask=self.dead_neurons,
             coefficients=self.get_coefficients(),
             n_training_steps=self.n_training_steps,
@@ -865,7 +941,10 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 else contextlib.nullcontext()
             )
             with fsdp_forward_context:
-                train_step_output = self.sae(step_input)  # type: ignore[arg-type]
+                train_step_output = (
+                    self.unit.forward(step_input) if self.unit
+                    else self.sae(step_input)  # type: ignore[arg-type]
+                )
 
         if self._profile_memory:
             _peak_fwd_alloc = torch.cuda.max_memory_allocated(self._base_sae.device) / 1024**2
@@ -874,10 +953,14 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
         with torch.no_grad():
             # calling .bool() should be equivalent to .abs() > 0, and work with coo tensors
-            firing_feats = train_step_output.feature_acts.bool().float()
-            did_fire = firing_feats.sum(-2).bool()
-            if did_fire.is_sparse:
-                did_fire = did_fire.to_dense()
+            feature_acts = train_step_output.feature_acts
+            if local_empty:
+                firing_counts = torch.zeros_like(self.act_freq_scores)
+            else:
+                firing_counts = feature_acts.bool().float().sum(0)
+                if firing_counts.is_sparse:
+                    firing_counts = firing_counts.to_dense()
+            did_fire = firing_counts.bool()
             # Sync did_fire across DP replicas: a feature counts as fired if any replica saw it.
             if self.dp_group is not None:
                 did_fire_int = did_fire.to(torch.int32)
@@ -893,13 +976,17 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 did_fire = did_fire_int.bool()
             self.n_forward_passes_since_fired += 1
             self.n_forward_passes_since_fired[did_fire] = 0
-            self.act_freq_scores += firing_feats.sum(0)
-            self.n_frac_active_samples += self.cfg.train_batch_size_samples
+            self.act_freq_scores += firing_counts
+            self.n_frac_active_samples += (
+                sae_in.shape[0] if self.unit else self.cfg.train_batch_size_samples
+            )
         if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
             _debug_prefix_tp("train_step forward done")
 
         # Grad scaler will rescale gradients if autocast is enabled
         loss = train_step_output.loss
+        empty_global_batch = local_empty
+        self._last_global_tokens = int(sae_in.shape[0])
         if self._is_ddp and self.dp_group is not None and self.token_count_weighted_dp:
             local_tokens = float(sae_in.shape[0])
             tokens_t = torch.tensor(local_tokens, device=loss.device)
@@ -908,7 +995,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             ):
                 dist.all_reduce(tokens_t, op=dist.ReduceOp.SUM, group=self.dp_group)
             dp_size = dist.get_world_size(self.dp_group)
-            loss = loss * (local_tokens * dp_size / tokens_t.item())
+            total_tokens = tokens_t.item()
+            self._last_global_tokens = int(total_tokens)
+            empty_global_batch = self.unit is not None and total_tokens == 0
+            loss = loss * (local_tokens * dp_size / max(total_tokens, 1.0))
+        elif local_empty:
+            loss = loss * 0.0
 
         backward_context = (
             nccl_nvtx_range(f"nccl:sae_{self.sae_dp_mode}_backward", self.dp_group)
@@ -916,9 +1008,19 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             else contextlib.nullcontext()
         )
         with backward_context:
-            self.grad_scaler.scale(loss).backward()  # loss.backward() if not autocasting
+            if self.unit:
+                self.unit.backward(loss, self.grad_scaler)
+            else:
+                self.grad_scaler.scale(loss).backward()
         if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
             _debug_prefix_tp("backward done")
+        if empty_global_batch:
+            # Complete DDP's backward lifecycle, but do not decay Adam moments
+            # or update parameters when no replica has a training token.
+            if self.unit:
+                self.unit.finish_grad_sync()
+            self.optimizer.zero_grad(set_to_none=True)
+            return train_step_output, 0.0, {}
         self.grad_scaler.unscale_(self.optimizer)  # needed to clip correctly
 
         if self._is_fsdp or self._is_ddp:
@@ -964,18 +1066,26 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                     g.copy_(flat[offset : offset + numel].view_as(g))
                     offset += numel
 
-        self._base_sae.sync_tensor_parallel_gradients()
+        if self.unit:
+            self.unit.finish_grad_sync()
+        else:
+            self._base_sae.sync_tensor_parallel_gradients()
         if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
             _debug_prefix_tp("grad sync done")
         # In FSDP mode pass dp_group so the norm all-reduce covers the DP shard dimension.
         dp_group_for_clip = self.dp_group if self._is_fsdp else None
-        self._base_sae.clip_grad_norm_(1.0, dp_group=dp_group_for_clip)
+        if self.unit:
+            self.unit.clip_grad_norm(1.0)
+        else:
+            self._base_sae.clip_grad_norm_(1.0, dp_group=dp_group_for_clip)
 
         if self._profile_memory:
             _peak_bwd_alloc = torch.cuda.max_memory_allocated(self._base_sae.device) / 1024**2
             _peak_bwd_res = torch.cuda.max_memory_reserved(self._base_sae.device) / 1024**2
             torch.cuda.reset_peak_memory_stats(self._base_sae.device)
 
+        if self.unit:
+            self.unit.check_failure()
         self.grad_scaler.step(
             self.optimizer
         )  # just ctx.optimizer.step() if not autocasting
@@ -1322,7 +1432,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
     def _checkpoint_if_needed(self):
         if (
             self.checkpoint_thresholds
-            and self.n_training_samples > self.checkpoint_thresholds[0]
+            and checkpoint_token_count(self) > self.checkpoint_thresholds[0]
         ):
             self.save_checkpoint(checkpoint_name=str(self.n_training_samples))
             self.checkpoint_thresholds.pop(0)

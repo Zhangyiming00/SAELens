@@ -24,8 +24,10 @@ import torch.distributed as dist
 from sae_lens.megatron_tp import (
     megatron_tp_allgather,
 )
+from sae_lens.sae_runtime import SAERuntime, SAETrainingDomain
 
 # Module-level state for prefix-overlap training.
+_sae_runtime: SAERuntime | None = None
 _sae_tp_group: dist.ProcessGroup | None = None
 _sae_tp_cpu_group: dist.ProcessGroup | None = None  # Gloo twin used only for CPU checkpoint/export
 _sae_dp_group: dist.ProcessGroup | None = None
@@ -189,25 +191,6 @@ def init_distributed(
                 _worker_group = group
                 _worker_cpu_group = cpu_group
 
-        # SAE TP group for each SAE replica (cluster).
-        # Create a same-membership Gloo twin for CPU checkpoint/export. All
-        # global ranks must call new_group() in the same order.
-        for cc in range(sae_dp_size):
-            base = cc * block
-            sae_ranks = list(range(base, base + sae_tp_size))
-            group = dist.new_group(sae_ranks)
-            cpu_group = dist.new_group(sae_ranks, backend="gloo")
-            if _sae_active and _sae_dp_rank == cc:
-                _sae_tp_group = group
-                _sae_tp_cpu_group = cpu_group
-
-        # SAE DP group: same sae_tp_rank across all clusters.
-        for sae_tp_r in range(sae_tp_size):
-            dp_ranks = [cc * block + sae_tp_r for cc in range(sae_dp_size)]
-            group = dist.new_group(dp_ranks)
-            if _sae_active and _sae_tp_rank == sae_tp_r:
-                _sae_dp_group = group
-
         # Dedicated Gloo group for vLLM DP P2P activation transfer.
         # Keep this path off NCCL entirely: vLLM's parallel-state setup can
         # leave additional NCCL P2P communicators in an invalid device state.
@@ -237,17 +220,6 @@ def init_distributed(
                 _worker_group = group
                 _worker_cpu_group = cpu_group
 
-        # SAE TP group: prefix [0, sae_tp_size) inside each replica.
-        # Keep the NCCL training group and a same-membership Gloo export group.
-        for replica_r in range(sae_dp_size):
-            base = replica_r * replica_size
-            ranks = list(range(base, base + sae_tp_size))
-            group = dist.new_group(ranks)
-            cpu_group = dist.new_group(ranks, backend="gloo")
-            if _sae_dp_rank == replica_r and _sae_active:
-                _sae_tp_group = group
-                _sae_tp_cpu_group = cpu_group
-
         # vLLM TP group: prefix [0, vllm_tp_size) inside each replica.
         for replica_r in range(sae_dp_size):
             base = replica_r * replica_size
@@ -256,12 +228,23 @@ def init_distributed(
             if _sae_dp_rank == replica_r and _vllm_active:
                 _vllm_tp_group = group
 
-        # SAE DP group: same local SAE rank across replicas.
-        for sae_tp_r in range(sae_tp_size):
-            ranks = [replica_r * replica_size + sae_tp_r for replica_r in range(sae_dp_size)]
-            group = dist.new_group(ranks)
-            if _sae_active and _sae_tp_rank == sae_tp_r:
-                _sae_dp_group = group
+    # Legacy producer layouts only select the SAE training domain. Megatron
+    # owns TP/DP construction, exactly as in the shard-routing entry.
+    stride = block if fan_in_topology else replica_size
+    training_ranks = tuple(
+        replica * stride + t for replica in range(sae_dp_size) for t in range(sae_tp_size)
+    )
+    global _sae_runtime
+    _sae_runtime = SAERuntime((SAETrainingDomain("sae", training_ranks, sae_tp_size),))
+    if _sae_runtime.local is not None:
+        context = _sae_runtime.require_local()
+        _sae_tp_group = context.tp_group
+        _sae_tp_cpu_group = context.tp_cpu_group
+        _sae_dp_group = context.dp_group
+        _sae_tp_rank = context.tp_rank
+        _sae_dp_rank = context.dp_rank
+    else:
+        _sae_tp_group = _sae_tp_cpu_group = _sae_dp_group = None
 
 
 def get_worker_group() -> dist.ProcessGroup | None:

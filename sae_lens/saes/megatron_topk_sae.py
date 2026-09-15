@@ -23,6 +23,7 @@ from sae_lens.megatron_tp import (
     megatron_tp_allgather,
     require_megatron_core,
 )
+from sae_lens.sae_runtime import SAERuntime
 from sae_lens.saes.sae import TrainingSAE, TrainStepInput
 from sae_lens.saes.topk_sae import (
     SparseHookPoint,
@@ -54,8 +55,14 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         use_error_term: bool = False,
         *,
         tp_group: dist.ProcessGroup | None = None,
+        runtime: SAERuntime | None = None,
     ):
         require_megatron_core()
+        if runtime is not None:
+            runtime_group = runtime.require_local().tp_group
+            if tp_group is not None and tp_group is not runtime_group:
+                raise ValueError("Explicit TP group differs from the SAE runtime")
+            tp_group = runtime_group
         if tp_group is None:
             raise ValueError(
                 "MegatronTopKSAE requires an explicit TP group, including a singleton group for TP1"
@@ -69,6 +76,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             raise ValueError("TopK requires d_in >= 2 and 0 < k <= d_sae")
         super().__init__(copy.deepcopy(cfg), use_error_term)
         self._tp_group = tp_group
+        self.parallel_context = runtime
         self.hook_sae_acts_post = SparseHookPoint(self.cfg.d_sae)
         self.setup()
 

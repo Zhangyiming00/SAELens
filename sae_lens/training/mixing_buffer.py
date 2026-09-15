@@ -1,4 +1,4 @@
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import torch
 
@@ -41,6 +41,8 @@ def mixing_buffer(
     mix_fraction: float = 0.5,
     generator: torch.Generator | None = None,
     shuffle: bool | None = None,
+    state: dict | None = None,
+    synchronize_batch_count: Callable[[int], int] | None = None,
 ) -> Iterator[ActivationBatch]:
     """
     A generator that maintains a mix of old and new activations for better training.
@@ -65,7 +67,15 @@ def mixing_buffer(
     if not 0 <= mix_fraction <= 1:
         raise ValueError("mix_fraction must be in [0, 1]")
 
-    storage_buffer: ActivationBatch | None = None
+    state = {} if state is None else state
+    storage_buffer: ActivationBatch | None = state.get("storage")
+    pending = state.get("serving")
+    if pending is not None:
+        for offset in range(0, _batch_len(pending), batch_size):
+            state["serving"] = _index_batch(pending, slice(offset + batch_size, None))
+            yield _index_batch(pending, slice(offset, offset + batch_size))
+    if state.get("exhausted", False):
+        return
 
     for new_activations in activations_loader:
         # The concat, shuffle and slicing below are the buffer's own GPU work.
@@ -78,7 +88,17 @@ def mixing_buffer(
                 else _cat_batches(storage_buffer, new_activations)
             )
 
-        if _batch_len(storage_buffer) >= buffer_size:
+        ready = _batch_len(storage_buffer) >= buffer_size
+        keep_for_mixing = int(buffer_size * mix_fraction)
+        num_serving_batches = (
+            max(1, (_batch_len(storage_buffer) - keep_for_mixing) // batch_size)
+            if ready else 0
+        )
+        if synchronize_batch_count is not None:
+            # Uneven DP batches must refill together. Agree before shuffling,
+            # including when this rank has not accumulated a full buffer yet.
+            num_serving_batches = synchronize_batch_count(num_serving_batches)
+        if num_serving_batches:
             with cuda_nvtx_range("mixing_buffer:shuffle"):
                 should_shuffle = mix_fraction > 0 if shuffle is None else shuffle
                 if should_shuffle:
@@ -88,9 +108,6 @@ def mixing_buffer(
                     storage_buffer = _index_batch(storage_buffer, perm)
 
                 # Keep a fixed amount for mixing, serve the rest
-                keep_for_mixing = int(buffer_size * mix_fraction)
-                num_to_serve = _batch_len(storage_buffer) - keep_for_mixing
-                num_serving_batches = max(1, num_to_serve // batch_size)
                 serving_cutoff = num_serving_batches * batch_size
                 serving_buffer = _index_batch(storage_buffer, slice(0, serving_cutoff))
                 storage_buffer = _index_batch(
@@ -99,6 +116,8 @@ def mixing_buffer(
 
             # Yield batches from the serving_buffer
             for batch_idx in range(num_serving_batches):
+                state["storage"] = storage_buffer
+                state["serving"] = _index_batch(serving_buffer, slice((batch_idx + 1) * batch_size, None))
                 yield _index_batch(
                     serving_buffer,
                     slice(batch_idx * batch_size, (batch_idx + 1) * batch_size),
@@ -107,5 +126,8 @@ def mixing_buffer(
     # If there are any remaining activations, yield them
     if storage_buffer is not None:
         remaining_batches = _batch_len(storage_buffer) // batch_size
+        state["storage"] = None
+        state["exhausted"] = True
         for i in range(remaining_batches):
+            state["serving"] = _index_batch(storage_buffer, slice((i + 1) * batch_size, remaining_batches * batch_size))
             yield _index_batch(storage_buffer, slice(i * batch_size, (i + 1) * batch_size))

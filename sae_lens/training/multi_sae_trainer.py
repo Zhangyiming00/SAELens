@@ -38,6 +38,7 @@ from sae_lens.constants import (
     TRAINER_STATE_FILENAME,
 )
 from sae_lens.profiling import cuda_nvtx_range, nccl_nvtx_range
+from sae_lens.sae_runtime import SAERuntime
 from sae_lens.saes.sae import TrainingSAE, TrainStepInput, TrainStepOutput
 from sae_lens.saes.topk_sae import TopKTrainingSAE
 from sae_lens.training.activation_scaler import ActivationScaler
@@ -57,6 +58,20 @@ from sae_lens.training.ddp_zero_optimizer import (
 )
 from sae_lens.training.multi_hook_sae import MultiHookSAE
 from sae_lens.training.optim import get_lr_scheduler
+from sae_lens.training.optimizer_checkpoint import (
+    UnitLRSchedulers,
+    load_parameter_groups,
+    restore_legacy_learning_rates,
+    save_parameter_groups,
+)
+from sae_lens.training.runtime_checkpoint import (
+    checkpoint_token_count,
+    configure_runtime_checkpoints,
+    load_runtime_trainer_state,
+    runtime_checkpoint_name,
+    save_runtime_trainer_state,
+)
+from sae_lens.training.sae_train_unit import SAETrainUnit, UnitOptimizers
 from sae_lens.training.sae_trainer import (
     SaveCheckpointFn,
     _log_feature_sparsity,
@@ -108,7 +123,25 @@ class MultiSAETrainer:
         seed_mode: str = "same",
         append_logs: bool = False,
         multi_hook_sae: Any | None = None,
+        runtime: SAERuntime | None = None,
     ) -> None:
+        self.runtime = runtime
+        self.units: dict[str, SAETrainUnit] = {}
+        if runtime is not None:
+            context = runtime.require_local()
+            if context.domain.hooks and tuple(hook_names) != context.domain.hooks:
+                raise ValueError("Trainer hooks must follow the runtime's local hook order")
+            if dp_group is not None and dp_group is not context.dp_group:
+                raise ValueError("Trainer DP group differs from the SAE runtime")
+            dp_group = context.dp_group
+            if sae_dp_mode != "ddp" or multi_hook_sae is not None:
+                raise ValueError("SAE runtime requires an independent DDP wrapper per hook")
+            if (
+                getattr(cfg, "multi_sae_optimizer_overlap", "off") != "off"
+                or os.environ.get("SAE_DDP_OPT_OVERLAP_V2", "0") == "1"
+                or getattr(cfg, "ddp_zero_optimizer", False)
+            ):
+                raise ValueError("SAE runtime currently supports synchronous unsharded Adam only")
         self.hook_names = hook_names
         self.multi_hook_sae = multi_hook_sae
         self.sae_by_hook = sae_by_hook
@@ -137,6 +170,10 @@ class MultiSAETrainer:
         self.stats_sync_interval: int = int(
             getattr(cfg, "multi_sae_stats_sync_interval", 1)
         )
+        if runtime is not None:
+            self.multi_sae_distributed_architecture = "legacy_per_hook_wrapper"
+            self.backward_mode = "sequential"
+            self.backward_order = "forward"
         self._is_fsdp = sae_dp_mode == "fsdp"
         self._is_ddp = sae_dp_mode == "ddp"
         if not (self._is_fsdp or self._is_ddp):
@@ -197,13 +234,26 @@ class MultiSAETrainer:
         elif _adam_impl == "forloop":
             _adam_kwargs["foreach"] = False
         use_zero_optimizer = bool(getattr(cfg, "ddp_zero_optimizer", False))
-        self.optimizer = build_adam_optimizer(
-            params,
-            adam_kwargs=_adam_kwargs,
-            zero_redundancy=use_zero_optimizer,
-            ddp_enabled=self._is_ddp,
-            dp_group=self.dp_group,
-        )
+        if runtime is not None:
+            for hook_name in self.hook_names:
+                model = self.base_sae_by_hook[hook_name]
+                optimizer = build_adam_optimizer(
+                    model.parameters(), adam_kwargs=_adam_kwargs,
+                    zero_redundancy=False, ddp_enabled=self._is_ddp,
+                    dp_group=self.dp_group,
+                )
+                self.units[hook_name] = SAETrainUnit(
+                    hook_name, model, self.sae_by_hook[hook_name], optimizer, runtime
+                )
+            self.optimizer = UnitOptimizers(self.units)
+        else:
+            self.optimizer = build_adam_optimizer(
+                params,
+                adam_kwargs=_adam_kwargs,
+                zero_redundancy=use_zero_optimizer,
+                ddp_enabled=self._is_ddp,
+                dp_group=self.dp_group,
+            )
 
         # Experimental per-hook DP-reduction -> optimizer overlap.  The raw
         # MultiHookSAE remains the state-dict owner, while each child executes
@@ -340,9 +390,8 @@ class MultiSAETrainer:
                     max_numel=max(replicated_sizes, default=1),
                     output_path=getattr(cfg, "output_path", None),
                 )
-        self.lr_scheduler = get_lr_scheduler(
+        scheduler_kwargs = dict(
             scheduler_name=cfg.lr_scheduler_name,
-            optimizer=self.optimizer,
             training_steps=cfg.total_training_steps,
             lr=cfg.lr,
             warm_up_steps=cfg.lr_warm_up_steps,
@@ -350,6 +399,17 @@ class MultiSAETrainer:
             lr_end=cfg.lr_end,
             num_cycles=cfg.n_restart_cycles,
         )
+        self.lr_scheduler = (
+            UnitLRSchedulers({
+                hook: get_lr_scheduler(optimizer=unit.optimizer, **scheduler_kwargs)
+                for hook, unit in self.units.items()
+            }) if self.units else get_lr_scheduler(optimizer=self.optimizer, **scheduler_kwargs)
+        )
+        if self.units:
+            batch_total = torch.tensor(cfg.train_batch_size_samples, device=cfg.device, dtype=torch.int64)
+            if self._dp_world_size() > 1:
+                dist.all_reduce(batch_total, group=self.dp_group)
+            self._progress_batch_total = int(batch_total.item())
         self.grad_scaler = torch.amp.GradScaler(
             "cuda",
             enabled=cfg.autocast and torch.cuda.is_available(),
@@ -429,6 +489,7 @@ class MultiSAETrainer:
                 )
             )[1:]
 
+        configure_runtime_checkpoints(self)
         should_write_logs = self._is_metric_writer_rank()
         if (
             should_write_logs
@@ -752,14 +813,6 @@ class MultiSAETrainer:
             self._memory_current_scaled_batch_by_hook = scaled_batch_by_hook
             self._record_memory_phase("after_scale_to_device")
             previous_samples = self.n_training_samples
-            if getattr(self.data_provider, "tracks_global_progress", False):
-                self.n_training_samples = int(
-                    self.data_provider.global_tokens_consumed
-                )
-            else:
-                self.n_training_samples += local_n
-            progress_samples = self.n_training_samples - previous_samples
-
             self._maybe_synchronize_timing()
             sae_t0 = time.perf_counter()
             self._memory_retained_outputs = self._memory_current_outputs
@@ -768,6 +821,17 @@ class MultiSAETrainer:
                 torch.cuda.reset_peak_memory_stats(self.cfg.device)
             with cuda_nvtx_range("multi_sae:train_step"):
                 outputs, sae_phase_timing = self._train_step(scaled_batch_by_hook, local_n)
+            if getattr(self.data_provider, "tracks_global_progress", False):
+                self.n_training_samples = int(self.data_provider.global_tokens_consumed)
+            elif self.units and self.token_count_weighted_dp:
+                count, self._token_count_remainder = divmod(
+                    self._last_global_tokens * self.cfg.train_batch_size_samples + getattr(self, "_token_count_remainder", 0),
+                    self._progress_batch_total,
+                )
+                self.n_training_samples += count
+            else:
+                self.n_training_samples += local_n
+            progress_samples = self.n_training_samples - previous_samples
             self._memory_current_outputs = outputs
             self._maybe_synchronize_timing()
             sae_time_s = time.perf_counter() - sae_t0
@@ -793,7 +857,8 @@ class MultiSAETrainer:
             self._record_memory_if_needed(memory_stats)
             self._maybe_stop_memory_timeline()
             self.n_training_steps += 1
-            self.lr_scheduler.step()
+            if self._last_step_had_tokens:
+                self.lr_scheduler.step()
             self._checkpoint_if_needed()
             pbar.update(progress_samples)
             if self.n_training_steps % 8 == 0 and outputs:
@@ -857,6 +922,8 @@ class MultiSAETrainer:
         batch_by_hook: dict[str, torch.Tensor],
         local_n: int,
     ) -> tuple[dict[str, TrainStepOutput], dict[str, float]]:
+        if self.units and set(batch_by_hook) != set(self.units):
+            raise ValueError("Every synchronous step must contain exactly the local SAE hooks")
         self._validate_unified_hook_set(batch_by_hook)
         if self.multi_sae_distributed_architecture == "unified_multi_hook":
             assert self.multi_hook_sae is not None
@@ -885,29 +952,34 @@ class MultiSAETrainer:
             "sae_optimizer_time_s": 0.0,
         }
         loss_scale = 1.0
+        global_n = float(local_n)
         if self._is_ddp and self.token_count_weighted_dp:
             local_n_t = torch.tensor(float(local_n), device=self.cfg.device)
             global_n_t = local_n_t.clone()
             self._all_reduce_sum(global_n_t)
             global_n = float(global_n_t.item())
-            if global_n == 0:
-                if self.multi_sae_distributed_architecture == "unified_multi_hook":
-                    self._train_step_unified_zero_backward(batch_by_hook, phase_timing)
-                    return outputs, phase_timing
+            dp_world_size = self._dp_world_size()
+            loss_scale = dp_world_size * float(local_n) / max(global_n, 1.0)
+        self._last_step_had_tokens = global_n > 0
+        self._last_global_tokens = int(global_n)
+        if global_n == 0:
+            if self.multi_sae_distributed_architecture == "unified_multi_hook":
+                self._train_step_unified_zero_backward(batch_by_hook, phase_timing)
+            else:
                 for hook_name in self.hook_names:
-                    dummy = torch.zeros(
-                        1,
-                        self.base_sae_by_hook[hook_name].cfg.d_in,
-                        device=self.cfg.device,
-                        dtype=batch_by_hook[hook_name].dtype,
+                    dummy = batch_by_hook[hook_name].new_zeros(
+                        (1, self.base_sae_by_hook[hook_name].cfg.d_in)
                     )
                     output = self._forward_one(hook_name, dummy)
-                    self.grad_scaler.scale(output.loss * 0.0).backward()
-                self.grad_scaler.unscale_(self.optimizer)
-                self.optimizer.zero_grad(set_to_none=True)
-                return outputs, phase_timing
-            dp_world_size = self._dp_world_size()
-            loss_scale = dp_world_size * float(local_n) / global_n
+                    if self.units:
+                        self.units[hook_name].backward(output.loss * 0.0, self.grad_scaler)
+                        self.units[hook_name].finish_grad_sync()
+                    else:
+                        self.grad_scaler.scale(output.loss * 0.0).backward()
+            # No unscale/step/update: the scaler stays READY and its growth
+            # counter, like Adam moments and LR, does not advance on empty steps.
+            self.optimizer.zero_grad(set_to_none=True)
+            return outputs, phase_timing
         if self._ddp_opt_overlap_v2:
             return self._train_step_ddp_optimizer_overlap_v2(
                 batch_by_hook,
@@ -1162,7 +1234,6 @@ class MultiSAETrainer:
                 overlap_state.wait_for_hook(hook_name)
             torch.cuda.current_stream(torch.device(self.cfg.device)).synchronize()
             overlap_state.finish_step()
-        self.grad_scaler.unscale_(self.optimizer)
         self.optimizer.zero_grad(set_to_none=True)
         for optimizer in self._overlap_optimizer_by_hook.values():
             optimizer.zero_grad(set_to_none=True)
@@ -1191,6 +1262,10 @@ class MultiSAETrainer:
                     output = self._forward_one(hook_name, dummy)
                 phase_timing["sae_forward_time_s"] += time.perf_counter() - t_fwd
                 outputs[hook_name] = output
+                if self.units:
+                    # Empty replicas still enter the same statistics collectives
+                    # as nonempty replicas, without counting the dummy forward.
+                    self._update_stats(hook_name, output, 0)
                 scaled_loss_by_hook[hook_name] = output.loss * 0.0
             else:
                 t_fwd = time.perf_counter()
@@ -1217,7 +1292,10 @@ class MultiSAETrainer:
                 f"nccl:multi_sae_{self.sae_dp_mode}_backward", self.dp_group
             ):
                 with cuda_nvtx_range(f"multi_sae:{hook_name}:backward"):
-                    self.grad_scaler.scale(scaled_loss_by_hook[hook_name]).backward()
+                    if self.units:
+                        self.units[hook_name].backward(scaled_loss_by_hook[hook_name], self.grad_scaler)
+                    else:
+                        self.grad_scaler.scale(scaled_loss_by_hook[hook_name]).backward()
             phase_timing["sae_backward_time_s"] += time.perf_counter() - t_bwd
             self._record_memory_phase(f"after_backward_{sanitize_hook_name_for_path(hook_name)}")
 
@@ -1227,12 +1305,17 @@ class MultiSAETrainer:
         for hook_name in self.hook_names:
             base_sae = self.base_sae_by_hook[hook_name]
             with cuda_nvtx_range(f"multi_sae:{hook_name}:tp_sync"):
-                base_sae.sync_tensor_parallel_gradients()
+                if self.units:
+                    self.units[hook_name].finish_grad_sync()
+                else:
+                    base_sae.sync_tensor_parallel_gradients()
             with cuda_nvtx_range(f"multi_sae:{hook_name}:clip_grad"):
-                base_sae.clip_grad_norm_(
-                    1.0,
-                    dp_group=self.dp_group if self._is_fsdp else None,
-                )
+                if self.units:
+                    self.units[hook_name].clip_grad_norm(1.0)
+                else:
+                    base_sae.clip_grad_norm_(
+                        1.0, dp_group=self.dp_group if self._is_fsdp else None,
+                    )
         phase_timing["sae_post_backward_time_s"] += time.perf_counter() - t_post
         self._record_memory_phase("after_post_backward")
         t_opt = time.perf_counter()
@@ -1478,7 +1561,10 @@ class MultiSAETrainer:
                 else contextlib.nullcontext()
             )
             with context:
-                output = self.sae_by_hook[hook_name](step_input)
+                output = (
+                    self.units[hook_name].forward(step_input)
+                    if self.units else self.sae_by_hook[hook_name](step_input)
+                )
         self._tp_phase_fence_if_needed()
         return output
 
@@ -1502,12 +1588,15 @@ class MultiSAETrainer:
     def _update_stats(
         self, hook_name: str, output: TrainStepOutput, local_n: int
     ) -> None:
-        firing_feats = output.feature_acts.bool().float()
-        did_fire = firing_feats.sum(-2).bool()
-        if did_fire.is_sparse:
-            did_fire = did_fire.to_dense()
+        if local_n == 0:
+            firing_counts = torch.zeros_like(self.act_freq_scores_by_hook[hook_name])
+        else:
+            firing_counts = output.feature_acts.bool().float().sum(0)
+            if firing_counts.is_sparse:
+                firing_counts = firing_counts.to_dense()
+        did_fire = firing_counts.bool()
         did_fire_int = did_fire.to(torch.int32).contiguous()
-        self.act_freq_scores_by_hook[hook_name] += firing_feats.sum(0)
+        self.act_freq_scores_by_hook[hook_name] += firing_counts
         if self.stats_sync_mode == "immediate":
             self._apply_stats_from_global(
                 hook_name=hook_name,
@@ -1616,6 +1705,8 @@ class MultiSAETrainer:
             self._save_one_final(base_output, hook_name)
 
     def _manifest(self, hook_names: list[str] | None = None) -> dict[str, Any]:
+        if hook_names is None and self.runtime is not None:
+            hook_names = [hook for domain in self.runtime.domains for hook in domain.hooks]
         hook_names = self.hook_names if hook_names is None else hook_names
         return {
             "format": "multi_independent_sae_v1",
@@ -1744,6 +1835,7 @@ class MultiSAETrainer:
             self._tp_barrier()
 
     def save_checkpoint(self, checkpoint_name: str) -> None:
+        checkpoint_name = runtime_checkpoint_name(self, checkpoint_name)
         checkpoint_base_path = self._checkpoint_base_path(checkpoint_name)
         if checkpoint_base_path is None:
             return
@@ -1761,11 +1853,14 @@ class MultiSAETrainer:
                 self._save_one_checkpoint_model(checkpoint_path, hook_name)
 
         self.save_trainer_state(checkpoint_path)
+        if self.save_checkpoint_fn is not None and (self.runtime is not None or self._is_metric_writer_rank()):
+            self.save_checkpoint_fn(checkpoint_path=checkpoint_path)
+        if self.runtime is not None:
+            # Publish completion only after every independently placed hook
+            # has persisted its model and optimizer files.
+            dist.barrier(group=self.runtime.training_group)
         if self._is_metric_writer_rank():
             _write_checkpoint_complete_marker(checkpoint_path)
-
-        if self.save_checkpoint_fn is not None and self._is_metric_writer_rank():
-            self.save_checkpoint_fn(checkpoint_path=checkpoint_path)
 
     def _checkpoint_base_path(self, checkpoint_name: str) -> str | None:
         if (
@@ -1823,6 +1918,7 @@ class MultiSAETrainer:
 
     def save_trainer_state(self, checkpoint_path: Path) -> None:
         checkpoint_path.mkdir(exist_ok=True, parents=True)
+        save_runtime_trainer_state(self, checkpoint_path)
         dp_rank = self._dp_rank()
         tp_rank = self._tp_rank()
         dp_size = self._dp_world_size()
@@ -1849,11 +1945,13 @@ class MultiSAETrainer:
             "format": "multi_independent_sae_v1",
             "hook_names": self.hook_names,
             "n_training_samples": self.n_training_samples,
+            "token_count_remainder": getattr(self, "_token_count_remainder", 0),
             "n_training_steps": self.n_training_steps,
             "act_freq_scores_by_hook": self.act_freq_scores_by_hook,
             "n_forward_passes_since_fired_by_hook": self.n_forward_passes_since_fired_by_hook,
             "n_frac_active_samples_by_hook": self.n_frac_active_samples_by_hook,
             "lr_scheduler": self.lr_scheduler.state_dict(),
+            "grad_scaler": self.grad_scaler.state_dict(),
             "sae_dp_mode": self.sae_dp_mode,
             "backward_mode": self.backward_mode,
             "backward_order": self.backward_order,
@@ -1874,6 +1972,14 @@ class MultiSAETrainer:
                     {
                         "hook_name": hook_name,
                         "optimizer_state_format": MULTI_SAE_OPTIMIZER_STATE_FORMAT,
+                        "optimizer_param_groups": save_parameter_groups(
+                            self.units[hook_name].optimizer if self.units else self.optimizer,
+                            self.base_sae_by_hook[hook_name].named_parameters(),
+                        ),
+                        "lr_scheduler": (
+                            self.lr_scheduler.schedulers[hook_name].state_dict()
+                            if self.units else self.lr_scheduler.state_dict()
+                        ),
                         "act_freq_scores": self.act_freq_scores_by_hook[hook_name],
                         "n_forward_passes_since_fired": self.n_forward_passes_since_fired_by_hook[hook_name],
                         "n_frac_active_samples": self.n_frac_active_samples_by_hook[hook_name],
@@ -1920,6 +2026,7 @@ class MultiSAETrainer:
                 "Cannot resume multi-SAE checkpoint with different hook_names"
             )
         self.n_training_samples = int(state["n_training_samples"])
+        self._token_count_remainder = state.get("token_count_remainder", 0)
         self.n_training_steps = int(state["n_training_steps"])
         saved_mode = state.get("sae_dp_mode", "ddp")
         if saved_mode != self.sae_dp_mode:
@@ -1967,10 +2074,30 @@ class MultiSAETrainer:
             self._load_named_optimizer_state(state["optimizer_by_hook_by_name"])
         else:
             self.optimizer.load_state_dict(state["optimizer"])
-        self.lr_scheduler.load_state_dict(state["lr_scheduler"])
+        if self.units and has_local_hook_states:
+            hook_states = {
+                hook: torch.load(path, map_location="cpu")
+                for hook, path in hook_state_paths.items()
+            }
+            if all("lr_scheduler" in s for s in hook_states.values()):
+                for hook, scheduler in self.lr_scheduler.schedulers.items():
+                    scheduler.load_state_dict(hook_states[hook]["lr_scheduler"])
+            else:
+                self.lr_scheduler.load_state_dict(state["lr_scheduler"])
+        else:
+            self.lr_scheduler.load_state_dict(state["lr_scheduler"])
+        restore_legacy_learning_rates(self.optimizer, self.lr_scheduler)
+        if state.get("grad_scaler"):
+            self.grad_scaler.load_state_dict(state["grad_scaler"])
         for hook_name in self.hook_names:
             if has_local_hook_states:
                 hook_state = torch.load(hook_state_paths[hook_name], map_location="cpu")
+                if "optimizer_param_groups" in hook_state:
+                    load_parameter_groups(
+                        self.units[hook_name].optimizer if self.units else self.optimizer,
+                        self.base_sae_by_hook[hook_name].named_parameters(),
+                        hook_state["optimizer_param_groups"],
+                    )
                 self.act_freq_scores_by_hook[hook_name] = hook_state[
                     "act_freq_scores"
                 ].to(self.cfg.device)
@@ -1991,10 +2118,12 @@ class MultiSAETrainer:
                     "n_frac_active_samples_by_hook"
                 ][hook_name]
 
+        load_runtime_trainer_state(self, checkpoint_path)
+
     def _checkpoint_if_needed(self) -> None:
         if (
             self.checkpoint_thresholds
-            and self.n_training_samples > self.checkpoint_thresholds[0]
+            and checkpoint_token_count(self) > self.checkpoint_thresholds[0]
         ):
             self.save_checkpoint(checkpoint_name=str(self.n_training_samples))
             self.checkpoint_thresholds.pop(0)
@@ -2922,6 +3051,7 @@ def _load_hook_optimizer_state_safetensors(
     tp_group: dist.ProcessGroup | None,
 ) -> dict[str, dict[str, Any]]:
     from safetensors import safe_open
+
     from sae_lens.util import str_to_dtype
 
     tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0

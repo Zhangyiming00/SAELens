@@ -352,7 +352,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     multi_sae_overlap_max_steps: int = 0
     multi_sae_distributed_architecture: Literal[
         "legacy_per_hook_wrapper", "unified_multi_hook"
-    ] = "unified_multi_hook"
+    ] = "legacy_per_hook_wrapper"
     multi_sae_tp_phase_fence: Literal["auto", "always", "off"] = "auto"
     multi_sae_optimizer_overlap: Literal["off", "on", "non_tp_only"] = "off"
     ddp_zero_optimizer: bool = False
@@ -781,6 +781,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
 
     def to_sae_trainer_config(self) -> "SAETrainerConfig":
         return SAETrainerConfig(
+            routing_dp_batch_mode=self.routing_dp_batch_mode,
             n_checkpoints=self.n_checkpoints,
             checkpoint_path=self.checkpoint_path,
             quiesce_checkpoint_path=self.quiesce_checkpoint_path,
@@ -1113,6 +1114,7 @@ class SAETrainerConfig:
     feature_sampling_window: int
     logger: LoggingConfig
     streaming_mode: bool = False
+    routing_dp_batch_mode: Literal["equal", "exact"] = "equal"
     append_history_logs: bool = False
     step_window_profile_start_step: int = 0
     step_window_profile_window_steps: int = 0
@@ -1123,7 +1125,7 @@ class SAETrainerConfig:
     multi_sae_overlap_max_steps: int = 0
     multi_sae_distributed_architecture: Literal[
         "legacy_per_hook_wrapper", "unified_multi_hook"
-    ] = "unified_multi_hook"
+    ] = "legacy_per_hook_wrapper"
     multi_sae_tp_phase_fence: Literal["auto", "always", "off"] = "auto"
     multi_sae_optimizer_overlap: Literal["off", "on", "non_tp_only"] = "off"
     ddp_zero_optimizer: bool = False

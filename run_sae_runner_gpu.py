@@ -484,13 +484,12 @@ def parse_args() -> argparse.Namespace:
         help="Sync interval for --multi-sae-stats-sync-mode=periodic.",
     )
     parser.add_argument(
-        "--multi-sae-distributed-architecture", default="unified_multi_hook",
+        "--multi-sae-distributed-architecture", default="legacy_per_hook_wrapper",
         choices=["legacy_per_hook_wrapper", "unified_multi_hook"],
         help=(
-            "Multi-layer SAE distributed wrapper architecture. The default "
-            "unified_multi_hook trains through one MultiHookSAE owner and enables "
-            "cross-hook TP wavefront forward when TP>1. legacy_per_hook_wrapper "
-            "keeps the old path. FSDP automatically falls back to legacy."
+            "Multi-layer SAE distributed wrapper architecture. Static routing "
+            "uses independent per-hook DDP and optimizer units. The unified "
+            "wrapper remains available to existing streaming paths."
         ),
     )
     parser.add_argument(
@@ -503,7 +502,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--multi-sae-optimizer-overlap", default="on", choices=["off", "on", "non_tp_only"],
+        "--multi-sae-optimizer-overlap", default="off", choices=["off", "on", "non_tp_only"],
         help=(
             "Experimental per-hook DDP bucket reduction -> optimizer overlap. "
             "Buckets launch during combined backward; 'on' also supports SAE-TP "
@@ -1169,10 +1168,9 @@ def main() -> None:
         raise ValueError(
             "--streaming-dp-batch-mode exact currently supports the SHM path only"
         )
-    if exact_dp_batch and args.resume_from_checkpoint is not None:
+    if exact_dp_batch and args.streaming_mode and args.resume_from_checkpoint is not None:
         raise ValueError(
-            "exact DP batch mode does not yet support checkpoint resume; stateful "
-            "resume will be added with the elastic cutover protocol"
+            "exact streaming DP batches do not yet support checkpoint resume"
         )
 
     training_tokens = args.training_tokens

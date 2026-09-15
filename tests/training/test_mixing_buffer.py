@@ -7,6 +7,38 @@ from sae_lens.training.mixing_buffer import mixing_buffer
 from tests.helpers import assert_not_close
 
 
+@pytest.mark.parametrize("dict_batch", [False, True])
+@pytest.mark.parametrize("cut", [1, 3, 6])
+def test_resume_preserves_pending_batches_storage_and_shuffle(dict_batch, cut):
+    from copy import deepcopy
+
+    batches = [torch.arange(i * 24, (i + 1) * 24).reshape(12, 2) for i in range(5)]
+    if dict_batch:
+        batches = [{"a": b, "b": b + 1000} for b in batches]
+    cursor = 0
+
+    def source():
+        nonlocal cursor
+        while cursor < len(batches):
+            value = batches[cursor]
+            cursor += 1
+            yield value
+
+    state = {}
+    generator = torch.Generator().manual_seed(59)
+    original = mixing_buffer(16, 4, source(), generator=generator, state=state)
+    for _ in range(cut):
+        next(original)
+    saved_cursor, saved_state, saved_rng = cursor, deepcopy(state), generator.get_state()
+    expected = list(original)
+    cursor = saved_cursor
+    generator = torch.Generator().set_state(saved_rng)
+    actual = list(mixing_buffer(16, 4, source(), generator=generator, state=saved_state))
+    assert len(expected) == len(actual)
+    for left, right in zip(expected, actual, strict=True):
+        torch.testing.assert_close(left, right, atol=0, rtol=0)
+
+
 def test_mixing_buffer_yields_batches_of_correct_size_despite_loader_size_fluctuations():
     # Create a simple activations loader that yields 2 batches
     batch_size = 4

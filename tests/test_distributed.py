@@ -11,6 +11,7 @@ import pytest
 
 import sae_lens.distributed as distributed_mod
 from sae_lens.distributed import init_distributed
+from tests._sae_runtime_stub import RuntimeStub
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +43,8 @@ def _reset_distributed_state() -> None:
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
+    monkeypatch.setattr(distributed_mod, "SAERuntime", RuntimeStub)
     _reset_distributed_state()
     yield
     _reset_distributed_state()

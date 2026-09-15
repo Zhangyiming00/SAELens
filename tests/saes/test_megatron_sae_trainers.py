@@ -67,7 +67,9 @@ def _trainer_config(device, checkpoint, architecture):
     return cfg
 
 
-def _exercise_trainers(tp_group, dp_group, device, output_dir, architecture):
+def _exercise_trainers(
+    tp_group, dp_group, device, output_dir, architecture, runtime=None, batch_provider=None
+):
     """Run six updates; after update three use the actual trainer disk loaders."""
     inputs = load_file(REFERENCE / "inputs.safetensors")
     golden = load_file(REFERENCE / "golden.safetensors")
@@ -84,6 +86,9 @@ def _exercise_trainers(tp_group, dp_group, device, output_dir, architecture):
     cases = {"blocks.0.hook_resid_post": 3}
     if architecture != "single":
         cases["blocks.1.hook_resid_post"] = 0
+    if runtime is not None:
+        cases = {hook: (3 if hook == "blocks.0.hook_resid_post" else 0)
+                 for hook in runtime.require_local().domain.hooks}
     cfg = _trainer_config(device, output_dir, architecture)
     errors = {"parameter": 0.0, "adam": 0.0, "reconstruction": 0.0}
 
@@ -92,7 +97,17 @@ def _exercise_trainers(tp_group, dp_group, device, output_dir, architecture):
         for hook, case in cases.items():
             model_cfg = TopKTrainingSAEConfig.from_dict(manifest["configs"][case])
             model_cfg.device = device
-            models[hook] = MegatronTopKSAE(model_cfg, tp_group=tp_group)
+            if runtime is not None:
+                from types import SimpleNamespace
+                from sae_lens.llm_sae_training_runner import LanguageModelSAETrainingRunner
+
+                runner = object.__new__(LanguageModelSAETrainingRunner)
+                runner.sae_runtime = runtime
+                runner.cfg = SimpleNamespace(get_training_sae_cfg_dict=model_cfg.to_dict)
+                models[hook] = runner._create_training_sae(seed=791, tp_group=None, device=device)
+                assert models[hook].parallel_context is runtime
+            else:
+                models[hook] = MegatronTopKSAE(model_cfg, tp_group=tp_group)
             models[hook].import_saelens_state_dict(initial)
         kwargs = {"process_group": dp_group, "gradient_as_bucket_view": True}
         if device.startswith("cuda"):
@@ -107,6 +122,7 @@ def _exercise_trainers(tp_group, dp_group, device, output_dir, architecture):
                 data_provider=MagicMock(),
                 dp_group=dp_group,
                 token_count_weighted_dp=True,
+                runtime=runtime,
             )
         else:
             wrapped_models = models
@@ -127,7 +143,12 @@ def _exercise_trainers(tp_group, dp_group, device, output_dir, architecture):
                 token_count_weighted_dp=True,
                 sae_dp_mode="ddp",
                 multi_hook_sae=root,
+                runtime=runtime,
             )
+            if runtime is not None:
+                assert len(trainer.units) == len(cases)
+                assert len({id(u.optimizer) for u in trainer.units.values()}) == len(cases)
+                assert all(u.parallel_context is runtime for u in trainer.units.values())
         return trainer, models
 
     def check(actual, expected, category):
@@ -142,6 +163,8 @@ def _exercise_trainers(tp_group, dp_group, device, output_dir, architecture):
             chunk.shape[0] for chunk in torch.tensor_split(batch, dp_size)[:dp_rank]
         )
         local_slice = slice(start, start + len(local_batch))
+        if batch_provider is not None:
+            local_batch, local_slice = batch_provider(step)
         for hook in cases:
             mask = inputs["dead_masks"][step].to(device)
             counts = mask.long() * (cfg.dead_feature_window + 1)
@@ -161,11 +184,12 @@ def _exercise_trainers(tp_group, dp_group, device, output_dir, architecture):
         trainer.n_training_samples += len(batch)
         for hook, model in models.items():
             prefix = f"case{cases[hook]}.step{step}."
-            check(
-                outputs[hook].sae_out,
-                golden[prefix + "reconstruction"][local_slice],
-                "reconstruction",
-            )
+            if len(local_batch):
+                check(
+                    outputs[hook].sae_out,
+                    golden[prefix + "reconstruction"][local_slice],
+                    "reconstruction",
+                )
             for name, value in model.export_saelens_state_dict().items():
                 check(value, golden[prefix + "parameter." + name], "parameter")
             states = {
@@ -183,7 +207,7 @@ def _exercise_trainers(tp_group, dp_group, device, output_dir, architecture):
             trainer.save_checkpoint("midpoint")
             # Other DP replicas wait until replica zero finishes writing.
             if dist.get_backend() != "fake":
-                dist.barrier()
+                dist.barrier(group=runtime.training_group if runtime else None)
             checkpoint = Path(output_dir) / "midpoint"
             trainer, models = build()
             if architecture == "single":

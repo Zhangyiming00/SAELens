@@ -1,5 +1,8 @@
 # Training Sparse Autoencoders
 
+For the static Megatron SAE routing entry, explicit training domains and independent
+per-hook training units, see [SAE runtime and routing](sae_runtime.md).
+
 Methods development for training SAEs is rapidly evolving, so these docs may change frequently. For all available training options, see the [LanguageModelSAERunnerConfig][sae_lens.LanguageModelSAERunnerConfig] and the architecture-specific configuration classes it uses (e.g., [StandardTrainingSAEConfig][sae_lens.StandardTrainingSAEConfig], [GatedTrainingSAEConfig][sae_lens.GatedTrainingSAEConfig], [JumpReLUTrainingSAEConfig][sae_lens.JumpReLUTrainingSAEConfig], and [TopKTrainingSAEConfig][sae_lens.TopKTrainingSAEConfig]).
 
 However, we are attempting to maintain this [tutorial](https://github.com/decoderesearch/SAELens/blob/main/tutorials/training_a_sparse_autoencoder.ipynb)

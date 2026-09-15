@@ -12,6 +12,7 @@ import pytest
 import sae_lens.distributed_v2 as v2_mod
 from sae_lens.distributed_v2 import init_distributed_v2
 from sae_lens.shard_routing import compute_routing_table
+from tests._sae_runtime_stub import RuntimeStub
 
 
 # ---------------------------------------------------------------------------
@@ -20,7 +21,9 @@ from sae_lens.shard_routing import compute_routing_table
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
+    monkeypatch.setattr(v2_mod, "SAERuntime", RuntimeStub)
+    monkeypatch.setattr(v2_mod.dist, "get_backend", lambda *_args: "nccl")
     v2_mod._reset()
     yield
     v2_mod._reset()
@@ -156,21 +159,21 @@ def test_init_v2_producer_only_large_producer_block() -> None:
 
 
 def test_init_v2_new_group_total_count_3_1() -> None:
-    """P=3, Q=1: P + endpoints + DP groups + replica groups + P2P = 7 calls."""
+    """Routing creates only producer, replica coordination and transport groups."""
     calls = _run_init(0, 3, P=3, Q=1)
-    assert len(calls) == 7
+    assert len(calls) == 5
 
 
 def test_init_v2_new_group_total_count_2_3() -> None:
-    """P=2, Q=3: P + endpoints + DP groups + replica groups + P2P = 12 calls."""
+    """SAE TP/DP group construction belongs to the runtime."""
     calls = _run_init(0, 3, P=2, Q=3)
-    assert len(calls) == 12
+    assert len(calls) == 8
 
 
 def test_init_v2_new_group_total_count_with_tp() -> None:
     """P=2, Q=2, vllm_tp=2, sae_tp=2: includes 2 replica groups."""
     calls = _run_init(0, 4, P=2, Q=2, vllm_tp=2, sae_tp=2)
-    assert len(calls) == 10
+    assert len(calls) == 6
 
 
 # ---------------------------------------------------------------------------
@@ -214,13 +217,9 @@ def test_init_v2_p2p_membership_2_3() -> None:
 def test_init_v2_sae_dp_group_spans_all_consumers() -> None:
     """SAE DP groups contain one rank per consumer."""
     calls = _run_init(0, 3, P=2, Q=3)
-    # SAE DP groups are NCCL groups with sae_tp_size members (1 here), Q groups total
-    # actually sae_tp_size=1, so 1 SAE DP group with 3 members (one per consumer)
-    nccl_calls = [c for c in calls if c[1] == "nccl"]
-    # P vLLM TP groups + Q SAE TP groups + sae_tp_size DP groups = 2+3+1 = 6 nccl groups
-    # DP group should contain consumer tp roots: [0, 1, 2]
-    dp_group_candidates = [c for c in nccl_calls if sorted(c[0]) == [0, 1, 2]]
-    assert len(dp_group_candidates) == 1
+    assert v2_mod.get_sae_dp_group() is v2_mod.get_sae_runtime().local.dp_group
+    assert v2_mod.get_sae_dp_group().ranks == (0, 1, 2)
+    assert ([0, 1, 2], "nccl") not in calls
 
 
 def test_init_v2_producer_only_rank_not_in_sae_tp_group() -> None:
