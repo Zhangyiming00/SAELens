@@ -56,6 +56,14 @@ from sae_lens.training.ddp_zero_optimizer import (
     optimizer_state_by_parameter,
     set_optimizer_parameter_state,
 )
+from sae_lens.training.gradient_window import (
+    configure_update_batch,
+    fit_window_batches,
+    require_window_boundary,
+    train_runtime_window,
+    validate_accumulation,
+    window_metrics,
+)
 from sae_lens.training.multi_hook_sae import MultiHookSAE
 from sae_lens.training.optim import get_lr_scheduler
 from sae_lens.training.optimizer_checkpoint import (
@@ -149,6 +157,7 @@ class MultiSAETrainer:
         self.data_provider = data_provider
         self.save_checkpoint_fn = save_checkpoint_fn
         self.cfg = cfg
+        validate_accumulation(self)
         self.dp_group = dp_group
         self.token_count_weighted_dp = token_count_weighted_dp
         self.sae_dp_mode = sae_dp_mode
@@ -235,6 +244,9 @@ class MultiSAETrainer:
             _adam_kwargs["foreach"] = False
         use_zero_optimizer = bool(getattr(cfg, "ddp_zero_optimizer", False))
         if runtime is not None:
+            if torch.device(cfg.device).type == "cuda":
+                _adam_kwargs.pop("foreach", None)
+                _adam_kwargs["fused"] = True
             for hook_name in self.hook_names:
                 model = self.base_sae_by_hook[hook_name]
                 optimizer = build_adam_optimizer(
@@ -410,6 +422,7 @@ class MultiSAETrainer:
             if self._dp_world_size() > 1:
                 dist.all_reduce(batch_total, group=self.dp_group)
             self._progress_batch_total = int(batch_total.item())
+            configure_update_batch(self)
         self.grad_scaler = torch.amp.GradScaler(
             "cuda",
             enabled=cfg.autocast and torch.cuda.is_available(),
@@ -777,6 +790,7 @@ class MultiSAETrainer:
                 _ack_drain_done()
                 _save_quiesce_checkpoint()
                 break
+            self._runtime_update_pending = bool(self.units)
             step_number = self.n_training_steps + 1
             if self.step_window_profiler is not None:
                 self.step_window_profiler.on_step_start(step_number)
@@ -789,6 +803,7 @@ class MultiSAETrainer:
                 try:
                     batch_by_hook = next(self.data_provider)
                 except StopIteration:
+                    self._runtime_update_pending = False
                     break
             self._memory_current_raw_batch_by_hook = batch_by_hook
             self._record_memory_phase("after_data_fetch")
@@ -798,7 +813,7 @@ class MultiSAETrainer:
                 )
             self._validate_unified_hook_set(batch_by_hook)
             local_ns = {hook: acts.shape[0] for hook, acts in batch_by_hook.items()}
-            if len(set(local_ns.values())) != 1:
+            if not self.units and len(set(local_ns.values())) != 1:
                 raise RuntimeError(f"Multi-layer activation sizes diverged: {local_ns}")
             local_n = next(iter(local_ns.values()))
             self._maybe_synchronize_timing()
@@ -820,10 +835,17 @@ class MultiSAETrainer:
             if self._memory_phase_step_active:
                 torch.cuda.reset_peak_memory_stats(self.cfg.device)
             with cuda_nvtx_range("multi_sae:train_step"):
-                outputs, sae_phase_timing = self._train_step(scaled_batch_by_hook, local_n)
+                outputs, sae_phase_timing = self._train_step(
+                    scaled_batch_by_hook, local_n,
+                    **({"_fit_window": True} if self.units else {}),
+                )
+            if self.units:
+                local_n = self._last_window_local_tokens
+                for key, value in self._window_extra_data_time.items():
+                    data_timing[key] += value
             if getattr(self.data_provider, "tracks_global_progress", False):
                 self.n_training_samples = int(self.data_provider.global_tokens_consumed)
-            elif self.units and self.token_count_weighted_dp:
+            elif self.units:
                 count, self._token_count_remainder = divmod(
                     self._last_global_tokens * self.cfg.train_batch_size_samples + getattr(self, "_token_count_remainder", 0),
                     self._progress_batch_total,
@@ -835,6 +857,8 @@ class MultiSAETrainer:
             self._memory_current_outputs = outputs
             self._maybe_synchronize_timing()
             sae_time_s = time.perf_counter() - sae_t0
+            if self.units:
+                sae_time_s = max(0.0, sae_time_s - self._window_data_time_s)
 
             if self._memory_phase_step_active:
                 memory_stats = self._aggregate_memory_phase_stats()
@@ -856,9 +880,13 @@ class MultiSAETrainer:
             )
             self._record_memory_if_needed(memory_stats)
             self._maybe_stop_memory_timeline()
-            self.n_training_steps += 1
+            self.n_training_steps += int(not self.units or self._last_step_had_tokens)
             if self._last_step_had_tokens:
-                self.lr_scheduler.step()
+                if self.units:
+                    self.lr_scheduler.step(self._last_updated_hooks)
+                else:
+                    self.lr_scheduler.step()
+            self._runtime_update_pending = False
             self._checkpoint_if_needed()
             pbar.update(progress_samples)
             if self.n_training_steps % 8 == 0 and outputs:
@@ -921,9 +949,14 @@ class MultiSAETrainer:
         self,
         batch_by_hook: dict[str, torch.Tensor],
         local_n: int,
+        *, _fit_window: bool = False,
     ) -> tuple[dict[str, TrainStepOutput], dict[str, float]]:
         if self.units and set(batch_by_hook) != set(self.units):
             raise ValueError("Every synchronous step must contain exactly the local SAE hooks")
+        if self.units:
+            return train_runtime_window(
+                self, fit_window_batches(self, batch_by_hook) if _fit_window else [batch_by_hook]
+            )
         self._validate_unified_hook_set(batch_by_hook)
         if self.multi_sae_distributed_architecture == "unified_multi_hook":
             assert self.multi_hook_sae is not None
@@ -1835,6 +1868,7 @@ class MultiSAETrainer:
             self._tp_barrier()
 
     def save_checkpoint(self, checkpoint_name: str) -> None:
+        require_window_boundary(self)
         checkpoint_name = runtime_checkpoint_name(self, checkpoint_name)
         checkpoint_base_path = self._checkpoint_base_path(checkpoint_name)
         if checkpoint_base_path is None:
@@ -1917,6 +1951,7 @@ class MultiSAETrainer:
             self._tp_barrier()
 
     def save_trainer_state(self, checkpoint_path: Path) -> None:
+        require_window_boundary(self)
         checkpoint_path.mkdir(exist_ok=True, parents=True)
         save_runtime_trainer_state(self, checkpoint_path)
         dp_rank = self._dp_rank()
@@ -2415,6 +2450,7 @@ class MultiSAETrainer:
             "step": self.n_training_steps + 1,
             "n_training_samples": self.n_training_samples,
             "hooks": {},
+            **window_metrics(self),
         }
         for hook_name in self.hook_names:
             output = outputs.get(hook_name)

@@ -61,9 +61,9 @@ class UnitLRSchedulers:
     def __init__(self, schedulers):
         self.schedulers = schedulers
 
-    def step(self):
-        for scheduler in self.schedulers.values():
-            scheduler.step()
+    def step(self, hooks=None):
+        for hook in self.schedulers if hooks is None else hooks:
+            self.schedulers[hook].step()
 
     def get_last_lr(self):
         return [

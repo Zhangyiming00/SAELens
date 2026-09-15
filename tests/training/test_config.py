@@ -20,6 +20,29 @@ test_cases_for_seqpos = [
 ]
 
 
+@pytest.mark.parametrize("steps", [0, -1, 1.5, True])
+def test_invalid_gradient_accumulation_steps(steps):
+    with pytest.raises(ValueError, match="gradient_accumulation_steps"):
+        LanguageModelSAERunnerConfig(
+            sae=StandardTrainingSAEConfig(d_in=10, d_sae=10),
+            gradient_accumulation_steps=steps,
+        )
+
+
+def test_accumulation_config_keeps_provider_batch_and_buffer():
+    cfg = LanguageModelSAERunnerConfig(
+        sae=StandardTrainingSAEConfig(d_in=10, d_sae=10),
+        train_batch_size_tokens=32, training_tokens=224,
+        gradient_accumulation_steps=3, ddp_bucket_cap_mb=0.125,
+        context_size=8, n_batches_in_buffer=4,
+    )
+    trainer_cfg = cfg.to_sae_trainer_config()
+    assert trainer_cfg.gradient_accumulation_steps == 3
+    assert trainer_cfg.train_batch_size_samples == 32
+    assert trainer_cfg.total_training_steps == cfg.total_training_steps == 3
+    assert cfg.tokens_per_buffer == 32 * 8 * 4
+
+
 @pytest.mark.parametrize("seqpos_slice, expected_error", test_cases_for_seqpos)
 def test_sae_training_runner_config_seqpos(
     seqpos_slice: tuple[int, int], expected_error: Type[BaseException]

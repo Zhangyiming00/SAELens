@@ -62,6 +62,7 @@ def _identity(trainer, runtime):
         dp_ranks=list(context.dp_ranks),
         local_batch_size=trainer.cfg.train_batch_size_samples,
         batch_mode=getattr(trainer.cfg, "routing_dp_batch_mode", "equal"),
+        gradient_accumulation_steps=getattr(trainer.cfg, "gradient_accumulation_steps", 1),
     )
 
 
@@ -103,7 +104,9 @@ def load_runtime_trainer_state(trainer, checkpoint_path):
     rank_path = path / f"trainer_runtime_rank{dist.get_rank()}.pt"
     if rank_path.exists():
         state = torch.load(rank_path, map_location="cpu", weights_only=True)
-        if state["identity"] != _identity(trainer, runtime):
+        identity = dict(state["identity"])
+        identity.setdefault("gradient_accumulation_steps", 1)
+        if identity != _identity(trainer, runtime):
             raise ValueError(
                 "Static checkpoint topology or batch configuration differs"
             )
@@ -134,3 +137,15 @@ def load_runtime_trainer_state(trainer, checkpoint_path):
     trainer.checkpoint_thresholds = [
         t for t in trainer.checkpoint_thresholds if t >= progress
     ]
+    # Old PyTorch-DDP checkpoints may encode foreach/for-loop execution flags.
+    # Preserve numerical hyperparameters and moments, while keeping the static
+    # CUDA runtime's fused Adam implementation after loading those groups.
+    for group in trainer.optimizer.param_groups:
+        if group["params"] and group["params"][0].device.type == "cuda":
+            group["fused"] = True
+            group["foreach"] = None
+            for parameter in group["params"]:
+                if parameter in trainer.optimizer.state:
+                    state = trainer.optimizer.state[parameter]
+                    if torch.is_tensor(state.get("step")):
+                        state["step"] = state["step"].to(parameter.device)

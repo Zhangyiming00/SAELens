@@ -54,6 +54,8 @@ def _worker(
     placement_amp=False,
     failure=None,
     uneven_filter=False,
+    accumulation_steps=1,
+    bucket_cap_mb=None,
 ):
     os.environ.update(
         RANK=str(rank),
@@ -89,7 +91,9 @@ def _worker(
     # The equal runner expects local batch/token counts, unlike exact mode.
     # For the uneven-filter regression reproduce precisely local batch 16.
     cfg_batch = global_batch // 2 if uneven_filter and batch_mode == "equal" else global_batch
-    checkpoint_tokens = cfg_batch * 3
+    checkpoint_step = 3 if accumulation_steps == 1 else 1
+    checkpoint_tokens = cfg_batch * checkpoint_step * accumulation_steps
+    microbatch_steps = 6 if accumulation_steps == 1 else 7
     hooks = [f"blocks.{i}.hook_resid_post" for i in (21, 26)[:hook_count]]
     # Pretokenized, deterministic local rows exercise vLLM prefill and real
     # activation extraction without network or dataset download variability.
@@ -129,8 +133,10 @@ def _worker(
         n_batches_in_buffer=64
         if global_batch == 4096
         else (2 if batch_mode == "exact" or uneven_filter else 4),
-        training_tokens=cfg_batch * 6,
+        training_tokens=cfg_batch * microbatch_steps,
         train_batch_size_tokens=cfg_batch,
+        gradient_accumulation_steps=accumulation_steps,
+        ddp_bucket_cap_mb=bucket_cap_mb,
         routing_dp_batch_mode=batch_mode,
         activations_mixing_fraction=0.5,
         device=f"cuda:{rank}",
@@ -163,6 +169,20 @@ def _worker(
         def audit_train(self, trainer, run):
             self.audited_trainer = trainer
             self.steps = []
+            self.microbatches = []
+            units = getattr(trainer, "units", {}) or {hooks[0]: trainer.unit}
+            for hook, unit in units.items():
+                forward = unit.forward
+
+                def audited_forward(step_input, hook=hook, forward=forward):
+                    tensor = step_input.sae_in.detach().cpu().contiguous()
+                    self.microbatches.append(dict(
+                        hook=hook, rows=len(tensor),
+                        sha256=hashlib.sha256(tensor.numpy().tobytes()).hexdigest(),
+                    ))
+                    return forward(step_input)
+
+                unit.forward = audited_forward
             if failure == "consumer_wait" and rank == 0:
                 raise RuntimeError("injected consumer waiting boundary")
             if failure == "consumer_backward" and rank == 0:
@@ -192,12 +212,14 @@ def _worker(
                 provider = trainer.data_provider
 
                 class EmptyBatchProbe:
+                    index = 0
                     def __getattr__(self, name):
                         return getattr(provider, name)
 
                     def __next__(self):
                         batch = next(provider)
-                        index = trainer.n_training_steps
+                        index = self.index
+                        self.index += 1
                         empty = index in (2, 3) or (
                             index == 1 and runner.sae_runtime.local.dp_rank == 0
                         )
@@ -212,7 +234,7 @@ def _worker(
                 trainer.data_provider = EmptyBatchProbe()
 
             def audited_step(*args, **kwargs):
-                if trainer.n_training_steps == 3:
+                if trainer.n_training_steps == checkpoint_step:
                     models = getattr(
                         trainer,
                         "base_sae_by_hook",
@@ -310,16 +332,19 @@ def _worker(
             )
         elif layout == "dp3":
             domains = (SAETrainingDomain("dp3", (0, 1, 2), 1, tuple(hooks)),)
+        elif layout == "dp1":
+            domains = (SAETrainingDomain("dp1", (0,), 1, tuple(hooks)),)
         runner = AuditRunner(
             cfg,
             override_dataset=dataset,
             vllm_tp_size=4,
-            sae_tp_size=1 if layout == "dp3" else 2,
+            sae_tp_size=1 if layout in ("dp3", "dp1") else 2,
             sae_dp_size=3 if layout == "dp3" else (2 if layout == "full" else 1),
             sae_pp_size=2 if layout == "placement" else 1,
             sae_training_domains=domains,
         )
         runner.steps = []
+        runner.microbatches = []
         # The runner appends its run ID to checkpoint_path. Use a fixed shared
         # directory after construction for cross-process resume verification.
         runner.cfg.checkpoint_path = str(directory / "checkpoints")
@@ -408,6 +433,7 @@ def _worker(
             json.dumps(
                 dict(
                     steps=runner.steps,
+                    microbatches=runner.microbatches,
                     vllm_generations=generated,
                     runtime_closed=True,
                     producer_only=runtime.local is None,
@@ -427,12 +453,14 @@ def main():
     parser.add_argument("--model", default="/root/models/Llama-3.1-8B")
     parser.add_argument("--hooks", type=int, choices=(1, 2), nargs="+", default=[1, 2])
     parser.add_argument(
-        "--layout", choices=("full", "prefix", "placement", "dp3"), default="full"
+        "--layout", choices=("full", "prefix", "placement", "dp3", "dp1"), default="full"
     )
     parser.add_argument("--batch-mode", choices=("equal", "exact"), default="equal")
     parser.add_argument("--global-batch", type=int, choices=(32, 4096), default=32)
     parser.add_argument("--placement-amp", action="store_true")
     parser.add_argument("--uneven-filter", action="store_true")
+    parser.add_argument("--accumulation-steps", type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument("--ddp-bucket-cap-mb", type=float, default=None)
     parser.add_argument(
         "--failure", choices=("consumer_wait", "producer_generate", "consumer_backward")
     )
@@ -477,6 +505,8 @@ def main():
         "sae_lens/training/activations_store.py",
         "sae_lens/training/mixing_buffer.py",
         "sae_lens/training/sae_train_unit.py",
+        "sae_lens/training/gradient_window.py",
+        "sae_lens/training/megatron_ddp.py",
         "sae_lens/training/optimizer_checkpoint.py",
         "sae_lens/saes/megatron_topk_sae.py",
         "sae_lens/config.py",
@@ -520,6 +550,8 @@ def main():
                     args.placement_amp,
                     args.failure,
                     args.uneven_filter,
+                    args.accumulation_steps,
+                    args.ddp_bucket_cap_mb,
                 ),
                 timeout=120 if args.failure else 600,
             )
@@ -558,7 +590,7 @@ def main():
                     directory / f"continuous_rank{rank + 2}.pt", weights_only=True
                 )
                 assert_state_equal(a, b)
-                assert a["n_training_steps"] == 9
+                assert a["n_training_steps"] == 7
                 assert all(
                     int(s["step"].item()) == 7 for s in a["optimizer"]["state"].values()
                 )
@@ -627,8 +659,15 @@ def main():
                 )
             else:
                 assert_state_equal(baseline, restored)
-            assert len(before["steps"]) == 6 and len(after["steps"]) == 3
-            assert before["steps"][3:] == after["steps"]
+            micro_steps = 6 if args.accumulation_steps == 1 else 7
+            checkpoint_step = 3 if args.accumulation_steps == 1 else 1
+            updates = (micro_steps + args.accumulation_steps - 1) // args.accumulation_steps
+            assert len(before["steps"]) == updates
+            assert len(after["steps"]) == updates - checkpoint_step
+            assert before["steps"][checkpoint_step:] == after["steps"]
+            local_hooks = len(baseline["models"])
+            assert len(before["microbatches"]) == micro_steps * local_hooks
+            assert before["microbatches"][checkpoint_step * args.accumulation_steps * local_hooks:] == after["microbatches"]
             assert before["vllm_generations"] > 0 and after["vllm_generations"] > 0
             if args.batch_mode == "exact":
                 from sae_lens.training.dp_batch import balanced_token_counts
@@ -678,10 +717,12 @@ def main():
         summary.append(
             dict(
                 hooks=hooks,
-                tp=1 if args.layout == "dp3" else 2,
+                tp=1 if args.layout in ("dp3", "dp1") else 2,
                 dp=3 if args.layout == "dp3" else (2 if args.layout == "full" else 1),
                 layout=args.layout,
                 result="passed",
+                accumulation_steps=args.accumulation_steps,
+                bucket_cap_mb=args.ddp_bucket_cap_mb,
                 resume_bitwise_equal=resume_bitwise_equal,
                 resume_max_abs_errors=maximum_errors,
                 checkpoint_state_bitwise_equal=True,

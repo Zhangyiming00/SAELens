@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, MutableMapping
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from typing import Any
 
+import torch
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 
 from sae_lens.profiling import cuda_nvtx_range
 from sae_lens.sae_runtime import SAERuntime
+from sae_lens.training.megatron_ddp import is_megatron_ddp, supports_early_grad_sync
 
 
 @dataclass
@@ -20,11 +24,17 @@ class SAETrainUnit:
     ddp: Any
     optimizer: Optimizer
     parallel_context: SAERuntime
+    _grad_sync_started: bool = field(default=False, init=False)
+    _grad_sync_finished: bool = field(default=False, init=False)
+    early_grad_sync: bool = field(default=False, init=False)
 
     def __post_init__(self):
         self.parallel_context.validate_model(self.model)
         context = self.parallel_context.require_local()
-        if isinstance(self.ddp, DistributedDataParallel):
+        if is_megatron_ddp(self.ddp):
+            if self.ddp.module is not self.model or self.ddp.dp_group is not context.dp_group:
+                raise ValueError("SAE unit Megatron DDP must use its runtime DP group")
+        elif isinstance(self.ddp, DistributedDataParallel):
             if (
                 self.ddp.module is not self.model
                 or self.ddp.process_group is not context.dp_group
@@ -46,13 +56,38 @@ class SAETrainUnit:
             raise ValueError(
                 "Each SAE optimizer must own exactly its hook's parameters"
             )
+        self.early_grad_sync = supports_early_grad_sync(self.ddp, self.parallel_context)
+        if (
+            is_megatron_ddp(self.ddp)
+            and context.tp_group.size() > 1
+            and context.dp_group.size() > 1
+        ):
+            # A rank-local environment/version check must not choose different
+            # collective orders within one domain. Agree once during setup,
+            # before any training window; fall back together if any rank cannot
+            # safely overlap communicators. This is not a gradient collective.
+            supported = torch.tensor(
+                int(self.early_grad_sync), device=next(self.model.parameters()).device
+            )
+            dist.all_reduce(supported, op=dist.ReduceOp.MIN, group=context.groups.tp_dp_cp)
+            self.early_grad_sync = bool(supported.item())
 
     def forward(self, step_input):
         self.check_failure()
         return self.ddp(step_input)
 
-    def backward(self, loss, scaler):
+    def backward(self, loss, scaler, *, sync_gradients=False):
+        if self._grad_sync_started:
+            raise RuntimeError("Cannot accumulate gradients after starting hook reduction")
         self.check_failure()
+        if sync_gradients:
+            if not self.early_grad_sync or not is_megatron_ddp(self.ddp):
+                raise RuntimeError("Native gradient synchronization is not enabled for this hook")
+            # This is the last backward allowed to write this window. Megatron
+            # owns bucket readiness and may dispatch from its autograd hooks.
+            # Reserve ownership before backward: failures may leave a subset
+            # of buckets in flight. Never explicitly start those buckets again.
+            self._grad_sync_started = True
         scaler.scale(loss).backward()
         monitor = getattr(self.parallel_context, "failure_monitor", None)
         if monitor is not None:
@@ -66,17 +101,73 @@ class SAETrainUnit:
         if monitor is not None:
             monitor.check()
 
-    def finish_grad_sync(self):
-        # PyTorch DDP finishes reduction as backward returns. This explicit
-        # boundary is where Megatron DDP's finish_grad_sync will be connected.
+    def start_grad_sync(self):
+        """Explicit fallback launch; a native final backward already owns sync."""
         self.check_failure()
+        if is_megatron_ddp(self.ddp):
+            if self._grad_sync_started:
+                return
+            # A later bucket may fail after an earlier one was enqueued. Keep
+            # ownership on failure so cleanup cannot clear a live main_grad.
+            self._grad_sync_started = True
+            self.ddp.start_grad_sync()
+
+    def finish_grad_sync(self):
+        """Establish stream dependencies and expose gradients for window update."""
+        self.check_failure()
+        if is_megatron_ddp(self.ddp):
+            if not self._grad_sync_started:
+                raise RuntimeError("Start hook gradient reduction before finishing it")
+            if self._grad_sync_finished:
+                return
+            self.ddp.finish_grad_sync()
+            for parameter in self.model.parameters():
+                parameter.grad = parameter.main_grad
         self.model.sync_tensor_parallel_gradients()
+        self._grad_sync_finished = True
+
+    def zero_grad(self):
+        if self._grad_sync_started and not self._grad_sync_finished:
+            raise RuntimeError("Cannot clear main_grad while hook reduction is pending")
+        self.optimizer.zero_grad(set_to_none=True)
+        if is_megatron_ddp(self.ddp):
+            self.ddp.zero_grad_buffer()
+        self._grad_sync_started = self._grad_sync_finished = False
+
+    def no_sync(self):
+        return self.ddp.no_sync() if hasattr(self.ddp, "no_sync") else nullcontext()
+
+    def finish_window(self, token_count):
+        """Convert accumulated token-sum gradients to the global token mean."""
+        if is_megatron_ddp(self.ddp):
+            # Unknown-length short windows and unsupported ordering use an
+            # explicit launch. Native final backward skips this launch; its
+            # first window is dispatched by Megatron's finish_grad_sync itself.
+            self.start_grad_sync()
+            self.finish_grad_sync()
+        else:
+            # CPU/reference wrappers execute every microbatch under no_sync.
+            import torch.distributed as dist
+
+            group = self.parallel_context.require_local().dp_group
+            for parameter in self.model.parameters():
+                if parameter.grad is not None and group.size() > 1:
+                    dist.all_reduce(parameter.grad, group=group)
+            self.model.sync_tensor_parallel_gradients()
+        if token_count:
+            for parameter in self.model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.div_(token_count)
 
     def clip_grad_norm(self, max_norm=1.0):
+        if is_megatron_ddp(self.ddp) and not self._grad_sync_finished:
+            raise RuntimeError("Finish hook gradient reduction before clipping")
         self.check_failure()
         return self.model.clip_grad_norm_(max_norm)
 
     def step(self):
+        if is_megatron_ddp(self.ddp) and not self._grad_sync_finished:
+            raise RuntimeError("Finish hook gradient reduction before optimizer update")
         self.check_failure()
         return self.optimizer.step()
 

@@ -2,12 +2,14 @@
 
 import copy
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from sae_lens.sae_runtime import SAERuntime
 from sae_lens.saes.megatron_topk_sae import MegatronTopKSAE
+from sae_lens.training.megatron_ddp import supports_early_grad_sync
 from sae_lens.training.sae_train_unit import SAETrainUnit, UnitOptimizers
 from tests.saes.test_megatron_sae_boundaries import sae  # noqa: F401
 
@@ -61,3 +63,99 @@ def test_unit_optimizer_state_round_trip_and_independent_updates(sae):  # noqa: 
             )
     with pytest.raises(ValueError, match="must not share parameters"):
         UnitOptimizers({"h1": units["h1"], "h2": units["h1"]})
+
+
+def test_pending_reduction_owns_gradient_buffer(sae):  # noqa: F811
+    """API state transitions, separate from the real NCCL acceptance below."""
+    runtime = object.__new__(SAERuntime)
+    runtime._closed = False
+    runtime.local = SimpleNamespace(tp_group=sae._tp_group, dp_group=sae._tp_group)
+    for p in sae.parameters():
+        p.main_grad = torch.ones_like(p)
+    ddp = SimpleNamespace(
+        _sae_megatron_ddp=True, module=sae, dp_group=sae._tp_group,
+        start_grad_sync=Mock(), finish_grad_sync=Mock(), zero_grad_buffer=Mock(),
+    )
+    unit = SAETrainUnit("h", sae, ddp, torch.optim.Adam(sae.parameters()), runtime)
+    with pytest.raises(RuntimeError, match="Start hook"):
+        unit.finish_grad_sync()
+    unit.start_grad_sync()
+    unit.start_grad_sync()
+    ddp.start_grad_sync.assert_called_once()
+    assert all(p.grad is None for p in sae.parameters())
+    with pytest.raises(RuntimeError, match="Cannot clear"):
+        unit.zero_grad()
+
+    with pytest.raises(RuntimeError, match="Cannot accumulate"):
+        unit.backward(None, None)
+    with pytest.raises(RuntimeError, match="before clipping"):
+        unit.clip_grad_norm()
+    with pytest.raises(RuntimeError, match="before optimizer"):
+        unit.step()
+    ddp.zero_grad_buffer.assert_not_called()
+    assert all(p.main_grad.eq(1).all() for p in sae.parameters())
+    unit.finish_window(4)
+    ddp.start_grad_sync.assert_called_once()
+    ddp.finish_grad_sync.assert_called_once()
+    assert all(p.grad is p.main_grad and p.grad.eq(0.25).all() for p in sae.parameters())
+    unit.finish_grad_sync()
+    ddp.finish_grad_sync.assert_called_once()
+    unit.zero_grad()
+    unit.start_grad_sync()
+    assert ddp.start_grad_sync.call_count == 2
+    unit.finish_grad_sync()
+    unit.zero_grad()
+    ddp.start_grad_sync.side_effect = RuntimeError("second bucket failed")
+    with pytest.raises(RuntimeError, match="second bucket"):
+        unit.start_grad_sync()
+    with pytest.raises(RuntimeError, match="Cannot clear"):
+        unit.zero_grad()
+
+
+def test_native_final_backward_owns_sync_even_on_failure(sae):  # noqa: F811
+    runtime = object.__new__(SAERuntime)
+    runtime._closed = False
+    runtime.local = SimpleNamespace(tp_group=sae._tp_group, dp_group=sae._tp_group)
+    for parameter in sae.parameters():
+        parameter.main_grad = torch.ones_like(parameter)
+    ddp = SimpleNamespace(
+        _sae_megatron_ddp=True, module=sae, dp_group=sae._tp_group,
+        start_grad_sync=Mock(), finish_grad_sync=Mock(), zero_grad_buffer=Mock(),
+    )
+    unit = SAETrainUnit("h", sae, ddp, torch.optim.Adam(sae.parameters()), runtime)
+    scaled_loss = Mock()
+    scaler = Mock(scale=Mock(return_value=scaled_loss))
+    unit.backward(None, scaler, sync_gradients=True)
+    scaled_loss.backward.assert_called_once()
+    with pytest.raises(RuntimeError, match="Cannot accumulate"):
+        unit.backward(None, scaler)
+    with pytest.raises(RuntimeError, match="Cannot clear"):
+        unit.zero_grad()
+    unit.start_grad_sync()
+    ddp.start_grad_sync.assert_not_called()
+    unit.finish_window(4)
+    ddp.start_grad_sync.assert_not_called()
+    ddp.finish_grad_sync.assert_called_once()
+    assert all(p.grad is p.main_grad and p.grad.eq(0.25).all() for p in sae.parameters())
+    unit.zero_grad()
+    scaled_loss.backward.side_effect = RuntimeError("backward failed after one bucket")
+    with pytest.raises(RuntimeError, match="after one bucket"):
+        unit.backward(None, scaler, sync_gradients=True)
+    with pytest.raises(RuntimeError, match="Cannot clear"):
+        unit.zero_grad()
+
+
+@pytest.mark.parametrize("tp,dp,implicit,nccl,expected", [
+    (1, 3, "0", (2, 25, 0), True),
+    (2, 1, "0", (2, 25, 0), True),
+    (2, 2, "0", (2, 27, 5), False),
+    (2, 2, "1", (2, 25, 0), False),
+    (2, 2, "1", (2, 27, 5), True),
+])
+def test_cross_group_early_reduction_requires_nccl_ordering(monkeypatch, tp, dp, implicit, nccl, expected):
+    monkeypatch.setenv("NCCL_LAUNCH_ORDER_IMPLICIT", implicit)
+    monkeypatch.setattr(torch.cuda.nccl, "version", lambda: nccl)
+    context = SimpleNamespace(tp_group=Mock(size=lambda: tp), dp_group=Mock(size=lambda: dp))
+    runtime = SimpleNamespace(require_local=lambda: context)
+    assert supports_early_grad_sync(SimpleNamespace(_sae_megatron_ddp=True), runtime) is expected
+    assert not supports_early_grad_sync(SimpleNamespace(), runtime)

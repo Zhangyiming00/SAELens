@@ -1439,19 +1439,10 @@ class LanguageModelSAETrainingRunner:
             self.sae_by_hook[hook_name] = self._wrap_runtime_sae(sae)
 
     def _wrap_runtime_sae(self, sae):
-        context = self.sae_runtime.require_local()
-        self.sae_runtime.validate_model(sae)
-        if context.dp_group.size() == 1:
-            return sae
-        from torch.nn.parallel import DistributedDataParallel as DDP
+        from sae_lens.training.megatron_ddp import wrap_runtime_sae
 
-        device = torch.device(self.cfg.device)
-        index = device.index if device.index is not None else torch.cuda.current_device() if device.type == "cuda" else None
-        return DDP(
-            sae, process_group=context.dp_group,
-            device_ids=[index] if device.type == "cuda" else None,
-            output_device=index,
-            **self._resolve_ddp_kwargs(),
+        return wrap_runtime_sae(
+            sae, self.sae_runtime, bucket_cap_mb=self.cfg.ddp_bucket_cap_mb
         )
 
     def _per_hook_ddp_overlap_enabled(self, local_hook_count: int) -> bool:
@@ -2037,6 +2028,9 @@ class LanguageModelSAETrainingRunner:
             sae = trainer.fit()
 
         except (KeyboardInterrupt, InterruptedException):
+            if getattr(trainer, "_gradient_window_active", False) or getattr(trainer, "_runtime_update_pending", False):
+                logger.warning("Interrupted within an accumulation window; resume from the last completed checkpoint")
+                raise
             if self.cfg.checkpoint_path is not None:
                 logger.warning("interrupted, saving progress")
                 checkpoint_path = Path(self.cfg.checkpoint_path) / str(
@@ -2056,6 +2050,9 @@ class LanguageModelSAETrainingRunner:
             signal.signal(signal.SIGTERM, interrupt_callback)
             return trainer.fit()
         except (KeyboardInterrupt, InterruptedException):
+            if getattr(trainer, "_gradient_window_active", False) or getattr(trainer, "_runtime_update_pending", False):
+                logger.warning("Interrupted within an accumulation window; resume from the last completed checkpoint")
+                raise
             if self.cfg.checkpoint_path is not None:
                 logger.warning("interrupted, saving multi-SAE progress")
                 trainer.save_checkpoint(checkpoint_name=str(trainer.n_training_samples))

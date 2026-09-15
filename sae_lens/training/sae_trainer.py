@@ -53,6 +53,15 @@ from sae_lens.training.ddp_zero_optimizer import (
     optimizer_state_by_parameter,
     set_optimizer_parameter_state,
 )
+from sae_lens.training.gradient_window import (
+    configure_update_batch,
+    fit_window_batches,
+    require_window_boundary,
+    train_runtime_window,
+    validate_accumulation,
+    window_metrics,
+)
+from sae_lens.training.megatron_ddp import is_megatron_ddp
 from sae_lens.training.optim import CoefficientScheduler, get_lr_scheduler
 from sae_lens.training.optimizer_checkpoint import (
     load_parameter_groups,
@@ -177,12 +186,13 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         # Defaults to sae itself in manual mode.
         self._base_sae: T_TRAINING_SAE = base_sae if base_sae is not None else sae
         self._is_fsdp = isinstance(sae, FSDP)
-        self._is_ddp = isinstance(sae, DDP)
+        self._is_ddp = isinstance(sae, DDP) or is_megatron_ddp(sae)
         self.data_provider = data_provider
         self.evaluator = evaluator
         self.activation_scaler = ActivationScaler()
         self.save_checkpoint_fn = save_checkpoint_fn
         self.cfg = cfg
+        validate_accumulation(self)
         self.dp_group = dp_group
         self.token_count_weighted_dp = token_count_weighted_dp
 
@@ -299,7 +309,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             adam_kwargs={
                 "lr": cfg.lr,
                 "betas": (cfg.adam_beta1, cfg.adam_beta2),
-                **_adam_optimizer_kwargs_from_env(),
+                **({"fused": True} if runtime is not None and torch.device(cfg.device).type == "cuda" else _adam_optimizer_kwargs_from_env()),
             },
             zero_redundancy=getattr(cfg, "ddp_zero_optimizer", False),
             ddp_enabled=self._is_ddp,
@@ -315,6 +325,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             if runtime.require_local().dp_group.size() > 1:
                 dist.all_reduce(batch_total, group=runtime.require_local().dp_group)
             self._progress_batch_total = int(batch_total.item())
+            configure_update_batch(self)
             configure_runtime_checkpoints(self)
         assert cfg.lr_end is not None  # this is set in config post-init
         self.lr_scheduler = get_lr_scheduler(
@@ -443,6 +454,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 _ack_drain_done()
                 _save_quiesce_checkpoint()
                 break
+            self._runtime_update_pending = self.unit is not None
             step_number = self.n_training_steps + 1
             if self.step_window_profiler is not None:
                 self.step_window_profiler.on_step_start(step_number)
@@ -459,6 +471,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             try:
                 batch = next(self.data_provider).to(self._base_sae.device)
             except StopIteration:
+                self._runtime_update_pending = False
                 break
             self._maybe_synchronize_timing()
             data_timing = self._consume_data_provider_timing()
@@ -477,9 +490,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             self._maybe_synchronize_timing()
             sae_t0 = time.perf_counter()
             step_output, _dp_allreduce_time_s, memory_stats = self._train_step(
-                sae=self.sae, sae_in=scaled_batch
+                sae=self.sae, sae_in=scaled_batch,
+                **({"_fit_window": True} if self.unit else {}),
             )
-            if self.unit and self.token_count_weighted_dp:
+            if self.unit:
+                vllm_step_time_s += self._window_extra_data_time["vllm_step_time_s"]
+                transfer_time_s += self._window_extra_data_time["transfer_time_s"]
                 count, self._token_count_remainder = divmod(
                     self._last_global_tokens * self.cfg.train_batch_size_samples + getattr(self, "_token_count_remainder", 0),
                     self._progress_batch_total,
@@ -490,6 +506,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             memory_stats = {**after_data_fetch_mem, **after_scale_mem, **memory_stats}
             self._maybe_synchronize_timing()
             sae_time_s = time.perf_counter() - sae_t0
+            if self.unit:
+                sae_time_s = max(0.0, sae_time_s - self._window_data_time_s)
 
             if self.cfg.logger.log_to_wandb:
                 self._log_train_step(step_output)
@@ -504,7 +522,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             )
             self._record_memory_if_needed(memory_stats)
             self._maybe_stop_memory_timeline()
-            self.n_training_steps += 1
+            self.n_training_steps += int(not self.unit or self._last_step_had_tokens)
+            self._runtime_update_pending = False
             self._checkpoint_if_needed()
             self._update_pbar(step_output, pbar)
 
@@ -513,7 +532,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             if self.step_window_profiler is not None:
                 self.step_window_profiler.on_step_end(
                     step_number,
-                    samples=batch.shape[0],
+                    samples=self._last_window_local_tokens if self.unit else batch.shape[0],
                     components={
                         "vllm_step_time_s": vllm_step_time_s,
                         "transfer_time_s": transfer_time_s,
@@ -553,6 +572,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         checkpoint_name: str,
         wandb_aliases: list[str] | None = None,
     ) -> None:
+        require_window_boundary(self)
         checkpoint_name = runtime_checkpoint_name(self, checkpoint_name)
         # With TP, all ranks in DP replica 0 must participate in the save collectives,
         # but only TP rank 0 writes files. FSDP state-dict collectives require all
@@ -661,6 +681,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         return model_weights_path, cfg_path
 
     def save_trainer_state(self, checkpoint_path: Path) -> None:
+        require_window_boundary(self)
         checkpoint_path.mkdir(exist_ok=True, parents=True)
         save_runtime_trainer_state(self, checkpoint_path)
         scheduler_state_dicts = {
@@ -874,7 +895,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self,
         sae: T_TRAINING_SAE,
         sae_in: torch.Tensor,
-    ) -> tuple[TrainStepOutput, float]:
+        *, _fit_window: bool = False,
+    ) -> tuple[TrainStepOutput, float, dict[str, float]]:
         sae.train()
         if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
             _debug_prefix_tp("train_step forward start")
@@ -908,6 +930,13 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 sparsity_log_dict = self._build_sparsity_log_dict()
                 wandb.log(sparsity_log_dict, step=self.n_training_steps)
             self._reset_running_sparsity_stats()
+
+        if self.unit is not None:
+            first = {self.unit.hook_name: sae_in}
+            outputs, timing = train_runtime_window(
+                self, fit_window_batches(self, first) if _fit_window else [first]
+            )
+            return outputs[self.unit.hook_name], timing["sae_post_backward_time_s"], {}
 
         local_empty = self.unit is not None and sae_in.shape[0] == 0
         forward_input = (
@@ -1197,6 +1226,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             "n_training_samples": self.n_training_samples,
             "mse_loss": _unwrap_item(mse_loss),
             "overall_loss": _unwrap_item(step_output.loss),
+            **window_metrics(self),
         }
         if "auxiliary_reconstruction_loss" in step_output.losses:
             record["auxiliary_reconstruction_loss"] = _unwrap_item(
@@ -1444,13 +1474,16 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         pbar: tqdm,  # type: ignore
         update_interval: int = 8,
     ):
+        if self.unit:
+            pbar.update(self.n_training_samples - pbar.n)
         if self.n_training_steps % update_interval == 0:
             loss_strs = " | ".join(
                 f"{loss_name}: {_unwrap_item(loss_value):.5f}"
                 for loss_name, loss_value in step_output.losses.items()
             )
             pbar.set_description(f"{self.n_training_steps}| {loss_strs}")
-            pbar.update(update_interval * self.cfg.train_batch_size_samples)
+            if not self.unit:
+                pbar.update(update_interval * self.cfg.train_batch_size_samples)
 
 
 def _unwrap_item(

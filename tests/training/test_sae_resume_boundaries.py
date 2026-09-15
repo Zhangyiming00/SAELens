@@ -9,11 +9,11 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 from sae_lens.sae_runtime import SAERuntime, SAETrainingDomain
 from sae_lens.saes.megatron_topk_sae import MegatronTopKSAE
 from sae_lens.saes.topk_sae import TopKTrainingSAEConfig
+from sae_lens.training.megatron_ddp import wrap_runtime_sae
 from sae_lens.training.multi_sae_trainer import MultiSAETrainer
 from sae_lens.training.sae_trainer import SAETrainer
 from tests.saes.test_megatron_sae_boundaries import sae  # noqa: F401
@@ -40,11 +40,7 @@ def build_trainer(runtime, hooks, path, device="cpu", sparse=False):
             runtime=runtime,
         )
         models[hook] = model
-        wrapped[hook] = (
-            DDP(model, process_group=context.dp_group)
-            if context.dp_group.size() > 1
-            else model
-        )
+        wrapped[hook] = wrap_runtime_sae(model, runtime)
     kwargs = dict(
         cfg=cfg,
         data_provider=MagicMock(),
@@ -72,7 +68,7 @@ def step(trainer, batch):
     else:
         trainer._train_step({h: batch for h in trainer.hook_names}, len(batch))
         if trainer._last_step_had_tokens:
-            trainer.lr_scheduler.step()
+            trainer.lr_scheduler.step(trainer._last_updated_hooks)
     trainer.n_training_steps += 1
 
 
@@ -89,6 +85,36 @@ def assert_state_equal(left, right):
             assert_state_equal(a, b)
     else:
         assert left == right
+
+
+@pytest.mark.parametrize("phase", ["first_fetch", "after_backward"])
+def test_partial_window_cannot_be_checkpointed(sae, tmp_path, phase):  # noqa: F811
+    from sae_lens.training.gradient_window import train_runtime_window
+
+    runtime = object.__new__(SAERuntime)
+    runtime._closed = False
+    runtime.local = SimpleNamespace(
+        tp_group=sae._tp_group, dp_group=sae._tp_group,
+        domain=SAETrainingDomain("test", (0,), 1, ("h",)),
+    )
+    trainer, _ = build_trainer(runtime, ("h",), tmp_path)
+    before = copy.deepcopy(trainer.optimizer.state_dict())
+
+    def interrupted():
+        yield {"h": torch.randn(5, 16)}
+        raise RuntimeError("data source interrupted")
+
+    with pytest.raises(RuntimeError, match="data source interrupted"):
+        if phase == "first_fetch":
+            trainer.data_provider = MagicMock()
+            trainer.data_provider.__next__.side_effect = RuntimeError("data source interrupted")
+            trainer.fit()
+        else:
+            train_runtime_window(trainer, interrupted())
+    assert_state_equal(before, trainer.optimizer.state_dict())
+    with pytest.raises(RuntimeError, match="completed gradient accumulation window"):
+        trainer.save_trainer_state(tmp_path / "partial")
+    assert not (tmp_path / "partial").exists()
 
 
 @pytest.mark.parametrize("hook_count", [1, 2])
@@ -202,6 +228,34 @@ def _empty_worker(rank, rendezvous, output):
                     )
                     step(trainer, local)
                     step(trainer, batch)
+                    # Only TP shard zero / DP replica zero overflows. Every
+                    # shard of that hook must skip Adam and its scheduler.
+                    before = copy.deepcopy(trainer.optimizer.state_dict())
+                    before_lr = copy.deepcopy(trainer.lr_scheduler.state_dict())
+                    before_scale = trainer.grad_scaler.get_scale()
+                    handles = [
+                        model.encoder.weight.register_hook(
+                            lambda grad: torch.full_like(grad, float("inf"))
+                            if runtime.local.tp_rank == 0 and runtime.local.dp_rank == 0
+                            else grad
+                        ) for model in models.values()
+                    ]
+                    step(trainer, batch)
+                    assert_state_equal(before, trainer.optimizer.state_dict())
+                    assert_state_equal(before_lr, trainer.lr_scheduler.state_dict())
+                    assert trainer.grad_scaler.get_scale() == before_scale / 2
+                    for handle in handles:
+                        handle.remove()
+                    step(trainer, batch)
+                    # Legacy checkpoint execution flags must not turn the
+                    # CUDA runtime's fused Adam back into for-loop Adam.
+                    expected = copy.deepcopy(trainer.optimizer.state_dict())
+                    for group in trainer.optimizer.param_groups:
+                        group.update(fused=False, foreach=False)
+                    name = f"legacy_adam_tp{tp_size}_h{hook_count}"
+                    trainer.save_checkpoint(name)
+                    trainer.load_trainer_state(Path(output) / name)
+                    assert_state_equal(expected, trainer.optimizer.state_dict())
                 finally:
                     runtime.close()
     finally:

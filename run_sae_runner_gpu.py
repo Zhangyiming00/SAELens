@@ -64,6 +64,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--training-tokens", type=int, default=2048 * 4096)
     parser.add_argument("--train-batch-size-tokens", type=int, default=4096)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+        help="Provider microbatches per static SAE optimizer update, including DP=1.",
+    )
     parser.add_argument("--dead-feature-window", type=int, default=1000,
         help=(
             "Training steps before a feature is considered dead for TopK aux loss. "
@@ -322,8 +325,8 @@ def parse_args() -> argparse.Namespace:
         help="Explicitly set DDP static_graph=False.",
     )
     parser.add_argument(
-        "--ddp-bucket-cap-mb", type=int, default=None,
-        help="Explicitly set DDP bucket_cap_mb.",
+        "--ddp-bucket-cap-mb", type=float, default=None,
+        help="Gradient communication bucket size in MiB, independent of accumulation.",
     )
     parser.add_argument(
         "--ddp-config-strict", action="store_true", default=False,
@@ -1348,6 +1351,7 @@ def main() -> None:
         ddp_gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,
         ddp_static_graph=args.ddp_static_graph,
         ddp_bucket_cap_mb=args.ddp_bucket_cap_mb,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         ddp_config_strict=args.ddp_config_strict,
         fsdp_backward_prefetch=args.fsdp_backward_prefetch,
         fsdp_forward_prefetch=args.fsdp_forward_prefetch,

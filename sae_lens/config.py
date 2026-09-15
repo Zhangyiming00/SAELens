@@ -360,7 +360,9 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     ddp_find_unused_parameters: bool | None = None
     ddp_gradient_as_bucket_view: bool | None = None
     ddp_static_graph: bool | None = None
-    ddp_bucket_cap_mb: int | None = None
+    ddp_bucket_cap_mb: float | None = None
+    # Provider batch size and shuffle/buffer settings remain microbatch settings.
+    gradient_accumulation_steps: int = 1
     ddp_config_strict: bool = False
     fsdp_backward_prefetch: Literal["backward_pre", "backward_post", "none"] = (
         "backward_pre"
@@ -447,6 +449,10 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             )
         if self.ddp_bucket_cap_mb is not None and self.ddp_bucket_cap_mb <= 0:
             raise ValueError("ddp_bucket_cap_mb must be > 0 when set")
+        if type(self.gradient_accumulation_steps) is not int or self.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be a positive integer")
+        if self.streaming_mode and self.gradient_accumulation_steps != 1:
+            raise ValueError("Gradient accumulation currently requires static routing")
         if self.fsdp_backward_prefetch not in (
             "backward_pre",
             "backward_post",
@@ -617,9 +623,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
                 f"Lower bound: n_contexts_per_buffer (millions): {n_contexts_per_buffer / 10**6}"
             )
 
-            total_training_steps = (
-                self.training_tokens
-            ) // self.train_batch_size_tokens
+            total_training_steps = self.total_training_steps
             logger.info(f"Total training steps: {total_training_steps}")
 
             total_wandb_updates = (
@@ -726,7 +730,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
 
     @property
     def total_training_steps(self) -> int:
-        return self.total_training_tokens // self.train_batch_size_tokens
+        return math.ceil(self.total_training_tokens / (self.train_batch_size_tokens * self.gradient_accumulation_steps))
 
     def get_training_sae_cfg_dict(self) -> dict[str, Any]:
         return self.sae.to_dict()
@@ -809,6 +813,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             multi_sae_tp_phase_fence=self.multi_sae_tp_phase_fence,
             multi_sae_optimizer_overlap=self.multi_sae_optimizer_overlap,
             ddp_zero_optimizer=self.ddp_zero_optimizer,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
             total_training_samples=self.total_training_tokens,
             device=self.device,
             autocast=self.autocast,
@@ -1129,6 +1134,7 @@ class SAETrainerConfig:
     multi_sae_tp_phase_fence: Literal["auto", "always", "off"] = "auto"
     multi_sae_optimizer_overlap: Literal["off", "on", "non_tp_only"] = "off"
     ddp_zero_optimizer: bool = False
+    gradient_accumulation_steps: int = 1
     # Runtime-only hint filled by LanguageModelSAETrainingRunner.  It is true
     # when producer and SAE roles share this rank, so auto fence can protect a
     # cross-process-group handoff without exposing another CLI knob.
@@ -1136,4 +1142,4 @@ class SAETrainerConfig:
 
     @property
     def total_training_steps(self) -> int:
-        return self.total_training_samples // self.train_batch_size_samples
+        return math.ceil(self.total_training_samples / (self.train_batch_size_samples * self.gradient_accumulation_steps))
