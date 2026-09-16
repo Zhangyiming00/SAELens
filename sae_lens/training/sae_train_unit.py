@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, MutableMapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -15,6 +15,11 @@ from torch.optim import Optimizer
 from sae_lens.profiling import cuda_nvtx_range
 from sae_lens.sae_runtime import SAERuntime
 from sae_lens.training.megatron_ddp import is_megatron_ddp, supports_early_grad_sync
+from sae_lens.training.megatron_optimizer import is_megatron_optimizer
+from sae_lens.training.optimizer_checkpoint import optimizer_state_for_loading
+
+if TYPE_CHECKING:
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
 
 
 @dataclass
@@ -22,7 +27,7 @@ class SAETrainUnit:
     hook_name: str
     model: Any
     ddp: Any
-    optimizer: Optimizer
+    optimizer: Optimizer | MegatronOptimizer
     parallel_context: SAERuntime
     _grad_sync_started: bool = field(default=False, init=False)
     _grad_sync_finished: bool = field(default=False, init=False)
@@ -163,6 +168,8 @@ class SAETrainUnit:
         if is_megatron_ddp(self.ddp) and not self._grad_sync_finished:
             raise RuntimeError("Finish hook gradient reduction before clipping")
         self.check_failure()
+        if is_megatron_optimizer(self.optimizer):
+            return self.optimizer.clip_grad_norm(max_norm)
         return self.model.clip_grad_norm_(max_norm)
 
     def step(self):
@@ -237,7 +244,7 @@ class UnitOptimizers(Optimizer):
         # Optimizer.load_state_dict replaces state/group containers. Transfer
         # those loaded values back to their owners and reinstate the live view.
         groups = self.param_groups
-        super().load_state_dict(state_dict)
+        super().load_state_dict(optimizer_state_for_loading(self, state_dict))
         loaded_state = self.state
         for live, loaded in zip(groups, self.param_groups, strict=True):
             live.clear()

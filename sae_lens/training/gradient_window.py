@@ -17,6 +17,7 @@ import torch.distributed as dist
 
 from sae_lens import logger
 from sae_lens.saes.sae import TrainStepInput, TrainStepOutput
+from sae_lens.training.megatron_optimizer import is_megatron_optimizer
 from sae_lens.training.sae_train_unit import SAETrainUnit
 
 
@@ -257,8 +258,12 @@ def train_runtime_window(
                     p for p in unit.model.parameters() if p.grad is not None
                 ).grad.fill_(float("inf"))
         trainer.grad_scaler.unscale_(unit.optimizer)
-        unit.clip_grad_norm(1.0)
+        if not is_megatron_optimizer(unit.optimizer):
+            unit.clip_grad_norm(1.0)
         unit.check_failure()
+        # Native FP32Optimizer.step owns prepare_grads, per-hook clipping and
+        # the Adam update. GradScaler gates the whole native step on overflow;
+        # do not clip twice or bypass Megatron via its inner Adam.
         trainer.grad_scaler.step(unit.optimizer)
         if finite:
             trainer._last_updated_hooks.append(h)

@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +22,10 @@ from sae_lens.saes.megatron_topk_sae import MegatronTopKSAE
 from sae_lens.saes.topk_sae import TopKTrainingSAEConfig
 from sae_lens.training.dp_batch import balanced_token_counts
 from sae_lens.training.megatron_ddp import is_megatron_ddp, wrap_runtime_sae
+from sae_lens.training.megatron_optimizer import (
+    MEGATRON_GROUP_METADATA,
+    is_megatron_optimizer,
+)
 from sae_lens.training.multi_sae_trainer import MultiSAETrainer
 from sae_lens.training.sae_train_unit import SAETrainUnit
 from sae_lens.training.sae_trainer import SAETrainer
@@ -86,6 +91,14 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
     snapshots = {}
     scaled = accumulation == 3 and bucket >= 1.0
 
+    def comparable_adam_state(optimizer_state):
+        # Native group identifiers are extra checkpoint bookkeeping, not
+        # numerical hyperparameters or optimizer moments.
+        return {**optimizer_state, "param_groups": [
+            {k: v for k, v in g.items() if k not in MEGATRON_GROUP_METADATA}
+            for g in optimizer_state["param_groups"]
+        ]}
+
     def compare(actual, expected, kind):
         if isinstance(actual, dict):
             assert actual.keys() == expected.keys()
@@ -96,7 +109,7 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
             if torch.is_tensor(actual) and actual.numel():
                 errors[kind] = max(errors[kind], (actual - expected).abs().max().item())
 
-    def build(position=0, *, late_reference=False):
+    def build(position=0, *, late_reference=False, legacy_optimizer=False):
         events = []
         audit = {}
         models = {
@@ -123,19 +136,32 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
             dp_group=ctx.dp_group,
             token_count_weighted_dp=True,
         )
-        if single:
-            trainer = SAETrainer(
-                sae=wrapped[hooks[0]], base_sae=models[hooks[0]], **kwargs
-            )
-        else:
-            trainer = MultiSAETrainer(
-                hook_names=list(hooks),
-                sae_by_hook=wrapped,
-                base_sae_by_hook=models,
-                save_checkpoint_fn=None,
-                sae_dp_mode="ddp",
-                **kwargs,
-            )
+        with ExitStack() as stack:
+            if legacy_optimizer:
+                # Reproduce the previous release's torch Adam + model clip
+                # path. No production option can opt out of Megatron on CUDA.
+                def old_optimizer(model, _runtime, *, adam_kwargs):
+                    kwargs = {**adam_kwargs, "fused": True}
+                    kwargs.pop("foreach", None)
+                    return torch.optim.Adam(model.parameters(), **kwargs)
+
+                for module in ("sae_trainer", "multi_sae_trainer"):
+                    stack.enter_context(patch(
+                        f"sae_lens.training.{module}.build_runtime_optimizer", old_optimizer
+                    ))
+            if single:
+                trainer = SAETrainer(
+                    sae=wrapped[hooks[0]], base_sae=models[hooks[0]], **kwargs
+                )
+            else:
+                trainer = MultiSAETrainer(
+                    hook_names=list(hooks),
+                    sae_by_hook=wrapped,
+                    base_sae_by_hook=models,
+                    save_checkpoint_fn=None,
+                    sae_dp_mode="ddp",
+                    **kwargs,
+                )
         if scaled:
             trainer.grad_scaler = torch.amp.GradScaler(
                 "cuda", init_scale=64, growth_interval=2
@@ -150,6 +176,25 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
             for index, b in enumerate(b for buf in unit.ddp.buffers for b in buf.buckets)
         }
         for h, unit in units.items():
+            assert is_megatron_optimizer(unit.optimizer) != legacy_optimizer
+            if not legacy_optimizer:
+                assert unit.optimizer.tp_group is ctx.tp_group
+                assert unit.optimizer.grad_stats_parallel_group is ctx.tp_group
+                assert unit.optimizer.config.clip_grad == 1.0
+                for method in ("prepare_grads", "step_with_ready_grads"):
+                    original = getattr(unit.optimizer, method)
+
+                    def native_update(*args, original=original, method=method, h=h, unit=unit, **kwargs):
+                        assert unit._grad_sync_finished
+                        events.append((trainer.n_training_steps, method, h))
+                        return original(*args, **kwargs)
+
+                    setattr(unit.optimizer, method, native_update)
+
+                def forbidden_clip(*_args, **_kwargs):
+                    raise AssertionError("CUDA updates must use Megatron's clip, not the model's")
+
+                unit.model.clip_grad_norm_ = forbidden_clip
             assert unit.optimizer.param_groups[0]["fused"]
             assert unit.early_grad_sync
             if late_reference:
@@ -177,10 +222,12 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
             unit.forward = forward
             unit.ddp.start_grad_sync = start
             unit.backward = backward
-            original_clip = unit.clip_grad_norm
+            clip_owner = unit if legacy_optimizer else unit.optimizer
+            original_clip = clip_owner.clip_grad_norm
 
             def clip(max_norm=1.0, h=h, unit=unit, original_clip=original_clip):
                 step = trainer.n_training_steps
+                events.append((step, "clip", h))
                 expected = golden[accumulation][h]["snapshots"][step]
                 gradients = native_state(
                     unit.model,
@@ -195,7 +242,7 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
                     "grad",
                 )
                 audit[(step, h, "grad")] = {n: v["g"].cpu() for n, v in gradients.items()}
-                norm = original_clip(max_norm)
+                norm = torch.as_tensor(original_clip(max_norm))
                 audit[(step, h, "norm")] = norm.detach().cpu()
                 torch.testing.assert_close(norm.cpu(), expected["norm"], **TOL)
                 gradients = native_state(
@@ -213,7 +260,7 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
                 audit[(step, h, "clipped")] = {n: v["g"].cpu() for n, v in gradients.items()}
                 return norm
 
-            unit.clip_grad_norm = clip
+            clip_owner.clip_grad_norm = clip
 
         def checkpoint():
             step = trainer.n_training_steps - 1
@@ -245,6 +292,12 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
                     assert all(i > max(ends) for i in reductions)
             # fit() has now advanced scheduler and update counters.
             for h, unit in units.items():
+                active = trainer._last_global_tokens_by_hook[h] > 0
+                assert [e for e in window_events if e == ("clip", h)] == ([("clip", h)] if active else [])
+                if not legacy_optimizer:
+                    assert [e for e in window_events if e[0] in ("prepare_grads", "clip", "step_with_ready_grads") and e[1] == h] == ([
+                        ("prepare_grads", h), ("clip", h), ("step_with_ready_grads", h)
+                    ] if active else [])
                 expected = golden[accumulation][h]["snapshots"][step]
                 state = unit.model.export_saelens_state_dict()
                 compare(
@@ -287,10 +340,11 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
                 trainer.optimizer.state_dict()
             )
             if trainer.n_training_steps == 1 and position == 0 and not late_reference:
-                trainer.save_checkpoint("window")
+                name = "legacy_window" if legacy_optimizer else "window"
+                trainer.save_checkpoint(name)
                 torch.save(
                     provider.position,
-                    path / "window" / f"provider_rank{dist.get_rank()}.pt",
+                    path / name / f"provider_rank{dist.get_rank()}.pt",
                 )
 
         trainer._checkpoint_if_needed = checkpoint
@@ -345,11 +399,33 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
                 restored_models[h].state_dict(), expected_models[h], **tolerance
             )
         assert restored_provider.seen == list(range(position, 7))
+    bucket = original_bucket
+    legacy, _, _ = build(legacy_optimizer=True)
+    fit_audited(legacy)
+    torch.testing.assert_close(legacy._schedule_audit, continuous._schedule_audit, **TOL)
+    torch.testing.assert_close(comparable_adam_state(legacy.optimizer.state_dict()), comparable_adam_state(final), **TOL)
+    # The legacy writer has the old model clipping and optimizer class. Load
+    # its actual on-disk checkpoint into native Megatron, checking state at
+    # the boundary exactly and subsequent updates against both references.
+    legacy_boundary = copy.deepcopy(snapshots[1])
+    migrated, migrated_models, migrated_provider = build(position)
+    migrated.load_trainer_state(path / "legacy_window")
+    if single:
+        migrated_models[hooks[0]].load_weights_from_checkpoint(path / "legacy_window")
+    torch.testing.assert_close(comparable_adam_state(migrated.optimizer.state_dict()), comparable_adam_state(legacy_boundary), rtol=0, atol=0)
+    fit_audited(migrated)
+    torch.testing.assert_close(comparable_adam_state(migrated.optimizer.state_dict()), comparable_adam_state(legacy.optimizer.state_dict()), **TOL)
+    torch.testing.assert_close(migrated.optimizer.state_dict(), final, **TOL)
+    torch.testing.assert_close(migrated.lr_scheduler.state_dict(), final_scheduler, rtol=0, atol=0)
+    assert migrated.grad_scaler.state_dict() == final_scaler
+    assert migrated_provider.seen == list(range(position, 7))
     return dict(
         errors=errors,
         ga1_late_schedule_bitwise_equal=True if accumulation == 1 else None,
         native_vs_explicit_sync_bitwise_equal=True,
         native_bucket_ready_collectives_verified=True,
+        native_optimizer_clip_and_step_once_verified=True,
+        legacy_optimizer_resume="boundary_bitwise_equal; updates_within_tolerance",
         updates=continuous.n_training_steps,
         microbatches=7,
         resume="same_bucket_bitwise_equal; changed_bucket_within_tolerance",
@@ -360,7 +436,7 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
     )
 
 
-def worker(rank, directory):
+def worker(rank, directory, rendezvous=None):
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -370,7 +446,7 @@ def worker(rank, directory):
         "nccl",
         rank=rank,
         world_size=4,
-        init_method=f"file://{directory / 'rdzv'}",
+        init_method=f"file://{rendezvous or directory / 'rdzv'}",
         timeout=timedelta(seconds=120),
     )
     try:
@@ -476,7 +552,10 @@ def test_native_large_batch_and_resume(tmp_path, monkeypatch):
         check=True,
         timeout=120,
     )
-    context = mp.spawn(worker, args=(str(directory),), nprocs=4, join=False)
+    # A failed run can leave FileStore keys behind in an explicit report
+    # directory. Every rerun must rendezvous through a fresh file.
+    rendezvous = directory / f"rdzv_{time.time_ns()}"
+    context = mp.spawn(worker, args=(str(directory), str(rendezvous)), nprocs=4, join=False)
     deadline = time.monotonic() + 180
     try:
         while not context.join(timeout=1):

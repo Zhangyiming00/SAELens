@@ -164,24 +164,27 @@ def _worker(rank, args):
                     assert not megatron, "Historical reference must use the pre-GA source snapshot"
                 else:
                     assert megatron
-                assert unit.optimizer.defaults["fused"]
+                native_optimizer = hasattr(unit.optimizer, "get_main_grads_for_grad_norm")
+                adam = unit.optimizer.optimizer if native_optimizer else unit.optimizer
+                assert adam.defaults["fused"]
                 unit.ddp._ga1_hook = hook
                 prefix = f"ga1:{hook}:"
                 for method, phase in [
                     ("forward", "forward"), ("backward", "backward"),
                     ("finish_window", "grad_normalize"),
                     ("finish_grad_sync", "grad_sync"),
-                    ("clip_grad_norm", "clip"),
                 ]:
                     if hasattr(unit, method):
                         nvtx_method(unit, method, prefix + phase)
+                nvtx_method(unit.optimizer if native_optimizer else unit,
+                            "clip_grad_norm", prefix + "clip")
                 if megatron:
                     # Native ready hooks dispatch bucket groups directly;
                     # instrument the actual launch point for both schedules.
                     for group in unit.ddp.bucket_groups + unit.ddp.expert_parallel_bucket_groups:
                         nvtx_method(group, "start_grad_sync", prefix + "ddp_launch")
                     nvtx_method(unit.ddp, "finish_grad_sync", prefix + "ddp_wait")
-                nvtx_method(unit.optimizer, "step", prefix + "fused_adam")
+                nvtx_method(adam, "step", prefix + "fused_adam")
 
                 def zero_label(h=hook, p=prefix):
                     zero_counts[h] += 1
@@ -194,7 +197,8 @@ def _worker(rank, args):
                     bucket_size=unit.ddp.ddp_config.bucket_size if megatron else None,
                     buckets=[b.grad_data.numel() for buf in unit.ddp.buffers for b in buf.buckets] if megatron else [],
                     grad_buffer_bytes=sum(buf.grad_data.numel() * 4 for buf in unit.ddp.buffers) if megatron else None,
-                    fused_adam=unit.optimizer.defaults["fused"],
+                    fused_adam=adam.defaults["fused"],
+                    megatron_optimizer=native_optimizer,
                     global_update_batch_size=getattr(trainer, "global_update_batch_size", global_batch),
                     early_grad_sync=getattr(unit, "early_grad_sync", False),
                     megatron_ddp=megatron,

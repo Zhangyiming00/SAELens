@@ -1,8 +1,9 @@
 # 静态 routing：Megatron DDP 与梯度累计
 
-静态 CUDA TopK SAE 按 hook 建立独立 Megatron DDP、梯度 buffer、fused
-`torch.optim.Adam` 和 LR scheduler。DP1 使用同一条路径。FP32 参数可配合
-BF16 autocast；CPU 测试使用兼容路径，不作为 Megatron DDP 验收。
+静态 CUDA TopK SAE 按 hook 建立独立 Megatron DDP、梯度 buffer、原生
+`FP32Optimizer` 和 LR scheduler。Megatron 负责梯度裁剪和优化器更新，底层
+使用 SAELens 配置的 fused `torch.optim.Adam`。DP1 使用同一条路径。FP32 参数
+可配合 BF16 autocast；CPU 测试使用兼容路径，不作为 Megatron CUDA 验收。
 
 ## 配置和 batch 定义
 
@@ -103,6 +104,39 @@ backward 返回后才进入下一 hook；本次允许原生 DDP 在该 backward 
 整个窗口没有有效 token 的 hook 不更新参数、Adam 或 scheduler；全空窗口也不
 推进 scaler。AMP 跳过的 hook 不推进 scheduler。
 
+### Megatron 优化器与独立裁剪
+
+每个 CUDA hook 的 `unit.optimizer` 是 Megatron-core 原生 `FP32Optimizer`。
+窗口末先完成归约、token 归一化和 AMP 反缩放，随后由原生 `step()` 执行
+`prepare_grads()`、`clip_grad_norm(1.0)`、`step_with_ready_grads()`。
+训练循环不再额外调用模型裁剪。每个 hook 只有一次裁剪和 Adam 更新，
+不使用会合并不同 hook 范数的 `ChainedOptimizer`。
+
+`tp_group` 与 `grad_stats_parallel_group` 都显式使用该 hook 的 TP group，
+包括 TP1 singleton；DP replica 不重复计入范数。Megatron 根据原有 TP
+参数属性识别分片与复制参数，复制的 `b_dec` 只在 TP rank 0 计入。
+原生裁剪仍为 L2 范数，系数为 `min(1, 1 / (norm + 1e-6))`。
+不同范数归约实现允许 FP32 舍入误差，验收比较裁剪前后梯度及 Adam 状态。
+
+采用 Megatron 官方支持的 `FP32Optimizer(base_optimizer, config, ...)`
+接入方式。底层 Adam 保留 `lr`、`betas`、默认 `eps=1e-8`、零 weight decay、
+bias correction、fused CUDA kernel，以及原有每 hook 一个参数组和逐参数
+moment/step 格式。没有更换为默认 AdamW，也没有安装 TE/Apex 或启用
+distributed optimizer。Megatron 管理整个更新流程，项目不实现 Adam 算法。
+参数组增加 Megatron 状态加载所需的四个识别字段；它们不改变 Adam 数值，
+加载旧的命名或 flat checkpoint 时从当前组补齐。
+
+原有共享 PyTorch GradScaler 保持不变：它在 TP 内一致判定溢出，反缩放后
+调用或跳过整个 Megatron step。BF16 autocast 不改变 FP32 参数类型，因而
+无需额外低精度 master weights。空 hook 跳过整个更新；原有 scheduler
+只在成功更新后推进，并通过底层 optimizer 的同一组字典调整 LR。
+
+检查点继续使用 SAELens 命名/TP 可重分片的 moment 格式和已有 scheduler、
+scaler 格式；`UnitOptimizers` 只提供跨 hook 的状态视图。恢复后的实际更新
+仍交给 Megatron，不因旧 checkpoint 的执行标志退回项目优化器路径。
+Megatron-core 0.16.1 的原生 optimizer/clip 依赖 CUDA，CPU 布局与参考测试
+保留 torch Adam 兼容实现。非静态训练路径不受此迁移影响。
+
 dead-feature mask 在窗口内固定，窗口末合并 firing 信息并推进一次计数，
 与原生 SAELens 把相同 token 拼成一个大 batch 的行为一致。
 LR 的训练步数按 `ceil(训练预算 / 名义更新 batch)` 规划，warmup/decay/
@@ -145,6 +179,12 @@ token 进度。检查点身份包含累计次数，禁止无提示地改变更�
 用两种 bucket 重复验证，共 24 组；包含不同 replica/hook token 数、空 replica、
 全空 hook、短 microbatch、尾窗口，以及保持/改变 bucket 的磁盘续训。
 判定容差为 `atol=4e-6, rtol=4e-5`，同 bucket 续训使用零容差。
+同一矩阵也验证原生优化器每个非空 hook 窗口恰好准备、裁剪、更新各一次，
+全空 hook 三者均不执行；旧 Adam 检查点的数值状态加载使用零容差，后续
+更新与旧实现及原生大 batch 都按上述 FP32 容差比较。
+
+Megatron 优化器迁移的记录见
+[验收报告](../results/megatron_optimizer_20260915/README.md)。
 
 真实 runner 验收用本地 Llama-3.1-8B，经 vLLM、静态 routing、token 排除和
 混合 buffer，核对恢复前后每一个 microbatch 的内容哈希，并比较模型、Adam、

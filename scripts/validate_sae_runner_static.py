@@ -167,11 +167,15 @@ def _worker(
 
     class AuditRunner(LanguageModelSAETrainingRunner):
         def audit_train(self, trainer, run):
+            from megatron.core.optimizer.optimizer import FP32Optimizer
+
             self.audited_trainer = trainer
             self.steps = []
             self.microbatches = []
             units = getattr(trainer, "units", {}) or {hooks[0]: trainer.unit}
             for hook, unit in units.items():
+                assert type(unit.optimizer) is FP32Optimizer
+                assert unit.optimizer.grad_stats_parallel_group is unit.parallel_context.require_local().tp_group
                 forward = unit.forward
 
                 def audited_forward(step_input, hook=hook, forward=forward):
@@ -507,6 +511,8 @@ def main():
         "sae_lens/training/sae_train_unit.py",
         "sae_lens/training/gradient_window.py",
         "sae_lens/training/megatron_ddp.py",
+        "sae_lens/training/megatron_optimizer.py",
+        "sae_lens/training/optim.py",
         "sae_lens/training/optimizer_checkpoint.py",
         "sae_lens/saes/megatron_topk_sae.py",
         "sae_lens/config.py",

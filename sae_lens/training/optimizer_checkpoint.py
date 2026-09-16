@@ -2,6 +2,17 @@
 
 from copy import deepcopy
 
+from sae_lens.training.megatron_optimizer import MEGATRON_GROUP_METADATA
+
+
+def optimizer_state_for_loading(optimizer, state):
+    """Backfill native group identifiers in older flat Adam checkpoints."""
+    groups = []
+    for live, saved in zip(optimizer.param_groups, state["param_groups"], strict=True):
+        metadata = {key: live[key] for key in MEGATRON_GROUP_METADATA if key in live}
+        groups.append({**metadata, **saved})
+    return {**state, "param_groups": groups}
+
 
 def save_parameter_groups(optimizer, named_parameters):
     names = {id(param): name for name, param in named_parameters}
@@ -30,8 +41,10 @@ def load_parameter_groups(optimizer, named_parameters, saved_groups):
     for saved in saved_groups:
         group = live[frozenset(saved["params"])]
         params = group["params"]
+        metadata = {key: group[key] for key in MEGATRON_GROUP_METADATA if key in group}
         # Preserve the live dictionary: UnitOptimizers and the scheduler reference it.
         group.clear()
+        group.update(metadata)
         group.update(deepcopy({k: v for k, v in saved.items() if k != "params"}))
         group["params"] = params
 

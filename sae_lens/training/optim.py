@@ -7,6 +7,8 @@ from typing import Any
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 
+from sae_lens.training.megatron_optimizer import scheduler_optimizer
+
 
 #  Constant
 #  Cosine Annealing with Warmup
@@ -35,6 +37,7 @@ def get_lr_scheduler(
         num_cycles (int, optional): Number of cycles for cosine annealing with warm restarts. Defaults to 1.
         lr_end (float, optional): Final learning rate multiplier before decay. Defaults to 0.0.
     """
+    optimizer = scheduler_optimizer(optimizer)
     base_scheduler_steps = training_steps - warm_up_steps - decay_steps
     norm_scheduler_name = scheduler_name.lower()
     main_scheduler = _get_main_lr_scheduler(

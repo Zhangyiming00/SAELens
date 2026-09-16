@@ -64,6 +64,7 @@ from sae_lens.training.gradient_window import (
     validate_accumulation,
     window_metrics,
 )
+from sae_lens.training.megatron_optimizer import build_runtime_optimizer
 from sae_lens.training.multi_hook_sae import MultiHookSAE
 from sae_lens.training.optim import get_lr_scheduler
 from sae_lens.training.optimizer_checkpoint import (
@@ -244,15 +245,10 @@ class MultiSAETrainer:
             _adam_kwargs["foreach"] = False
         use_zero_optimizer = bool(getattr(cfg, "ddp_zero_optimizer", False))
         if runtime is not None:
-            if torch.device(cfg.device).type == "cuda":
-                _adam_kwargs.pop("foreach", None)
-                _adam_kwargs["fused"] = True
             for hook_name in self.hook_names:
                 model = self.base_sae_by_hook[hook_name]
-                optimizer = build_adam_optimizer(
-                    model.parameters(), adam_kwargs=_adam_kwargs,
-                    zero_redundancy=False, ddp_enabled=self._is_ddp,
-                    dp_group=self.dp_group,
+                optimizer = build_runtime_optimizer(
+                    model, runtime, adam_kwargs=_adam_kwargs,
                 )
                 self.units[hook_name] = SAETrainUnit(
                     hook_name, model, self.sae_by_hook[hook_name], optimizer, runtime

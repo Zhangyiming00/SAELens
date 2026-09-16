@@ -62,9 +62,11 @@ from sae_lens.training.gradient_window import (
     window_metrics,
 )
 from sae_lens.training.megatron_ddp import is_megatron_ddp
+from sae_lens.training.megatron_optimizer import build_runtime_optimizer
 from sae_lens.training.optim import CoefficientScheduler, get_lr_scheduler
 from sae_lens.training.optimizer_checkpoint import (
     load_parameter_groups,
+    optimizer_state_for_loading,
     restore_legacy_learning_rates,
     save_parameter_groups,
 )
@@ -304,17 +306,23 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
         # Optimizer is constructed over self.sae.parameters() so that in FSDP mode
         # it sees FSDP's managed parameter views; in manual mode self.sae == _base_sae.
-        self.optimizer = build_adam_optimizer(
-            sae.parameters(),
-            adam_kwargs={
-                "lr": cfg.lr,
-                "betas": (cfg.adam_beta1, cfg.adam_beta2),
-                **({"fused": True} if runtime is not None and torch.device(cfg.device).type == "cuda" else _adam_optimizer_kwargs_from_env()),
-            },
-            zero_redundancy=getattr(cfg, "ddp_zero_optimizer", False),
-            ddp_enabled=self._is_ddp,
-            dp_group=self.dp_group,
-        )
+        adam_kwargs = {
+            "lr": cfg.lr,
+            "betas": (cfg.adam_beta1, cfg.adam_beta2),
+            **_adam_optimizer_kwargs_from_env(),
+        }
+        if runtime is not None:
+            self.optimizer = build_runtime_optimizer(
+                self._base_sae, runtime, adam_kwargs=adam_kwargs
+            )
+        else:
+            self.optimizer = build_adam_optimizer(
+                sae.parameters(),
+                adam_kwargs=adam_kwargs,
+                zero_redundancy=getattr(cfg, "ddp_zero_optimizer", False),
+                ddp_enabled=self._is_ddp,
+                dp_group=self.dp_group,
+            )
         if runtime is not None:
             hooks = runtime.require_local().domain.hooks
             self.unit = SAETrainUnit(
@@ -775,7 +783,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             elif "optimizer_by_name" in state_dict:
                 self._load_named_optimizer_state(state_dict["optimizer_by_name"])
             else:
-                self.optimizer.load_state_dict(state_dict["optimizer"])
+                self.optimizer.load_state_dict(
+                    optimizer_state_for_loading(self.optimizer, state_dict["optimizer"])
+                )
             self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
             if "optimizer_param_groups" in state_dict:
                 load_parameter_groups(

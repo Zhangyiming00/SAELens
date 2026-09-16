@@ -10,8 +10,43 @@ import torch
 from sae_lens.sae_runtime import SAERuntime
 from sae_lens.saes.megatron_topk_sae import MegatronTopKSAE
 from sae_lens.training.megatron_ddp import supports_early_grad_sync
+from sae_lens.training.megatron_optimizer import (
+    MEGATRON_GROUP_METADATA,
+    build_runtime_optimizer,
+)
+from sae_lens.training.optim import get_lr_scheduler
+from sae_lens.training.optimizer_checkpoint import optimizer_state_for_loading
 from sae_lens.training.sae_train_unit import SAETrainUnit, UnitOptimizers
 from tests.saes.test_megatron_sae_boundaries import sae  # noqa: F401
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Megatron optimizer requires CUDA")
+def test_native_optimizer_raw_state_round_trip_and_legacy_groups(sae):  # noqa: F811
+    from megatron.core.optimizer.optimizer import FP32Optimizer
+
+    sae.to("cuda")
+    runtime = SimpleNamespace(require_local=lambda: SimpleNamespace(tp_group=sae._tp_group))
+    optimizer = build_runtime_optimizer(sae, runtime, adam_kwargs={"lr": 3e-4})
+    assert type(optimizer) is FP32Optimizer
+    scheduler = get_lr_scheduler("cosineannealing", optimizer, 8, 3e-4, 0, 0, 3e-5, 1)
+    assert scheduler.optimizer is optimizer.optimizer
+    for p in sae.parameters():
+        p.grad = torch.ones_like(p)
+    success, norm, _ = optimizer.step()
+    assert success and norm > 1
+    scheduler.step()
+    saved = copy.deepcopy(optimizer.state_dict())
+    optimizer.state.clear()
+    optimizer.load_state_dict(copy.deepcopy(saved))
+    torch.testing.assert_close(optimizer.state_dict(), saved, atol=0, rtol=0)
+    legacy = copy.deepcopy(saved)
+    for group in legacy["param_groups"]:
+        for key in MEGATRON_GROUP_METADATA:
+            del group[key]
+    optimizer.state.clear()
+    optimizer.load_state_dict(optimizer_state_for_loading(optimizer, legacy))
+    torch.testing.assert_close(optimizer.state_dict(), saved, atol=0, rtol=0)
+    assert scheduler.optimizer.param_groups is optimizer.param_groups
 
 
 def test_unit_optimizer_state_round_trip_and_independent_updates(sae):  # noqa: F811
