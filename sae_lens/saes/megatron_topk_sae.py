@@ -9,6 +9,8 @@ from __future__ import annotations
 import copy
 import json
 import warnings
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,11 @@ from sae_lens.saes.topk_sae import (
     _fold_norm_topk,
     calculate_topk_aux_acts,
 )
+
+
+@dataclass
+class MegatronTPWavefrontState(TopKTPWavefrontState):
+    decoder_norm: torch.Tensor | None = None
 
 
 class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
@@ -185,6 +192,32 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
     def get_coefficients(self) -> dict[str, float]:
         return {}
 
+    @contextmanager
+    def _share_decoder_norm(self, norm: torch.Tensor | None = None):
+        """Share one differentiable norm node within this forward only.
+
+        Its vector gradients combine before expanding to the decoder matrix.
+        Restore the scope on exceptions/nested calls; never reuse across steps.
+        """
+        previous = getattr(self, "_decoder_norm_scope", None)
+        self._decoder_norm_scope = [norm]
+        try:
+            yield
+        finally:
+            self._decoder_norm_scope = previous
+
+    def _decoder_norm(self) -> torch.Tensor:
+        scope = getattr(self, "_decoder_norm_scope", None)
+        if scope is None:
+            return self.decoder.weight.norm(dim=0)
+        if scope[0] is None:
+            scope[0] = self.decoder.weight.norm(dim=0)
+        return scope[0]
+
+    def training_forward_pass(self, step_input: TrainStepInput) -> TrainStepOutput:
+        with self._share_decoder_norm():
+            return super().training_forward_pass(step_input)
+
     def process_sae_in(self, sae_in: torch.Tensor) -> torch.Tensor:
         sae_in = self.reshape_fn_in(sae_in.to(self.dtype))
         sae_in = self.hook_sae_input(sae_in)
@@ -218,7 +251,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         local, _ = self.encoder(sae_in.reshape(-1, self.cfg.d_in))
         local = self.hook_sae_acts_pre(local.reshape(*shape, -1))
         if self.cfg.rescale_acts_by_decoder_norm:
-            local = local * self.decoder.weight.norm(dim=0)
+            local = local * self._decoder_norm()
         hidden_pre = megatron_tp_allgather(local, self._tp_group)
         return self.hook_sae_acts_post(self.activation_fn(hidden_pre)), hidden_pre
 
@@ -228,7 +261,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         width = self.cfg.d_sae // self.tp_size
         local = feature_acts.narrow(-1, self.tp_rank * width, width)
         if self.cfg.rescale_acts_by_decoder_norm:
-            local = local * (1 / self.decoder.weight.norm(dim=0))
+            local = local * (1 / self._decoder_norm())
         result, _ = self.decoder(local.reshape(-1, width))
         return result.reshape(*feature_acts.shape[:-1], self.cfg.d_in)
 
@@ -277,27 +310,31 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
 
     def tp_wavefront_encode_launch(
         self, step_input: TrainStepInput
-    ) -> TopKTPWavefrontState:
+    ) -> MegatronTPWavefrontState:
         if not self.tp_wavefront_supported():
             raise RuntimeError("TP wavefront requires a CUDA SAE with TP > 1")
         sae_in = self.process_sae_in(step_input.sae_in)
         local, _ = self.encoder(sae_in.reshape(-1, self.cfg.d_in))
         local = self.hook_sae_acts_pre(local.reshape(*sae_in.shape[:-1], -1))
+        norm = None
         if self.cfg.rescale_acts_by_decoder_norm:
-            local = local * self.decoder.weight.norm(dim=0)
-        return TopKTPWavefrontState(
+            norm = self.decoder.weight.norm(dim=0)
+            local = local * norm
+        return MegatronTPWavefrontState(
             step_input=step_input, hidden_pre_local=local,
             gather=megatron_tp_launch(local, self._tp_group, gather=True),
+            decoder_norm=norm,
         )
 
-    def tp_wavefront_decode_launch(self, state: TopKTPWavefrontState) -> None:
+    def tp_wavefront_decode_launch(self, state: MegatronTPWavefrontState) -> None:
         hidden_pre = state.gather.wait()
         feature_acts = self.hook_sae_acts_post(self.activation_fn(hidden_pre))
         dense = feature_acts.to_dense() if feature_acts.is_sparse else feature_acts
         width = self.cfg.d_sae // self.tp_size
         local = dense.narrow(-1, self.tp_rank * width, width)
         if self.cfg.rescale_acts_by_decoder_norm:
-            local = local * (1 / self.decoder.weight.norm(dim=0))
+            assert state.decoder_norm is not None
+            local = local * (1 / state.decoder_norm)
         # Exactly the local computation of native RowParallelLinear.forward.
         # Split only its trailing native TP reduction so the next hook can run
         # before the consumer waits. Parameters and linear autograd stay native.
@@ -319,7 +356,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         state.decode_bias = self.b_dec
         state.reduce = megatron_tp_launch(recons, self._tp_group, gather=False)
 
-    def tp_wavefront_finish(self, state: TopKTPWavefrontState) -> TrainStepOutput:
+    def tp_wavefront_finish(self, state: MegatronTPWavefrontState) -> TrainStepOutput:
         if state.reduce is None or state.hidden_pre is None or state.feature_acts is None:
             raise RuntimeError("Incomplete Megatron TP wavefront state")
         out = self.hook_sae_recons(state.reduce.wait() + self.b_dec)
@@ -327,9 +364,10 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         out = self.reshape_fn_out(out, self.d_head)
         # Auxiliary reconstruction keeps the ordinary native decoder path,
         # including the encode bias-edge reduction and input-gradient fallback.
-        return self._build_train_step_output(
-            state.step_input, state.feature_acts, state.hidden_pre, out
-        )
+        with self._share_decoder_norm(state.decoder_norm):
+            return self._build_train_step_output(
+                state.step_input, state.feature_acts, state.hidden_pre, out
+            )
 
     def _tp_param_shard_dims(self) -> dict[str, int | None]:
         return {

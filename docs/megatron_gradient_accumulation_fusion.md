@@ -34,7 +34,25 @@ encoder 不需要这个兼容处理。rescale 关闭时 decoder 也不需要它�
 不 detach norm、不改变 TopK/auxiliary loss 的求导，不改 GEMM 为低精度，
 不启用 half optimizer 或 optimizer sharding。
 
-## 2026-09-18 验证
+## 同一次 forward 共享 decoder norm
+
+encode、主 decode、aux decode 使用相同的 decoder 权重，现在复用一个可微的
+norm 节点。三条分支先在长度为 `d_sae / TP` 的向量上累计梯度，然后只展开一次
+decoder 矩阵梯度，保留全部 norm 导数。普通 forward 使用局部作用域；TP wavefront
+把 norm 放在该次 forward 的 state 中，finish 时提供给 aux 分支。
+不跨 microbatch/step 缓存；异常和嵌套调用会恢复原作用域。
+
+H3、DP2、aux 开启时，norm backward 从每步 9 次降为 3 次；6 次大矩阵
+gradient addition 变成向量 addition。原生 DDP 的 decoder `main_grad.add_`
+仍为 3 次，native dummy 清零也仍保留，不能与这 6 次普通 autograd addition 混淆。
+
+同配置配对实验：DP2 SAE step 210.36→187.87 ms（-10.69%），
+TP2DP2 + wavefront 134.67→128.33 ms（-4.71%）。数据与 Nsight
+见 `results/decoder_norm_20260918/README.md`。
+这次主要节省重复计算；DP2 未覆盖的通信时间仅由 22.96 降到 22.28 ms。
+实验性的“仅 encoder fusion”另省约 1.56 ms，但默认仍保留两块 linear 的原生 fusion。
+
+## 2026-09-18 仅开启 fusion 的初始验证
 
 结果与原始 trace 位于 `results/gradient_fusion_20260918/`。
 配置沿用 H3、global batch 2048、4096→32768、K128、dense、FP32、
