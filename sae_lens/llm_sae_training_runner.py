@@ -904,6 +904,7 @@ class LanguageModelSAETrainingRunner:
         )
         if (
             overlap_uses_per_hook_ddp
+            and (self.cfg.sae.architecture() != "topk" or elastic_streaming_control_path is not None)
             and self.cfg.multi_sae_distributed_architecture == "legacy_per_hook_wrapper"
         ):
             logger.warning(
@@ -995,11 +996,9 @@ class LanguageModelSAETrainingRunner:
             from sae_lens.distributed_v2 import initialize_sae_routing
 
             if (
-                cfg.sae_dp_mode == "fsdp" or cfg.ddp_zero_optimizer
-                or cfg.multi_sae_optimizer_overlap != "off"
-                or os.environ.get("SAE_DDP_OPT_OVERLAP_V2", "0") == "1"
+                cfg.sae_dp_mode == "fsdp"
             ):
-                raise ValueError("Static SAE runtime requires synchronous DDP and unsharded Adam")
+                raise ValueError("Static SAE runtime requires Megatron DDP")
             cfg.sae_dp_mode = "ddp"
             self.sae_runtime = initialize_sae_routing(
                 P=vllm_dp_size, Q=sae_dp_size,
@@ -1427,7 +1426,6 @@ class LanguageModelSAETrainingRunner:
         if runtime is None:
             raise RuntimeError("Multi-hook training requires an initialized SAE runtime")
         context = runtime.require_local()
-        self.cfg.multi_sae_distributed_architecture = "legacy_per_hook_wrapper"
         self._pp_hook_names = list(context.domain.hooks)
         self.activations_store._all_hook_names = list(self.hook_names)
         self.activations_store.hook_names = list(self._pp_hook_names)
@@ -1442,7 +1440,10 @@ class LanguageModelSAETrainingRunner:
         from sae_lens.training.megatron_ddp import wrap_runtime_sae
 
         return wrap_runtime_sae(
-            sae, self.sae_runtime, bucket_cap_mb=self.cfg.ddp_bucket_cap_mb
+            sae, self.sae_runtime, bucket_cap_mb=self.cfg.ddp_bucket_cap_mb,
+            distributed_optimizer=self.cfg.ddp_zero_optimizer,
+            single_replica_fast_path=self.cfg.sae_single_replica_fast_path,
+            gradient_accumulation_fusion=self.cfg.sae_gradient_accumulation_fusion,
         )
 
     def _per_hook_ddp_overlap_enabled(self, local_hook_count: int) -> bool:
@@ -1635,7 +1636,8 @@ class LanguageModelSAETrainingRunner:
             if self.sae_runtime is not None:
                 from sae_lens.distributed_v2 import control_producer_helpers
 
-                control_producer_helpers("finish")
+                if not self.streaming_mode:
+                    control_producer_helpers("finish")
                 monitor.finish()
             return result
         except BaseException as exc:
@@ -2127,7 +2129,12 @@ class LanguageModelSAETrainingRunner:
             sae_dp=self.sae_dp_size,
             sae_pp_size=self.sae_pp_size,
             use_gpu_direct=getattr(self, "_use_gpu_direct", False),
+            hook_names=tuple(self.hook_names),
         )
+
+        if elastic_layout is None and cfg.sae.architecture() == "topk" and cfg.sae_dp_mode == "ddp":
+            from sae_lens.distributed_v2 import get_sae_runtime
+            self.sae_runtime = get_sae_runtime()
 
         self._elastic_runtime = None
         self._elastic_controller = None
@@ -2380,6 +2387,8 @@ class LanguageModelSAETrainingRunner:
 
     def _streaming_wrap_sae_dp(self, sae: torch.nn.Module, ds: Any) -> Any:
         """Apply the configured SAE-DP wrapper on the current (PP, TP) shard."""
+        if self.sae_runtime is not None:
+            return self._wrap_runtime_sae(sae)
         sae_dp_size = ds.get_sae_dp_size()
         if sae_dp_size <= 1:
             return sae
@@ -2499,6 +2508,9 @@ class LanguageModelSAETrainingRunner:
         raw_sae_by_hook = dict(self.base_sae_by_hook)
         self.sae_by_hook = {}
         self.multi_hook_sae = None
+        if self.sae_runtime is not None:
+            self.sae_by_hook = {h: self._wrap_runtime_sae(sae) for h, sae in raw_sae_by_hook.items()}
+            return
         tp_group = ds.get_sae_tp_group() if self.sae_tp_size > 1 else None
         for sae in raw_sae_by_hook.values():
             if hasattr(sae, "_tp_group"):
@@ -3943,6 +3955,7 @@ class LanguageModelSAETrainingRunner:
             evaluator=None,
             save_checkpoint_fn=self._streaming_save_checkpoint,
             cfg=trainer_cfg,
+            runtime=self.sae_runtime,
             dp_group=sae_dp_group,
             token_count_weighted_dp=(self.cfg.streaming_dp_batch_mode == "exact"),
             append_logs=self.cfg.resume_from_checkpoint is not None
@@ -4028,6 +4041,7 @@ class LanguageModelSAETrainingRunner:
             data_provider=provider,
             save_checkpoint_fn=self._streaming_save_checkpoint,
             cfg=trainer_cfg,
+            runtime=self.sae_runtime,
             dp_group=sae_dp_group,
             token_count_weighted_dp=(self.cfg.streaming_dp_batch_mode == "exact"),
             sae_dp_mode=self.cfg.sae_dp_mode,
@@ -4115,11 +4129,17 @@ class LanguageModelSAETrainingRunner:
             return
         import sae_lens.distributed_streaming as ds
         checkpoint_path.mkdir(exist_ok=True, parents=True)
-        if ds.is_sae_tp_root():
+        runtime = self.sae_runtime
+        writer = (
+            dist.get_rank() == min(r for d in runtime.domains for r in d.ranks)
+            if runtime is not None else ds.is_sae_tp_root()
+        )
+        if writer:
             runner_config = self.cfg.to_dict()
             with open(checkpoint_path / RUNNER_CFG_FILENAME, "w") as f:
                 json.dump(runner_config, f)
-            (checkpoint_path / "COMPLETED").write_text("ok\n")
+            if runtime is None:
+                (checkpoint_path / "COMPLETED").write_text("ok\n")
 
     def _streaming_save_final(
         self,

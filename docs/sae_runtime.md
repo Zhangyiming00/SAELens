@@ -1,5 +1,9 @@
 # 静态 SAE routing 与独立训练单元
 
+本文记录初始静态迁移。后续已接入 Megatron DDP/optimizer，见
+[累计与更新](static_megatron_accumulation.md)、[逐 hook optimizer overlap](hook_optimizer_overlap.md)
+及 [TP wavefront](megatron_tp_wavefront.md)、[默认 wgrad fusion](megatron_gradient_accumulation_fusion.md)；下文早期范围描述不代表当前功能限制。
+
 这一入口统一了 SAE 通信组来源，并为每个 hook 提供独立的模型、DDP reducer、
 梯度裁剪和 Adam 状态。保留原有 activation slicing、过滤、buffer、shuffle、
 token 加权和 SAE loss；本阶段不实现异步 routing、streaming/elastic 调度，

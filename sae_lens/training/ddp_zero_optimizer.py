@@ -177,6 +177,11 @@ def optimizer_owns_parameter(optimizer: Optimizer, parameter: torch.Tensor) -> b
 def local_optimizer_parameter_state(
     optimizer: Optimizer, parameter: torch.Tensor
 ) -> dict[str, Any]:
+    if getattr(optimizer, "_sae_distributed_optimizer", False):
+        for full, shard, _, _ in optimizer.sae_shards.values():
+            if full is parameter:
+                return optimizer.state.get(shard, {})
+        return {}
     if is_zero_optimizer(optimizer):
         return optimizer.optim.state.get(parameter, {})  # type: ignore[attr-defined]
     return optimizer.state.get(parameter, {})
@@ -203,6 +208,9 @@ def set_optimizer_parameter_state(
     state: dict[str, Any],
 ) -> None:
     """Install state only on the ZeRO rank that owns the parameter."""
+    if getattr(optimizer, "_sae_distributed_optimizer", False):
+        optimizer.load_full_parameter_state(parameter, state)
+        return
     if not optimizer_owns_parameter(optimizer, parameter):
         return
     copied_state = {

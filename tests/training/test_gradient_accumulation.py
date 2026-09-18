@@ -87,7 +87,7 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
     cfg.lr_scheduler_name = "cosineannealing"
     cfg.lr_end = 3e-5
     cfg.dead_feature_window = 0
-    errors = dict(grad=0.0, clipped=0.0, parameters=0.0, adam=0.0)
+    errors = dict(grad=0.0, coefficient=0.0, clipped=0.0, parameters=0.0, adam=0.0)
     snapshots = {}
     scaled = accumulation == 3 and bucket >= 1.0
 
@@ -124,7 +124,9 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
         wrapped = {}
         for h, model in models.items():
             model.import_saelens_state_dict(plan["initial"])
-            wrapped[h] = wrap_runtime_sae(model, runtime, bucket_cap_mb=bucket)
+            wrapped[h] = wrap_runtime_sae(
+                model, runtime, bucket_cap_mb=bucket, single_replica_fast_path=False
+            )
             assert is_megatron_ddp(wrapped[h])
             assert wrapped[h].dp_group is ctx.dp_group
             assert wrapped[h].buffers
@@ -243,8 +245,14 @@ def exercise(runtime, plan, golden, path, accumulation, bucket, single):
                 )
                 audit[(step, h, "grad")] = {n: v["g"].cpu() for n, v in gradients.items()}
                 norm = torch.as_tensor(original_clip(max_norm))
+                if not legacy_optimizer:
+                    assert norm.is_cuda and norm.ndim == 0
                 audit[(step, h, "norm")] = norm.detach().cpu()
                 torch.testing.assert_close(norm.cpu(), expected["norm"], **TOL)
+                coefficient = (max_norm / (norm + 1e-6)).clamp(max=1.0)
+                expected_coefficient = (max_norm / (expected["norm"] + 1e-6)).clamp(max=1.0)
+                compare(coefficient.cpu(), expected_coefficient, "coefficient")
+                audit[(step, h, "coefficient")] = coefficient.detach().cpu()
                 gradients = native_state(
                     unit.model,
                     {

@@ -1,7 +1,7 @@
 # 静态 routing：Megatron DDP 与梯度累计
 
-静态 CUDA TopK SAE 按 hook 建立独立 Megatron DDP、梯度 buffer、原生
-`FP32Optimizer` 和 LR scheduler。Megatron 负责梯度裁剪和优化器更新，底层
+静态 CUDA TopK SAE 按 hook 建立独立 Megatron DDP、梯度 buffer、
+`FP32Optimizer` 子类和 LR scheduler。原生 step 调用项目的 GPU 裁剪并管理更新，底层
 使用 SAELens 配置的 fused `torch.optim.Adam`。DP1 使用同一条路径。FP32 参数
 可配合 BF16 autocast；CPU 测试使用兼容路径，不作为 Megatron CUDA 验收。
 
@@ -11,6 +11,7 @@
 | --- | --- |
 | `train_batch_size_tokens` | 原有 provider microbatch 大小，含义和数据切分方式保持不变 |
 | `gradient_accumulation_steps` | 每个更新窗口最多读取的 microbatch 数，默认 `1`，DP1 同样有效 |
+| `sae_gradient_accumulation_fusion` | 默认 `True`；有 native DDP buffer 的 FP32 路径融合 wgrad GEMM 累加，GA1 也有效；[适用条件与 decoder 梯度](megatron_gradient_accumulation_fusion.md) |
 | `ddp_bucket_cap_mb` | 每个 hook 的梯度通信 bucket 目标大小，单位 MiB，与累计次数独立；一个参数不会被拆开 |
 
 **每个 hook 的名义全局更新 batch = 累计次数 × 所有 DP replica 的本地
@@ -106,7 +107,8 @@ backward 返回后才进入下一 hook；本次允许原生 DDP 在该 backward 
 
 ### Megatron 优化器与独立裁剪
 
-每个 CUDA hook 的 `unit.optimizer` 是 Megatron-core 原生 `FP32Optimizer`。
+每个 CUDA hook 的 `unit.optimizer` 是项目内的 `GPUClipFP32Optimizer`，
+它继承 Megatron-core `FP32Optimizer`，只覆盖 `clip_grad_norm()`。
 窗口末先完成归约、token 归一化和 AMP 反缩放，随后由原生 `step()` 执行
 `prepare_grads()`、`clip_grad_norm(1.0)`、`step_with_ready_grads()`。
 训练循环不再额外调用模型裁剪。每个 hook 只有一次裁剪和 Adam 更新，
@@ -115,7 +117,13 @@ backward 返回后才进入下一 hook；本次允许原生 DDP 在该 backward 
 `tp_group` 与 `grad_stats_parallel_group` 都显式使用该 hook 的 TP group，
 包括 TP1 singleton；DP replica 不重复计入范数。Megatron 根据原有 TP
 参数属性识别分片与复制参数，复制的 `b_dec` 只在 TP rank 0 计入。
-原生裁剪仍为 L2 范数，系数为 `min(1, 1 / (norm + 1e-6))`。
+裁剪复用原有 SAE 的 GPU L2 公式，系数为 `min(1, 1 / (norm + 1e-6))`。
+参数筛选使用 Megatron 的 `get_main_grads_for_grad_norm()`；范数只在实际
+TP 组内归约，范数、系数和梯度缩放始终留在 GPU。返回值为零维 CUDA
+tensor，继承的原生 `step()` 原样返回该 tensor；训练循环不读取它。
+不要在训练日志或性能 harness 中用 `item()`、`float()` 或格式化把它转回 CPU。
+独立数值验收可以在测量之外复制结果。此实现不修改安装的 Megatron，
+也不覆盖原生 `prepare_grads()`、`step()` 或 `step_with_ready_grads()`。
 不同范数归约实现允许 FP32 舍入误差，验收比较裁剪前后梯度及 Adam 状态。
 
 采用 Megatron 官方支持的 `FP32Optimizer(base_optimizer, config, ...)`

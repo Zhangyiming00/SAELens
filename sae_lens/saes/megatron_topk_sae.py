@@ -1,4 +1,4 @@
-"""TopK SAE with Megatron-owned parameters and standard TP backward semantics.
+"""TopK SAE with Megatron-owned parameters and SAE-specific TP reductions.
 
 The semantic oracle is SAELens 6.37.6 (see tests/native_reference). Checkpoint
 conversion is the only place that uses SAELens' transposed weight layout.
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -21,13 +22,15 @@ from sae_lens.constants import SAE_CFG_FILENAME, SAE_WEIGHTS_FILENAME
 from sae_lens.megatron_tp import (
     _shard_init_topk_cpu,
     megatron_tp_allgather,
+    megatron_tp_launch,
     require_megatron_core,
 )
 from sae_lens.sae_runtime import SAERuntime
-from sae_lens.saes.sae import TrainingSAE, TrainStepInput
+from sae_lens.saes.sae import TrainingSAE, TrainStepInput, TrainStepOutput
 from sae_lens.saes.topk_sae import (
     SparseHookPoint,
     TopK,
+    TopKTPWavefrontState,
     TopKTrainingSAEConfig,
     _fold_norm_topk,
     calculate_topk_aux_acts,
@@ -102,6 +105,8 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             params_dtype=self.dtype,
             use_cpu_initialization=True,
             perform_initialization=False,
+            # Enable only after native DDP has allocated main_grad. Standalone
+            # SAEs and the DP1 direct-gradient fast path have no such buffer.
             gradient_accumulation_fusion=False,
             sequence_parallel=False,
         )
@@ -112,7 +117,10 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             init_method=nn.init.zeros_,
             bias=True,
             gather_output=False,
-            disable_grad_reduce=False,
+            # Detached activation training only consumes the token-summed
+            # encoder input gradient in b_dec. Reduce that vector at the bias
+            # edge below instead of all-reducing [tokens, d_in] in this linear.
+            disable_grad_reduce=True,
             tp_group=self._init_tp_group,
         )
         self.decoder = RowParallelLinear(
@@ -142,6 +150,33 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         self.b_dec.tensor_model_parallel = False
         self.b_dec.allreduce = True
 
+    def configure_gradient_accumulation_fusion(self, enabled: bool) -> bool:
+        """Enable native wgrad accumulation after DDP owns the gradient buffers."""
+        from megatron.core.tensor_parallel import layers
+
+        weights = (self.encoder.weight, self.decoder.weight)
+        available = layers._grad_accum_fusion_available
+        buffered = all(p.is_cuda and hasattr(p, "main_grad") for p in weights)
+        if enabled and buffered and not available:
+            warnings.warn(
+                "Megatron gradient accumulation fusion requested, but "
+                "fused_weight_gradient_mlp_cuda is unavailable; using unfused wgrad.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        active = bool(enabled and buffered and available)
+        self.gradient_accumulation_fusion = active
+        for linear in (self.encoder, self.decoder):
+            linear.gradient_accumulation_fusion = active
+            linear.config.gradient_accumulation_fusion = active
+        # The decoder also receives ordinary autograd gradients through its
+        # norms. Megatron's native escape hatch returns zero dummy wgrads and
+        # adds the residual autograd gradient; otherwise DDP silently drops it.
+        self.decoder.weight.zero_out_wgrad = (
+            active and self.cfg.rescale_acts_by_decoder_norm
+        )
+        return active
+
     def get_activation_fn(self) -> TopK:
         # Megatron's linear modules consume dense activations. The sparse flag
         # controls the returned representation; decoding densifies at the edge.
@@ -149,6 +184,31 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
 
     def get_coefficients(self) -> dict[str, float]:
         return {}
+
+    def process_sae_in(self, sae_in: torch.Tensor) -> torch.Tensor:
+        sae_in = self.reshape_fn_in(sae_in.to(self.dtype))
+        sae_in = self.hook_sae_input(sae_in)
+        sae_in = self.run_time_activation_norm_fn_in(sae_in)
+        bias = self.b_dec * self.cfg.apply_b_dec_to_input
+        if self.tp_size > 1:
+            tp = require_megatron_core()
+            # Identity in forward, SUM across TP in backward. The subtraction
+            # first reduces the token dimensions, so only d_in values move.
+            # The replicated decode-path bias gradient is already complete
+            # and bypasses this edge. AccumulateGrad therefore sees the full
+            # bias gradient before DDP copies/reduce-scatters its buffer.
+            if self.cfg.apply_b_dec_to_input:
+                bias = tp.copy_to_tensor_model_parallel_region(
+                    bias, group=self._tp_group
+                )
+            # Preserve differentiable-input/hook semantics when an upstream
+            # consumer actually needs the full dgrad. Cached/online detached
+            # activations do not create this larger backward collective.
+            if sae_in.requires_grad:
+                sae_in = tp.copy_to_tensor_model_parallel_region(
+                    sae_in, group=self._tp_group
+                )
+        return sae_in - bias
 
     def encode_with_hidden_pre(
         self, x: torch.Tensor
@@ -173,8 +233,8 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         return result.reshape(*feature_acts.shape[:-1], self.cfg.d_in)
 
     def decode(self, feature_acts: torch.Tensor) -> torch.Tensor:
-        # ColumnParallelLinear already sums d(input) across TP. Both b_dec
-        # contributions are complete on every rank: no 1/TP and no post reduce.
+        # The encode bias edge sums its partial gradient; this decode path is
+        # already replicated. No 1/TP scaling or post-DDP bias reduction.
         out = self.hook_sae_recons(self._decode_features(feature_acts) + self.b_dec)
         out = self.run_time_activation_norm_fn_out(out)
         return self.reshape_fn_out(out, self.d_head)
@@ -210,11 +270,66 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         return {"auxiliary_reconstruction_loss": loss}
 
     def sync_tensor_parallel_gradients(self) -> None:
-        """No compensation: Megatron modules complete TP gradients in backward."""
+        """Megatron's bias-edge reduction completes TP gradients in backward."""
 
     def tp_wavefront_supported(self) -> bool:
-        # The scheduling protocol is migrated after static TP acceptance.
-        return False
+        return self.tp_size > 1 and self.encoder.weight.is_cuda
+
+    def tp_wavefront_encode_launch(
+        self, step_input: TrainStepInput
+    ) -> TopKTPWavefrontState:
+        if not self.tp_wavefront_supported():
+            raise RuntimeError("TP wavefront requires a CUDA SAE with TP > 1")
+        sae_in = self.process_sae_in(step_input.sae_in)
+        local, _ = self.encoder(sae_in.reshape(-1, self.cfg.d_in))
+        local = self.hook_sae_acts_pre(local.reshape(*sae_in.shape[:-1], -1))
+        if self.cfg.rescale_acts_by_decoder_norm:
+            local = local * self.decoder.weight.norm(dim=0)
+        return TopKTPWavefrontState(
+            step_input=step_input, hidden_pre_local=local,
+            gather=megatron_tp_launch(local, self._tp_group, gather=True),
+        )
+
+    def tp_wavefront_decode_launch(self, state: TopKTPWavefrontState) -> None:
+        hidden_pre = state.gather.wait()
+        feature_acts = self.hook_sae_acts_post(self.activation_fn(hidden_pre))
+        dense = feature_acts.to_dense() if feature_acts.is_sparse else feature_acts
+        width = self.cfg.d_sae // self.tp_size
+        local = dense.narrow(-1, self.tp_rank * width, width)
+        if self.cfg.rescale_acts_by_decoder_norm:
+            local = local * (1 / self.decoder.weight.norm(dim=0))
+        # Exactly the local computation of native RowParallelLinear.forward.
+        # Split only its trailing native TP reduction so the next hook can run
+        # before the consumer waits. Parameters and linear autograd stay native.
+        decoder = self.decoder
+        if (
+            not decoder.input_is_parallel or decoder.sequence_parallel
+            or decoder.explicit_expert_comm or decoder.bias is not None
+            or decoder.config._cpu_offloading_context is not None
+        ):
+            raise RuntimeError("Unsupported RowParallelLinear wavefront configuration")
+        recons = decoder._forward_impl(
+            input=local.reshape(-1, width), weight=decoder.weight, bias=None,
+            gradient_accumulation_fusion=decoder.gradient_accumulation_fusion,
+            allreduce_dgrad=False, sequence_parallel=False,
+            tp_group=None, grad_output_buffer=None,
+        ).reshape(*dense.shape[:-1], self.cfg.d_in)
+        state.hidden_pre = hidden_pre
+        state.feature_acts = feature_acts
+        state.decode_bias = self.b_dec
+        state.reduce = megatron_tp_launch(recons, self._tp_group, gather=False)
+
+    def tp_wavefront_finish(self, state: TopKTPWavefrontState) -> TrainStepOutput:
+        if state.reduce is None or state.hidden_pre is None or state.feature_acts is None:
+            raise RuntimeError("Incomplete Megatron TP wavefront state")
+        out = self.hook_sae_recons(state.reduce.wait() + self.b_dec)
+        out = self.run_time_activation_norm_fn_out(out)
+        out = self.reshape_fn_out(out, self.d_head)
+        # Auxiliary reconstruction keeps the ordinary native decoder path,
+        # including the encode bias-edge reduction and input-gradient fallback.
+        return self._build_train_step_output(
+            state.step_input, state.feature_acts, state.hidden_pre, out
+        )
 
     def _tp_param_shard_dims(self) -> dict[str, int | None]:
         return {

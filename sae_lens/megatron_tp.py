@@ -5,6 +5,7 @@ linear or collective autograd implementation lives here.
 """
 
 import math
+from dataclasses import dataclass
 from functools import lru_cache
 from importlib import import_module
 from types import ModuleType
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from sae_lens.profiling import cuda_nvtx_range
 from sae_lens.util import str_to_dtype
 
 if TYPE_CHECKING:
@@ -45,6 +47,57 @@ def megatron_tp_allgather(
             local.reshape(-1, local.shape[-1]), group=group
         )
     return gathered.reshape(*local.shape[:-1], local.shape[-1] * group.size())
+
+
+@lru_cache(maxsize=None)
+def _wavefront_stream(device: torch.device) -> torch.cuda.Stream:
+    # All hooks on a device submit to one stream, in the same host order on
+    # every TP rank. No process group or tensor is kept in this cache.
+    return torch.cuda.Stream(device=device)
+
+
+@dataclass
+class MegatronTPPending:
+    """Native TP result whose consumer-stream dependency is deferred."""
+
+    result: torch.Tensor
+    ready: torch.cuda.Event
+
+    def wait(self) -> torch.Tensor:
+        stream = torch.cuda.current_stream(self.result.device)
+        stream.wait_event(self.ready)
+        self.result.record_stream(stream)
+        return self.result
+
+
+def megatron_tp_launch(
+    local: torch.Tensor, group: dist.ProcessGroup, *, gather: bool
+) -> MegatronTPPending:
+    """Enqueue a native mapping on the TP stream without stalling compute.
+
+    Megatron's mapping retains its own autograd (gather backward is a split;
+    reduce backward is identity). Its synchronous c10d call waits on the
+    *calling CUDA stream*, so the event includes actual collective completion.
+    No custom collective backward or NCCL Work handling is needed here.
+    """
+    if not local.is_cuda or group.size() <= 1:
+        raise ValueError("Megatron TP wavefront requires CUDA and TP > 1")
+    current = torch.cuda.current_stream(local.device)
+    stream = _wavefront_stream(local.device)
+    with torch.cuda.device(local.device), torch.cuda.stream(stream):
+        stream.wait_stream(current)
+        local.record_stream(stream)
+        with cuda_nvtx_range("sae_tp_wavefront:all_gather" if gather else "sae_tp_wavefront:all_reduce"):
+            result = (
+                megatron_tp_allgather(local, group)
+                if gather
+                else require_megatron_core().reduce_from_tensor_model_parallel_region(
+                    local, group=group
+                )
+            )
+        ready = torch.cuda.Event()
+        ready.record(stream)
+    return MegatronTPPending(result, ready)
 
 
 _RNG_CHUNK_NUMEL = 4 * 1024 * 1024

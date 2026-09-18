@@ -1,19 +1,51 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, cast
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from sae_lens.profiling import cuda_nvtx_range
+from sae_lens.saes.megatron_topk_sae import MegatronTopKSAE
 from sae_lens.saes.sae import TrainingSAE, TrainStepInput, TrainStepOutput
-from sae_lens.saes.topk_sae import TopKTrainingSAE, TopKTPWavefrontState
+from sae_lens.saes.topk_sae import TopKTPWavefrontState, TopKTrainingSAE
 
 
 def _sanitize_module_key(hook_name: str) -> str:
     key = "".join(ch if ch.isalnum() else "_" for ch in hook_name).strip("_")
     return key or "hook"
+
+
+def forward_tp_wavefront(
+    hook_names: list[str],
+    sae_by_hook: Mapping[str, Any],
+    inputs_by_hook: dict[str, TrainStepInput],
+    forward_context: Callable[[str], Any] = lambda _: contextlib.nullcontext(),
+) -> dict[str, TrainStepOutput]:
+    """Shared legacy/Megatron schedule: AG(A), encode(B), AR(A), ... ."""
+    states: dict[str, TopKTPWavefrontState] = {}
+    current_hook = hook_names[0]
+    current_sae = sae_by_hook[current_hook]
+    with forward_context(current_hook), cuda_nvtx_range(f"sae:{current_hook}:wavefront_encode"):
+        current_state = current_sae.tp_wavefront_encode_launch(inputs_by_hook[current_hook])
+    for next_hook in hook_names[1:]:
+        next_sae = sae_by_hook[next_hook]
+        with forward_context(next_hook), cuda_nvtx_range(f"sae:{next_hook}:wavefront_encode"):
+            next_state = next_sae.tp_wavefront_encode_launch(inputs_by_hook[next_hook])
+        with forward_context(current_hook), cuda_nvtx_range(f"sae:{current_hook}:wavefront_decode"):
+            current_sae.tp_wavefront_decode_launch(current_state)
+        states[current_hook] = current_state
+        current_hook, current_sae, current_state = next_hook, next_sae, next_state
+    with forward_context(current_hook), cuda_nvtx_range(f"sae:{current_hook}:wavefront_decode"):
+        current_sae.tp_wavefront_decode_launch(current_state)
+    states[current_hook] = current_state
+    outputs = {}
+    for hook in hook_names:
+        with forward_context(hook), cuda_nvtx_range(f"sae:{hook}:wavefront_finish"):
+            outputs[hook] = sae_by_hook[hook].tp_wavefront_finish(states[hook])
+    return outputs
 
 
 class MultiHookSAE(torch.nn.Module):
@@ -123,7 +155,7 @@ class MultiHookSAE(torch.nn.Module):
         tp_group = None
         for hook_name in self.hook_names:
             sae = self.saes[self.module_key_by_hook[hook_name]]
-            if not isinstance(sae, TopKTrainingSAE) or not sae.tp_wavefront_supported():
+            if not isinstance(sae, (TopKTrainingSAE, MegatronTopKSAE)) or not sae.tp_wavefront_supported():
                 return False
             sae_group = sae._tp_group
             if tp_group is None:
@@ -154,45 +186,10 @@ class MultiHookSAE(torch.nn.Module):
                 prepared_inputs[hook_name] = args[0]
             inputs_by_hook = prepared_inputs
 
-        states: dict[str, TopKTPWavefrontState] = {}
-        current_hook = self.hook_names[0]
-        current_sae = cast(
-            TopKTrainingSAE, self.saes[self.module_key_by_hook[current_hook]]
+        outputs = forward_tp_wavefront(
+            self.hook_names, self.raw_sae_by_hook(), inputs_by_hook,
+            self._ddp_forward_context,
         )
-        with self._ddp_forward_context(current_hook):
-            current_state = current_sae.tp_wavefront_encode_launch(
-                inputs_by_hook[current_hook]
-            )
-
-        for next_hook in self.hook_names[1:]:
-            next_sae = cast(
-                TopKTrainingSAE, self.saes[self.module_key_by_hook[next_hook]]
-            )
-            # AG(current) overlaps this next hook's local encoder work.
-            with self._ddp_forward_context(next_hook):
-                next_state = next_sae.tp_wavefront_encode_launch(
-                    inputs_by_hook[next_hook]
-                )
-            with self._ddp_forward_context(current_hook):
-                current_sae.tp_wavefront_decode_launch(current_state)
-            states[current_hook] = current_state
-            current_hook, current_sae, current_state = (
-                next_hook,
-                next_sae,
-                next_state,
-            )
-
-        with self._ddp_forward_context(current_hook):
-            current_sae.tp_wavefront_decode_launch(current_state)
-        states[current_hook] = current_state
-
-        outputs: dict[str, TrainStepOutput] = {}
-        for hook_name in self.hook_names:
-            with self._ddp_forward_context(hook_name):
-                outputs[hook_name] = cast(
-                    TopKTrainingSAE,
-                    self.saes[self.module_key_by_hook[hook_name]],
-                ).tp_wavefront_finish(states[hook_name])
         if self._ddp_forward_by_hook:
             outputs = {
                 hook_name: self._ddp_forward_by_hook[hook_name]._post_forward(

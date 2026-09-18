@@ -161,7 +161,7 @@ def _worker(rank, rendezvous, work_dir):
                 sae.import_saelens_state_dict(initial)
                 assert isinstance(sae.encoder, ColumnParallelLinear)
                 assert isinstance(sae.decoder, RowParallelLinear)
-                assert sae.encoder.allreduce_dgrad == (tp_size > 1)
+                assert not sae.encoder.allreduce_dgrad
                 assert sae.encoder.weight.shape == (32 // tp_size, 16)
                 assert sae.decoder.weight.shape == (16, 32 // tp_size)
                 assert (

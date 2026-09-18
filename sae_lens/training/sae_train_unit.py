@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, MutableMapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -22,6 +23,15 @@ if TYPE_CHECKING:
     from megatron.core.optimizer.optimizer import MegatronOptimizer
 
 
+class HookPhase(str, Enum):
+    ACCUMULATING = "accumulating"
+    GRAD_COMM = "gradient_communication"
+    GRADS_READY = "gradients_ready"
+    UPDATING = "updating"
+    PARAMS_ENQUEUED = "parameters_enqueued"
+    PARAMS_READY = "parameters_ready"
+
+
 @dataclass
 class SAETrainUnit:
     hook_name: str
@@ -32,12 +42,36 @@ class SAETrainUnit:
     _grad_sync_started: bool = field(default=False, init=False)
     _grad_sync_finished: bool = field(default=False, init=False)
     early_grad_sync: bool = field(default=False, init=False)
+    phase: HookPhase = field(default=HookPhase.PARAMS_READY, init=False)
+    params_ready: Any = field(default=None, init=False)
+    update_done: Any = field(default=None, init=False)
+    param_gather_pending: bool = field(default=False, init=False)
+    update_count: int = field(default=0, init=False)
+
+    def wait_params(self):
+        """Order the caller stream after the update; this is not a host wait."""
+        if self.param_gather_pending:
+            raise RuntimeError("Hook parameters require the deferred native all-gather")
+        if self.params_ready is not None:
+            torch.cuda.current_stream().wait_event(self.params_ready)
+
+    def params_complete(self):
+        """Unlike an enqueued wait, query reports actual GPU completion."""
+        complete = not self.param_gather_pending and (
+            self.params_ready is None or self.params_ready.query()
+        )
+        if complete and self.phase == HookPhase.PARAMS_ENQUEUED:
+            self.phase = HookPhase.PARAMS_READY
+        return complete
 
     def __post_init__(self):
         self.parallel_context.validate_model(self.model)
         context = self.parallel_context.require_local()
         if is_megatron_ddp(self.ddp):
-            if self.ddp.module is not self.model or self.ddp.dp_group is not context.dp_group:
+            if (
+                self.ddp.module is not self.model
+                or self.ddp.dp_group is not context.dp_group
+            ):
                 raise ValueError("SAE unit Megatron DDP must use its runtime DP group")
         elif isinstance(self.ddp, DistributedDataParallel):
             if (
@@ -55,7 +89,16 @@ class SAETrainUnit:
         optimizer_params = [
             id(p) for g in self.optimizer.param_groups for p in g["params"]
         ]
-        if set(optimizer_params) != model_params or len(optimizer_params) != len(
+        sharded = getattr(self.optimizer, "_sae_distributed_optimizer", False)
+        if sharded:
+            if (
+                self.optimizer.sae_model is not self.model
+                or self.optimizer.model_chunks != [self.ddp]
+            ):
+                raise ValueError(
+                    "Distributed optimizer must own this hook and DDP buffers"
+                )
+        elif set(optimizer_params) != model_params or len(optimizer_params) != len(
             model_params
         ):
             raise ValueError(
@@ -74,25 +117,33 @@ class SAETrainUnit:
             supported = torch.tensor(
                 int(self.early_grad_sync), device=next(self.model.parameters()).device
             )
-            dist.all_reduce(supported, op=dist.ReduceOp.MIN, group=context.groups.tp_dp_cp)
+            dist.all_reduce(
+                supported, op=dist.ReduceOp.MIN, group=context.groups.tp_dp_cp
+            )
             self.early_grad_sync = bool(supported.item())
 
     def forward(self, step_input):
+        self.wait_params()
         self.check_failure()
         return self.ddp(step_input)
 
     def backward(self, loss, scaler, *, sync_gradients=False):
         if self._grad_sync_started:
-            raise RuntimeError("Cannot accumulate gradients after starting hook reduction")
+            raise RuntimeError(
+                "Cannot accumulate gradients after starting hook reduction"
+            )
         self.check_failure()
         if sync_gradients:
             if not self.early_grad_sync or not is_megatron_ddp(self.ddp):
-                raise RuntimeError("Native gradient synchronization is not enabled for this hook")
+                raise RuntimeError(
+                    "Native gradient synchronization is not enabled for this hook"
+                )
             # This is the last backward allowed to write this window. Megatron
             # owns bucket readiness and may dispatch from its autograd hooks.
             # Reserve ownership before backward: failures may leave a subset
             # of buckets in flight. Never explicitly start those buckets again.
             self._grad_sync_started = True
+            self.phase = HookPhase.GRAD_COMM
         scaler.scale(loss).backward()
         monitor = getattr(self.parallel_context, "failure_monitor", None)
         if monitor is not None:
@@ -115,6 +166,7 @@ class SAETrainUnit:
             # A later bucket may fail after an earlier one was enqueued. Keep
             # ownership on failure so cleanup cannot clear a live main_grad.
             self._grad_sync_started = True
+            self.phase = HookPhase.GRAD_COMM
             self.ddp.start_grad_sync()
 
     def finish_grad_sync(self):
@@ -126,23 +178,31 @@ class SAETrainUnit:
             if self._grad_sync_finished:
                 return
             self.ddp.finish_grad_sync()
-            for parameter in self.model.parameters():
-                parameter.grad = parameter.main_grad
+            if getattr(self.optimizer, "_sae_distributed_optimizer", False):
+                self.optimizer.expose_valid_grads()
+            else:
+                for parameter in self.model.parameters():
+                    parameter.grad = parameter.main_grad
         self.model.sync_tensor_parallel_gradients()
         self._grad_sync_finished = True
+        self.phase = HookPhase.GRADS_READY
 
     def zero_grad(self):
+        self.wait_params()
         if self._grad_sync_started and not self._grad_sync_finished:
             raise RuntimeError("Cannot clear main_grad while hook reduction is pending")
         self.optimizer.zero_grad(set_to_none=True)
         if is_megatron_ddp(self.ddp):
             self.ddp.zero_grad_buffer()
         self._grad_sync_started = self._grad_sync_finished = False
+        self.phase = HookPhase.ACCUMULATING
 
     def no_sync(self):
         return self.ddp.no_sync() if hasattr(self.ddp, "no_sync") else nullcontext()
 
-    def finish_window(self, token_count):
+    def finish_window(
+        self, token_count, *, gradients_are_mean=False, normalization_in_unscale=False
+    ):
         """Convert accumulated token-sum gradients to the global token mean."""
         if is_megatron_ddp(self.ddp):
             # Unknown-length short windows and unsupported ordering use an
@@ -158,11 +218,18 @@ class SAETrainUnit:
             for parameter in self.model.parameters():
                 if parameter.grad is not None and group.size() > 1:
                     dist.all_reduce(parameter.grad, group=group)
+                if parameter.grad is not None and parameter.is_cuda:
+                    # Direct autograd grads were allocated on the compute
+                    # stream and may be freed by zero_grad on the update stream.
+                    parameter.grad.record_stream(torch.cuda.current_stream())
             self.model.sync_tensor_parallel_gradients()
-        if token_count:
-            for parameter in self.model.parameters():
-                if parameter.grad is not None:
-                    parameter.grad.div_(token_count)
+            self._grad_sync_finished = True
+            self.phase = HookPhase.GRADS_READY
+        if token_count and not (gradients_are_mean or normalization_in_unscale):
+            for group in self.optimizer.param_groups:
+                for parameter in group["params"]:
+                    if parameter.grad is not None:
+                        parameter.grad.div_(token_count)
 
     def clip_grad_norm(self, max_norm=1.0):
         if is_megatron_ddp(self.ddp) and not self._grad_sync_finished:
@@ -217,6 +284,14 @@ class UnitOptimizers(Optimizer):
     """
 
     def __init__(self, units: dict[str, SAETrainUnit]):
+        # Native shard tensors are distinct view objects even if a caller
+        # accidentally reuses a full model parameter in two hooks. Audit the
+        # full owners as well as the optimizer's local shard objects.
+        model_parameters = [p for u in units.values() for p in u.model.parameters()]
+        if len({id(p) for p in model_parameters}) != len(model_parameters):
+            raise ValueError(
+                "SAE training units must not share parameters (full model ownership)"
+            )
         parameters = [
             p
             for u in units.values()
@@ -227,7 +302,11 @@ class UnitOptimizers(Optimizer):
             raise ValueError("SAE training units must not share parameters")
         self.units = units
         groups = [g for u in units.values() for g in u.optimizer.param_groups]
-        super().__init__(groups, {})
+        # Native DistributedOptimizer owns non-leaf FP32 buffer views. This
+        # compatibility facade must not re-register them with PyTorch's leaf
+        # validator; the native optimizer already owns and validated them.
+        super().__init__([{"params": []}], {})
+        self.param_groups = groups
         self.state = _UnitStates(units)
 
     def step(self, closure=None):

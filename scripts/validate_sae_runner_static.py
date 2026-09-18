@@ -174,7 +174,8 @@ def _worker(
             self.microbatches = []
             units = getattr(trainer, "units", {}) or {hooks[0]: trainer.unit}
             for hook, unit in units.items():
-                assert type(unit.optimizer) is FP32Optimizer
+                assert isinstance(unit.optimizer, FP32Optimizer)
+                assert type(unit.optimizer).step is FP32Optimizer.step
                 assert unit.optimizer.grad_stats_parallel_group is unit.parallel_context.require_local().tp_group
                 forward = unit.forward
 

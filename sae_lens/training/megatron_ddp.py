@@ -31,9 +31,15 @@ def supports_early_grad_sync(module, runtime):
     )
 
 
-def wrap_runtime_sae(model, runtime, *, bucket_cap_mb=None):
+def wrap_runtime_sae(
+    model, runtime, *, bucket_cap_mb=None, distributed_optimizer=False,
+    single_replica_fast_path=True,
+    gradient_accumulation_fusion=True,
+):
     runtime.validate_model(model)
     context = runtime.require_local()
+    model.gradient_accumulation_fusion_requested = gradient_accumulation_fusion
+    model.configure_gradient_accumulation_fusion(False)
     if next(model.parameters()).device.type == "cpu":
         # Megatron's buffers require CUDA. CPU is a development/test fallback.
         return (
@@ -42,16 +48,24 @@ def wrap_runtime_sae(model, runtime, *, bucket_cap_mb=None):
             else model
         )
 
+    if any(p.dtype != torch.float32 for p in model.parameters()):
+        raise ValueError(
+            "Static Megatron DDP requires FP32 parameters; use autocast for BF16 compute"
+        )
+    model._sae_single_replica_fast_path = (
+        single_replica_fast_path and context.dp_group.size() == 1
+    )
+    if model._sae_single_replica_fast_path:
+        # TP linears and groups stay native. With no replicas there is no DP
+        # reduction, contiguous main_grad buffer, or DDP AccumulateGrad hook.
+        return model
+
     from megatron.core.distributed import (
         DistributedDataParallel,
         DistributedDataParallelConfig,
     )
     from megatron.core.transformer.transformer_config import TransformerConfig
 
-    if any(p.dtype != torch.float32 for p in model.parameters()):
-        raise ValueError(
-            "Static Megatron DDP requires FP32 parameters; use autocast for BF16 compute"
-        )
     config = TransformerConfig(
         num_layers=1,
         hidden_size=model.cfg.d_in,
@@ -72,12 +86,15 @@ def wrap_runtime_sae(model, runtime, *, bucket_cap_mb=None):
             if bucket_cap_mb is None
             else max(1, int(bucket_cap_mb * 1024**2 / 4)),
             average_in_collective=False,
-            use_distributed_optimizer=False,
+            use_distributed_optimizer=distributed_optimizer,
             check_for_nan_in_grad=False,  # GradScaler owns overflow handling.
         ),
         module=model,
         pg_collection=context.groups,
     )
     ddp._sae_megatron_ddp = True
+    config.gradient_accumulation_fusion = model.configure_gradient_accumulation_fusion(
+        gradient_accumulation_fusion
+    )
     ddp.broadcast_params()
     return ddp

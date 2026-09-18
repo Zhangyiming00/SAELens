@@ -145,12 +145,6 @@ class MultiSAETrainer:
             dp_group = context.dp_group
             if sae_dp_mode != "ddp" or multi_hook_sae is not None:
                 raise ValueError("SAE runtime requires an independent DDP wrapper per hook")
-            if (
-                getattr(cfg, "multi_sae_optimizer_overlap", "off") != "off"
-                or os.environ.get("SAE_DDP_OPT_OVERLAP_V2", "0") == "1"
-                or getattr(cfg, "ddp_zero_optimizer", False)
-            ):
-                raise ValueError("SAE runtime currently supports synchronous unsharded Adam only")
         self.hook_names = hook_names
         self.multi_hook_sae = multi_hook_sae
         self.sae_by_hook = sae_by_hook
@@ -181,6 +175,9 @@ class MultiSAETrainer:
             getattr(cfg, "multi_sae_stats_sync_interval", 1)
         )
         if runtime is not None:
+            # This internal field describes parameter/checkpoint ownership.
+            # Keep cfg's requested architecture intact: unified_multi_hook
+            # selects the shared TP wavefront within independent native units.
             self.multi_sae_distributed_architecture = "legacy_per_hook_wrapper"
             self.backward_mode = "sequential"
             self.backward_order = "forward"
@@ -247,8 +244,15 @@ class MultiSAETrainer:
         if runtime is not None:
             for hook_name in self.hook_names:
                 model = self.base_sae_by_hook[hook_name]
+                if cfg.autocast or not cfg.sae_gradient_accumulation_fusion:
+                    # Native wgrad fusion requires matching input/dout dtypes;
+                    # our FP32 parameters + autocast linears do not ensure that.
+                    model.configure_gradient_accumulation_fusion(False)
+                    if getattr(self.sae_by_hook[hook_name], "_sae_megatron_ddp", False):
+                        self.sae_by_hook[hook_name].config.gradient_accumulation_fusion = False
                 optimizer = build_runtime_optimizer(
                     model, runtime, adam_kwargs=_adam_kwargs,
+                    **({"ddp": self.sae_by_hook[hook_name]} if use_zero_optimizer else {}),
                 )
                 self.units[hook_name] = SAETrainUnit(
                     hook_name, model, self.sae_by_hook[hook_name], optimizer, runtime
@@ -289,7 +293,8 @@ class MultiSAETrainer:
         ):
             raise ValueError("multi_sae_optimizer_overlap requires sae_dp_mode='ddp'")
         self._ddp_opt_overlap_v2 = (
-            overlap_requested_here
+            runtime is None
+            and overlap_requested_here
             and len(self.hook_names) > 1
             and self._is_ddp
             and self._dp_world_size() > 1
@@ -684,6 +689,8 @@ class MultiSAETrainer:
         return self._dp_rank() == 0 and self._tp_rank() == 0 and pp_rank == 0
 
     def _pp_rank(self) -> int:
+        if self.runtime is not None:
+            return self.runtime.domains.index(self.runtime.require_local().domain)
         if dist.is_available() and dist.is_initialized():
             try:
                 import sae_lens.distributed_v2 as v2_mod
@@ -1050,6 +1057,7 @@ class MultiSAETrainer:
             # TP remains untouched unless the user explicitly chooses always.
             cross_hook_tp_forward = len(self.hook_names) > 1 and (
                 self.multi_sae_distributed_architecture == "unified_multi_hook"
+                or getattr(self, "_runtime_tp_wavefront", False)
             )
             producer_sae_overlap = bool(
                 getattr(
@@ -1967,7 +1975,9 @@ class MultiSAETrainer:
                 return
             optimizer_by_hook_by_name = self._build_named_optimizer_state_for_save()
             optimizer_state = {
-                "optimizer_state_format": MULTI_SAE_OPTIMIZER_STATE_FORMAT,
+                "optimizer_state_format": "megatron_distributed_v1" if self.units and all(
+                    getattr(u.optimizer, "_sae_distributed_optimizer", False) for u in self.units.values()
+                ) else MULTI_SAE_OPTIMIZER_STATE_FORMAT,
             }
             if tp_rank != 0:
                 return
@@ -2002,7 +2012,8 @@ class MultiSAETrainer:
                 torch.save(
                     {
                         "hook_name": hook_name,
-                        "optimizer_state_format": MULTI_SAE_OPTIMIZER_STATE_FORMAT,
+                        "optimizer_state_format": optimizer_state["optimizer_state_format"],
+                        **({"optimizer_state": {}} if not optimizer_by_hook_by_name[hook_name] else {}),
                         "optimizer_param_groups": save_parameter_groups(
                             self.units[hook_name].optimizer if self.units else self.optimizer,
                             self.base_sae_by_hook[hook_name].named_parameters(),
@@ -2065,7 +2076,14 @@ class MultiSAETrainer:
                 f"Cannot resume multi-SAE checkpoint saved with sae_dp_mode='{saved_mode}' "
                 f"using current sae_dp_mode='{self.sae_dp_mode}'."
             )
-        if self._is_fsdp:
+        if state.get("optimizer_state_format") == "megatron_distributed_v1":
+            from sae_lens.training.runtime_checkpoint import (
+                require_distributed_checkpoint,
+            )
+
+            require_distributed_checkpoint(self, checkpoint_path)
+            clear_optimizer_state(self.optimizer)
+        elif self._is_fsdp:
             if (
                 state.get("optimizer_state_format")
                 != MULTI_SAE_FSDP_OPTIMIZER_STATE_FORMAT
@@ -2188,10 +2206,8 @@ class MultiSAETrainer:
         for hook_name in self.hook_names:
             base_sae = self.base_sae_by_hook[hook_name]
             hook_state: dict[str, dict[str, Any]] = {}
-            state_optimizer = self._overlap_optimizer_by_hook.get(
-                hook_name,
-                self.optimizer,
-            )
+            state_optimizer = (self.units[hook_name].optimizer if self.units else
+                self._overlap_optimizer_by_hook.get(hook_name, self.optimizer))
             optimizer_id = id(state_optimizer)
             if optimizer_id not in state_by_optimizer:
                 state_by_optimizer[optimizer_id] = optimizer_state_by_parameter(
@@ -2223,13 +2239,13 @@ class MultiSAETrainer:
             clear_optimizer_state(optimizer)
         for hook_name in self.hook_names:
             base_sae = self.base_sae_by_hook[hook_name]
-            state_optimizer = self._overlap_optimizer_by_hook.get(
-                hook_name,
-                self.optimizer,
-            )
+            state_optimizer = (self.units[hook_name].optimizer if self.units else
+                self._overlap_optimizer_by_hook.get(hook_name, self.optimizer))
             hook_state = deepcopy(optimizer_state_by_hook.get(hook_name, {}))
             if not already_processed:
                 base_sae.process_named_optimizer_state_for_loading(hook_state)
+            if getattr(state_optimizer, "_sae_distributed_optimizer", False):
+                state_optimizer.prepare_full_parameter_state(hook_state)
             named_params = dict(base_sae.named_parameters())
             for name, state in hook_state.items():
                 if name not in named_params:
@@ -2744,10 +2760,8 @@ class MultiSAETrainer:
         optimizer_state_bytes = 0
 
         for hook_name, sae in self.sae_by_hook.items():
-            state_optimizer = self._overlap_optimizer_by_hook.get(
-                hook_name,
-                self.optimizer,
-            )
+            state_optimizer = (self.units[hook_name].optimizer if self.units else
+                self._overlap_optimizer_by_hook.get(hook_name, self.optimizer))
             for param in sae.parameters():
                 if param.device.type == "cuda":
                     param_bytes += self._tensor_tree_bytes(param, seen)

@@ -23,6 +23,7 @@ def init_distributed_streaming(
     sae_dp: int = 1,
     sae_pp_size: int = 1,
     use_gpu_direct: bool = False,
+    hook_names: tuple[str, ...] = (),
 ) -> None:
     """Initialize process groups for streaming_mode v1.
 
@@ -44,6 +45,7 @@ def init_distributed_streaming(
         disjoint=True,
         use_gpu_direct=use_gpu_direct,
         build_routing_table=False,
+        hook_names=hook_names,
     )
 
 

@@ -15,6 +15,10 @@ def optimizer_state_for_loading(optimizer, state):
 
 
 def save_parameter_groups(optimizer, named_parameters):
+    if getattr(optimizer, "_sae_distributed_optimizer", False):
+        assert len(optimizer.param_groups) == 1
+        return [{**deepcopy({k: v for k, v in optimizer.param_groups[0].items() if k != "params"}),
+                 "params": [name for name, _ in named_parameters]}]
     names = {id(param): name for name, param in named_parameters}
     groups = []
     for group in optimizer.param_groups:
@@ -30,6 +34,12 @@ def save_parameter_groups(optimizer, named_parameters):
 
 
 def load_parameter_groups(optimizer, named_parameters, saved_groups):
+    if getattr(optimizer, "_sae_distributed_optimizer", False):
+        names = {name for name, _ in named_parameters}
+        if len(saved_groups) != 1 or set(saved_groups[0]["params"]) != names:
+            raise ValueError("Distributed Adam requires the existing single full-model parameter group")
+        optimizer.param_groups[0].update(deepcopy({k: v for k, v in saved_groups[0].items() if k != "params"}))
+        return
     names = {id(param): name for name, param in named_parameters}
     live = {}
     for group in optimizer.param_groups:

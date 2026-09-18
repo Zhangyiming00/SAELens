@@ -27,12 +27,14 @@ def test_native_optimizer_raw_state_round_trip_and_legacy_groups(sae):  # noqa: 
     sae.to("cuda")
     runtime = SimpleNamespace(require_local=lambda: SimpleNamespace(tp_group=sae._tp_group))
     optimizer = build_runtime_optimizer(sae, runtime, adam_kwargs={"lr": 3e-4})
-    assert type(optimizer) is FP32Optimizer
+    assert isinstance(optimizer, FP32Optimizer)
+    assert type(optimizer).step is FP32Optimizer.step
     scheduler = get_lr_scheduler("cosineannealing", optimizer, 8, 3e-4, 0, 0, 3e-5, 1)
     assert scheduler.optimizer is optimizer.optimizer
     for p in sae.parameters():
         p.grad = torch.ones_like(p)
     success, norm, _ = optimizer.step()
+    assert torch.is_tensor(norm) and norm.is_cuda and norm.ndim == 0
     assert success and norm > 1
     scheduler.step()
     saved = copy.deepcopy(optimizer.state_dict())

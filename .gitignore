@@ -205,6 +205,7 @@ docs/pretrained_saes/
 # SAE config cache for docs generation
 docs/.sae_config_cache/
 results/
+results*/
 logs/
 scripts/tests/
 scripts/integration_tests/
@@ -220,7 +221,7 @@ profile*.sqlite
 bash*.txt
 docs/foreach_bench/*
 docs/memory_model*.md
-
+staged_changes*
 sae_lens/autoconfig*/profile_results/*
 sae_lens/autoconfig/autoconfig*
 docs/validation/*

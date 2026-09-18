@@ -43,6 +43,74 @@ def test_accumulation_config_keeps_provider_batch_and_buffer():
     assert cfg.tokens_per_buffer == 32 * 8 * 4
 
 
+@pytest.mark.parametrize("schedule", ["eager", "one_hook_lag", "after_backward"])
+def test_parameter_gather_schedule_reaches_trainer(schedule):
+    cfg = LanguageModelSAERunnerConfig(
+        sae=StandardTrainingSAEConfig(d_in=10, d_sae=10),
+        multi_sae_param_gather_schedule=schedule,
+        multi_sae_optimizer_overlap="on", ddp_zero_optimizer=True,
+        sae_pp_size=2,
+    )
+    trainer = cfg.to_sae_trainer_config()
+    assert trainer.multi_sae_param_gather_schedule == schedule
+    assert trainer.multi_sae_optimizer_overlap == "on"
+    assert trainer.ddp_zero_optimizer
+    assert cfg.to_dict()["multi_sae_param_gather_schedule"] == schedule
+
+
+def test_invalid_parameter_gather_schedule_is_rejected():
+    with pytest.raises(ValueError, match="multi_sae_param_gather_schedule"):
+        LanguageModelSAERunnerConfig(
+            sae=StandardTrainingSAEConfig(d_in=10, d_sae=10),
+            multi_sae_param_gather_schedule="rank_local_ready_order",
+        )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_single_replica_fast_path_reaches_trainer(enabled):
+    cfg = LanguageModelSAERunnerConfig(
+        sae=StandardTrainingSAEConfig(d_in=10, d_sae=10),
+        sae_single_replica_fast_path=enabled,
+    )
+    assert cfg.to_sae_trainer_config().sae_single_replica_fast_path is enabled
+    assert cfg.to_dict()["sae_single_replica_fast_path"] is enabled
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_gradient_accumulation_fusion_reaches_trainer(enabled):
+    cfg = LanguageModelSAERunnerConfig(
+        sae=StandardTrainingSAEConfig(d_in=10, d_sae=10),
+        sae_gradient_accumulation_fusion=enabled,
+    )
+    assert cfg.to_sae_trainer_config().sae_gradient_accumulation_fusion is enabled
+    assert cfg.to_dict()["sae_gradient_accumulation_fusion"] is enabled
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_ga1_loss_normalization_reaches_trainer(enabled):
+    cfg = LanguageModelSAERunnerConfig(
+        sae=StandardTrainingSAEConfig(d_in=10, d_sae=10),
+        sae_ga1_loss_normalization=enabled,
+        sae_single_replica_fast_path=False,
+        sae_dp_mode="ddp", ddp_zero_optimizer=True,
+    )
+    assert cfg.to_sae_trainer_config().sae_ga1_loss_normalization is enabled
+    assert cfg.to_dict()["sae_ga1_loss_normalization"] is enabled
+
+
+@pytest.mark.parametrize("architecture", ["legacy_per_hook_wrapper", "unified_multi_hook"])
+def test_tp_wavefront_existing_switch_reaches_trainer(architecture):
+    cfg = LanguageModelSAERunnerConfig(
+        sae=StandardTrainingSAEConfig(d_in=10, d_sae=10),
+        multi_sae_distributed_architecture=architecture,
+        multi_sae_tp_phase_fence="off",
+    )
+    trainer = cfg.to_sae_trainer_config()
+    assert trainer.multi_sae_distributed_architecture == architecture
+    assert trainer.multi_sae_tp_phase_fence == "off"
+    assert cfg.to_dict()["multi_sae_distributed_architecture"] == architecture
+
+
 @pytest.mark.parametrize("seqpos_slice, expected_error", test_cases_for_seqpos)
 def test_sae_training_runner_config_seqpos(
     seqpos_slice: tuple[int, int], expected_error: Type[BaseException]

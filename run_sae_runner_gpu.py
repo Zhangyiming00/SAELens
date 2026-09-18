@@ -336,7 +336,8 @@ def parse_args() -> argparse.Namespace:
         "--ddp-zero-optimizer", action="store_true", default=False,
         help=(
             "Shard Adam state and parameter updates across SAE DDP ranks with "
-            "ZeroRedundancyOptimizer. Disabled by default."
+            "native Megatron DistributedOptimizer in the fixed runtime (including DP1); "
+            "legacy runtimes use PyTorch ZeroRedundancyOptimizer. Disabled by default."
         ),
     )
     parser.add_argument(
@@ -490,9 +491,10 @@ def parse_args() -> argparse.Namespace:
         "--multi-sae-distributed-architecture", default="legacy_per_hook_wrapper",
         choices=["legacy_per_hook_wrapper", "unified_multi_hook"],
         help=(
-            "Multi-layer SAE distributed wrapper architecture. Static routing "
-            "uses independent per-hook DDP and optimizer units. The unified "
-            "wrapper remains available to existing streaming paths."
+            "Multi-layer SAE forward scheduling: unified_multi_hook enables "
+            "cross-hook TP wavefront; legacy_per_hook_wrapper disables it. "
+            "Megatron routing retains independent per-hook DDP/optimizer units "
+            "with either choice. TP1 or one local hook runs serially."
         ),
     )
     parser.add_argument(
@@ -507,12 +509,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--multi-sae-optimizer-overlap", default="off", choices=["off", "on", "non_tp_only"],
         help=(
-            "Experimental per-hook DDP bucket reduction -> optimizer overlap. "
-            "Buckets launch during combined backward; 'on' also supports SAE-TP "
-            "through CPU shared-memory TP post; 'non_tp_only' keeps TP x DDP on "
-            "the normal optimizer path."
+            "Fixed-runtime per-hook optimizer stream overlap after final backward. "
+            "Supports ordinary and native distributed Adam with SAE hook placement; "
+            "non_tp_only disables cross-hook overlap for TP > 1."
         ),
     )
+    parser.add_argument("--multi-sae-param-gather-overlap", action=argparse.BooleanOptionalAction, default=True,
+                        help="Allow native parameter gather to overlap other hooks; disable for an Adam-only overlap diagnostic.")
+    parser.add_argument("--sae-single-replica-fast-path", default=True,
+                        action=argparse.BooleanOptionalAction,
+                        help="Use parameter.grad without DDP buffers when SAE DP=1; disable for diagnostics.")
+    parser.add_argument("--sae-gradient-accumulation-fusion", default=True,
+                        action=argparse.BooleanOptionalAction,
+                        help="Fuse native Megatron weight-gradient GEMM accumulation into main_grad when DDP buffers and the CUDA extension are available.")
+    parser.add_argument("--sae-ga1-loss-normalization", default=True,
+                        action=argparse.BooleanOptionalAction,
+                        help="For GA=1, normalize FP32 loss before backward or fold token normalization into AMP unscale (all TP/DP/SPP layouts).")
+    parser.add_argument("--multi-sae-param-gather-schedule", default="eager",
+                        choices=["eager", "one_hook_lag", "after_backward"],
+                        help="Native sharded gather submission: immediately, after the next hook backward, or after all backwards. Requires optimizer and parameter-gather overlap.")
     parser.add_argument("--tp-size", "-tp", type=int, default=1)
     parser.add_argument(
         "-sddp", dest="sae_ddp_size", type=int, default=None, metavar="N",
@@ -1346,6 +1361,11 @@ def main() -> None:
         multi_sae_tp_phase_fence=args.multi_sae_tp_phase_fence,
         multi_sae_optimizer_overlap=args.multi_sae_optimizer_overlap,
         ddp_zero_optimizer=args.ddp_zero_optimizer,
+        multi_sae_param_gather_overlap=args.multi_sae_param_gather_overlap,
+        multi_sae_param_gather_schedule=args.multi_sae_param_gather_schedule,
+        sae_single_replica_fast_path=args.sae_single_replica_fast_path,
+        sae_gradient_accumulation_fusion=args.sae_gradient_accumulation_fusion,
+        sae_ga1_loss_normalization=args.sae_ga1_loss_normalization,
         ddp_broadcast_buffers=args.ddp_broadcast_buffers,
         ddp_find_unused_parameters=args.ddp_find_unused_parameters,
         ddp_gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,

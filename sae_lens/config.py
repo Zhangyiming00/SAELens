@@ -218,7 +218,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         multi_sae_nvtx_detailed (bool): Emit fine-grained NVTX ranges/marks for each hook's forward, stats, backward, clip and per-bucket communication. Independent of `multi_sae_overlap_instrumentation`: this writes no files. (default is False)
         multi_sae_overlap_trace_dir (str): Directory for overlap event JSONL files. (default is "results/overlap_trace")
         multi_sae_overlap_max_steps (int): Stop appending overlap events after this many steps. 0 records every step. (default is 0)
-        multi_sae_distributed_architecture (str): Multi-hook distributed wrapper architecture. "unified_multi_hook" is the default and trains through one MultiHookSAE owner, enabling cross-hook TP wavefront forward for supported TopK SAEs. "legacy_per_hook_wrapper" preserves the per-hook DDP/FSDP wrapper behavior. Unified mode falls back to legacy when FSDP is selected because TP wavefront is not supported there.
+        multi_sae_distributed_architecture (str): "unified_multi_hook" enables cross-hook TP wavefront forward; "legacy_per_hook_wrapper" (default) disables it. Megatron routing keeps independent per-hook DDP and optimizer ownership in either mode. Legacy unified training uses one MultiHookSAE owner; FSDP falls back to per-hook wrappers.
         fsdp_sharding_strategy (str): FSDP sharding strategy for single-SAE and legacy multi-SAE wrappers. Unified multi-hook mode falls back to the legacy per-hook wrapper under FSDP. "shard_grad_op" keeps full parameters after forward and shards gradients/optimizer state, avoiding a second all-gather during backward. "full_shard" also reshards parameters after forward. "no_shard" keeps parameters replicated. (default is "shard_grad_op")
         verbose (bool): Whether to print verbose output. (default is True)
         model_kwargs (dict[str, Any]): Keyword arguments for `model.run_with_cache`
@@ -356,6 +356,13 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     multi_sae_tp_phase_fence: Literal["auto", "always", "off"] = "auto"
     multi_sae_optimizer_overlap: Literal["off", "on", "non_tp_only"] = "off"
     ddp_zero_optimizer: bool = False
+    multi_sae_param_gather_overlap: bool = True
+    multi_sae_param_gather_schedule: Literal[
+        "eager", "one_hook_lag", "after_backward"
+    ] = "eager"
+    sae_single_replica_fast_path: bool = True
+    sae_gradient_accumulation_fusion: bool = True
+    sae_ga1_loss_normalization: bool = True
     ddp_broadcast_buffers: bool | None = None
     ddp_find_unused_parameters: bool | None = None
     ddp_gradient_as_bucket_view: bool | None = None
@@ -440,6 +447,10 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             raise ValueError(
                 "multi_sae_optimizer_overlap must be 'off', 'on', or 'non_tp_only'"
             )
+        if self.multi_sae_param_gather_schedule not in (
+            "eager", "one_hook_lag", "after_backward"
+        ):
+            raise ValueError("Invalid multi_sae_param_gather_schedule")
         if (
             self.multi_sae_distributed_architecture == "unified_multi_hook"
             and self.multi_sae_backward_mode != "combined"
@@ -813,6 +824,11 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             multi_sae_tp_phase_fence=self.multi_sae_tp_phase_fence,
             multi_sae_optimizer_overlap=self.multi_sae_optimizer_overlap,
             ddp_zero_optimizer=self.ddp_zero_optimizer,
+            multi_sae_param_gather_overlap=self.multi_sae_param_gather_overlap,
+            multi_sae_param_gather_schedule=self.multi_sae_param_gather_schedule,
+            sae_single_replica_fast_path=self.sae_single_replica_fast_path,
+            sae_gradient_accumulation_fusion=self.sae_gradient_accumulation_fusion,
+            sae_ga1_loss_normalization=self.sae_ga1_loss_normalization,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             total_training_samples=self.total_training_tokens,
             device=self.device,
@@ -1134,6 +1150,13 @@ class SAETrainerConfig:
     multi_sae_tp_phase_fence: Literal["auto", "always", "off"] = "auto"
     multi_sae_optimizer_overlap: Literal["off", "on", "non_tp_only"] = "off"
     ddp_zero_optimizer: bool = False
+    multi_sae_param_gather_overlap: bool = True
+    multi_sae_param_gather_schedule: Literal[
+        "eager", "one_hook_lag", "after_backward"
+    ] = "eager"
+    sae_single_replica_fast_path: bool = True
+    sae_gradient_accumulation_fusion: bool = True
+    sae_ga1_loss_normalization: bool = True
     gradient_accumulation_steps: int = 1
     # Runtime-only hint filled by LanguageModelSAETrainingRunner.  It is true
     # when producer and SAE roles share this rank, so auto fence can protect a

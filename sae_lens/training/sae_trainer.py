@@ -181,8 +181,6 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             if dp_group is not None and dp_group is not context.dp_group:
                 raise ValueError("Trainer DP group differs from the SAE runtime")
             dp_group = context.dp_group
-            if getattr(cfg, "ddp_zero_optimizer", False):
-                raise ValueError("SAE runtime currently supports synchronous unsharded Adam only")
         self.sae = sae
         # base_sae is the unwrapped module when sae is an FSDP/DDP wrapper.
         # Defaults to sae itself in manual mode.
@@ -312,8 +310,13 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             **_adam_optimizer_kwargs_from_env(),
         }
         if runtime is not None:
+            if cfg.autocast or not cfg.sae_gradient_accumulation_fusion:
+                self._base_sae.configure_gradient_accumulation_fusion(False)
+                if is_megatron_ddp(sae):
+                    sae.config.gradient_accumulation_fusion = False
             self.optimizer = build_runtime_optimizer(
-                self._base_sae, runtime, adam_kwargs=adam_kwargs
+                self._base_sae, runtime, adam_kwargs=adam_kwargs,
+                **({"ddp": sae} if getattr(cfg, "ddp_zero_optimizer", False) else {}),
             )
         else:
             self.optimizer = build_adam_optimizer(
@@ -715,6 +718,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 return
             optimizer_state = {
                 "optimizer_by_name": optimizer_state_by_name,
+                "optimizer_backend": "distributed" if getattr(self.optimizer, "_sae_distributed_optimizer", False) else "fp32",
             }
 
         if tp_rank != 0:
@@ -756,6 +760,12 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             checkpoint_path / TRAINER_STATE_FILENAME, map_location="cpu"
         )
         if not skip_optimizer:
+            if state_dict.get("optimizer_backend") == "distributed":
+                from sae_lens.training.runtime_checkpoint import (
+                    require_distributed_checkpoint,
+                )
+
+                require_distributed_checkpoint(self, checkpoint_path)
             saved_mode = state_dict.get("sae_dp_mode", "manual")
             current_mode = self.sae_dp_mode
             if saved_mode != current_mode:
@@ -857,6 +867,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self.optimizer.load_state_dict(optimizer_state)
 
     def _build_named_optimizer_state_for_save(self) -> dict[str, dict[str, Any]]:
+        if getattr(self.optimizer, "_sae_distributed_optimizer", False):
+            return {}
         optimizer_state_by_name: dict[str, dict[str, Any]] = {}
         state_by_parameter = optimizer_state_by_parameter(self.optimizer)
         for name, param in self._base_sae.named_parameters():
@@ -881,6 +893,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         )
         clear_optimizer_state(self.optimizer)
 
+        if getattr(self.optimizer, "_sae_distributed_optimizer", False):
+            self.optimizer.prepare_full_parameter_state(optimizer_state_by_name)
         named_params = dict(self._base_sae.named_parameters())
         for name, state in optimizer_state_by_name.items():
             if name not in named_params:
