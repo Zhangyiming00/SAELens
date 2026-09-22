@@ -16,12 +16,14 @@ from typing import Any, Iterable
 import einops
 import pandas as pd
 import torch
+import torch.distributed as dist
 from tqdm.auto import tqdm
 from transformer_lens import HookedTransformer
 from transformer_lens.hook_points import HookedRootModule
 
 from sae_lens.loading.pretrained_saes_directory import get_pretrained_saes_directory
 from sae_lens.saes.sae import SAE, SAEConfig
+from sae_lens.sharded_topk import gather_feature_summary
 from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.activations_store import ActivationsStore
 from sae_lens.util import (
@@ -398,6 +400,7 @@ def get_sparsity_and_variance_metrics(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     hook_name = sae.cfg.metadata.hook_name
     hook_head_index = sae.cfg.metadata.hook_head_index
+    sharded_group = getattr(sae, "_tp_group", None) if getattr(sae, "sharded_latents", False) else None
 
     metric_dict = {}
     feature_metric_dict = {}
@@ -525,6 +528,10 @@ def get_sparsity_and_variance_metrics(
         if compute_sparsity_metrics:
             l0 = (flattened_sae_feature_acts > 0).sum(dim=-1).float()
             l1 = flattened_sae_feature_acts.sum(dim=-1)
+            if sharded_group is not None and dist.get_world_size(sharded_group) > 1:
+                # Per-token SCALAR summaries; latent feature shards remain local.
+                dist.all_reduce(l0, group=sharded_group)
+                dist.all_reduce(l1, group=sharded_group)
             metric_dict["l0"].append(l0)
             metric_dict["l1"].append(l1)
 
@@ -568,10 +575,10 @@ def get_sparsity_and_variance_metrics(
 
         if compute_featurewise_density_statistics:
             sae_feature_activations_bool = (masked_sae_feature_activations > 0).float()
-            total_feature_acts += sae_feature_activations_bool.sum(dim=1).sum(dim=0)
-            total_feature_prompts += (sae_feature_activations_bool.sum(dim=1) > 0).sum(
-                dim=0
-            )
+            local_acts = sae_feature_activations_bool.sum(dim=1).sum(dim=0)
+            local_prompts = (sae_feature_activations_bool.sum(dim=1) > 0).sum(dim=0)
+            total_feature_acts += gather_feature_summary(local_acts, sharded_group)
+            total_feature_prompts += gather_feature_summary(local_prompts, sharded_group)
             total_tokens += mask.sum()
 
     # Aggregate scalar metrics

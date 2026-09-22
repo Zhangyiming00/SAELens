@@ -68,7 +68,8 @@ def _trainer_config(device, checkpoint, architecture):
 
 
 def _exercise_trainers(
-    tp_group, dp_group, device, output_dir, architecture, runtime=None, batch_provider=None
+    tp_group, dp_group, device, output_dir, architecture, runtime=None, batch_provider=None,
+    topk_backend="legacy",
 ):
     """Run six updates; after update three use the actual trainer disk loaders."""
     inputs = load_file(REFERENCE / "inputs.safetensors")
@@ -97,6 +98,7 @@ def _exercise_trainers(
         for hook, case in cases.items():
             model_cfg = TopKTrainingSAEConfig.from_dict(manifest["configs"][case])
             model_cfg.device = device
+            model_cfg.topk_backend = topk_backend
             if runtime is not None:
                 from types import SimpleNamespace
                 from sae_lens.llm_sae_training_runner import LanguageModelSAETrainingRunner
@@ -224,14 +226,16 @@ def _exercise_trainers(
 @pytest.mark.parametrize(
     "architecture", ["single", "legacy_per_hook_wrapper", "unified_multi_hook"]
 )
-def test_tp1_trainer_resume_against_native_oracle(tmp_path, monkeypatch, architecture):
+@pytest.mark.parametrize("topk_backend", ["legacy", "sharded_dense", "sharded_sparse"])
+def test_tp1_trainer_resume_against_native_oracle(tmp_path, monkeypatch, architecture, topk_backend):
     pytest.importorskip("megatron.core")
     import torch.testing._internal.distributed.fake_pg  # noqa: F401
 
     monkeypatch.setenv("SAE_ADAM_IMPL", "forloop")
     dist.init_process_group("fake", store=dist.HashStore(), rank=0, world_size=1)
     try:
-        _exercise_trainers(dist.group.WORLD, None, "cpu", tmp_path, architecture)
+        _exercise_trainers(dist.group.WORLD, None, "cpu", tmp_path, architecture,
+                           topk_backend=topk_backend)
     finally:
         dist.destroy_process_group()
 

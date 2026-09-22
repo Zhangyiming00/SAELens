@@ -36,7 +36,8 @@ def test_oracle_integrity():
 
 
 @pytest.mark.parametrize("case", range(4))
-def test_tp1_math_against_native_oracle(case):
+@pytest.mark.parametrize("topk_backend", ["legacy", "sharded_dense", "sharded_sparse"])
+def test_tp1_math_against_native_oracle(case, topk_backend):
     """Real Megatron TP1 math; the singleton test group has no communication."""
     pytest.importorskip("megatron.core")
     import torch.testing._internal.distributed.fake_pg  # noqa: F401
@@ -48,6 +49,7 @@ def test_tp1_math_against_native_oracle(case):
     try:
         cfg = TopKTrainingSAEConfig.from_dict(manifest["configs"][case])
         cfg.device = "cpu"
+        cfg.topk_backend = topk_backend
         sae = MegatronTopKSAE(cfg, tp_group=dist.group.WORLD)
         sae.import_saelens_state_dict(
             {
@@ -70,8 +72,16 @@ def test_tp1_math_against_native_oracle(case):
                 )
             )
             for name in ("hidden_pre", "feature_acts", "loss"):
+                actual = getattr(output, name)
+                if actual.is_sparse:
+                    actual = actual.to_dense()
                 torch.testing.assert_close(
-                    getattr(output, name), golden[prefix + name], **TOLERANCE
+                    actual, golden[prefix + name], **TOLERANCE
+                )
+            if topk_backend != "legacy":
+                torch.testing.assert_close(
+                    output.feature_firing_counts,
+                    (golden[prefix + "feature_acts"] != 0).float().sum(0),
                 )
             torch.testing.assert_close(
                 output.sae_out, golden[prefix + "reconstruction"], **TOLERANCE

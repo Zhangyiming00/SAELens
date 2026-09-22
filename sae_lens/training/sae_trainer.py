@@ -44,6 +44,7 @@ from sae_lens.saes.sae import (
     TrainStepInput,
     TrainStepOutput,
 )
+from sae_lens.sharded_topk import feature_counts_from_output
 from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.ddp_zero_optimizer import (
     build_adam_optimizer,
@@ -1006,11 +1007,10 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
         with torch.no_grad():
             # calling .bool() should be equivalent to .abs() > 0, and work with coo tensors
-            feature_acts = train_step_output.feature_acts
             if local_empty:
                 firing_counts = torch.zeros_like(self.act_freq_scores)
             else:
-                firing_counts = feature_acts.bool().float().sum(0)
+                firing_counts = feature_counts_from_output(train_step_output)
                 if firing_counts.is_sparse:
                     firing_counts = firing_counts.to_dense()
             did_fire = firing_counts.bool()
@@ -1405,7 +1405,11 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         loss = output.loss.item()
 
         # metrics for currents acts
-        l0 = feature_acts.bool().float().sum(-1).to_dense().mean()
+        if output.feature_firing_counts is not None:
+            # Already globally selected over TP; no rank-conditional logging collective.
+            l0 = output.feature_firing_counts.sum() / max(1, math.prod(feature_acts.shape[:-1]))
+        else:
+            l0 = feature_acts.bool().float().sum(-1).to_dense().mean()
         current_learning_rate = self.optimizer.param_groups[0]["lr"]
 
         per_token_l2_loss = (sae_out - sae_in).pow(2).sum(dim=-1).squeeze()

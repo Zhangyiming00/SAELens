@@ -19,6 +19,7 @@ import torch.distributed as dist
 from sae_lens import logger
 from sae_lens.profiling import cuda_nvtx_range
 from sae_lens.saes.sae import TrainStepInput, TrainStepOutput
+from sae_lens.sharded_topk import feature_counts_from_output
 from sae_lens.training.megatron_optimizer import is_megatron_optimizer
 from sae_lens.training.sae_train_unit import HookPhase, SAETrainUnit
 
@@ -198,7 +199,7 @@ def train_runtime_window(
                     timing["sae_forward_time_s"] += perf_counter() - t
                 with torch.no_grad():
                     if n:
-                        firing = output.feature_acts.bool().float().sum(0)
+                        firing = feature_counts_from_output(output)
                         counts[h] += firing.to_dense() if firing.is_sparse else firing
                     for key, value in {"loss": output.loss, **output.losses}.items():
                         loss_sums[h][key] = (

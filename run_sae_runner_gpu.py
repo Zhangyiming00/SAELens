@@ -422,6 +422,22 @@ def parse_args() -> argparse.Namespace:
 
     # 7. General settings
     parser.add_argument(
+        "--sae-topk-backend", choices=["legacy", "sharded_dense", "sharded_sparse"],
+        default="legacy", help="Sharded modes NEVER gather full latent activations.",
+    )
+    parser.add_argument(
+        "--sae-topk-keys", choices=["torch", "triton"], default="torch",
+        help="Torch comparison keys or explicitly enabled fused Triton key generation.",
+    )
+    parser.add_argument(
+        "--sae-topk-protocol", choices=["auto", "candidates", "radix"],
+        default="auto", help="Exact candidate keys; auto uses radix if candidates exceed a shard.",
+    )
+    parser.add_argument(
+        "--sae-sparse-decoder", choices=["torch", "triton"], default="torch",
+        help="Local weighted embedding_bag or optional Triton sparse decoder.",
+    )
+    parser.add_argument(
         "--use-sparse-activations", action=argparse.BooleanOptionalAction, default=False,
         help="Use COO sparse Top-K activations during SAE training (default: disabled).",
     )
@@ -1297,6 +1313,10 @@ def main() -> None:
             device=device,
             dtype=args.dtype,
             use_sparse_activations=args.use_sparse_activations,
+            topk_backend=args.sae_topk_backend,
+            topk_key_backend=args.sae_topk_keys,
+            topk_candidate_protocol=args.sae_topk_protocol,
+            sparse_decoder_backend=args.sae_sparse_decoder,
             rescale_acts_by_decoder_norm=args.rescale_acts_by_decoder_norm,
         ),
         model_name=args.model_name,

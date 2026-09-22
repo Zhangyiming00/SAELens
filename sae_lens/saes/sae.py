@@ -210,6 +210,9 @@ class TrainStepOutput:
     metrics: dict[
         str, torch.Tensor | float | int | Callable[[], torch.Tensor | float | int]
     ] = field(default_factory=dict)
+    # Optional replicated [d_sae] summary. Never a token-by-feature tensor.
+    # Sharded backends populate this once on all TP ranks, outside logging paths.
+    feature_firing_counts: torch.Tensor | None = None
 
 
 @dataclass

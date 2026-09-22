@@ -23,6 +23,7 @@ from torch import nn
 from sae_lens.constants import SAE_CFG_FILENAME, SAE_WEIGHTS_FILENAME
 from sae_lens.megatron_tp import (
     _shard_init_topk_cpu,
+    _wavefront_stream,
     megatron_tp_allgather,
     megatron_tp_launch,
     require_megatron_core,
@@ -36,6 +37,12 @@ from sae_lens.saes.topk_sae import (
     TopKTrainingSAEConfig,
     _fold_norm_topk,
     calculate_topk_aux_acts,
+)
+from sae_lens.sharded_sparse import scale_sparse_features, sparse_decode
+from sae_lens.sharded_topk import (
+    launch_sharded_topk,
+    sharded_firing_counts,
+    sharded_topk,
 )
 
 
@@ -68,6 +75,21 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         runtime: SAERuntime | None = None,
     ):
         require_megatron_core()
+        if cfg.topk_backend not in ("legacy", "sharded_dense", "sharded_sparse"):
+            raise ValueError("Unknown TopK backend: " + str(cfg.topk_backend))
+        if cfg.topk_key_backend not in ("torch", "triton"):
+            raise ValueError("Unknown TopK comparison-key backend")
+        if cfg.topk_candidate_protocol not in ("auto", "candidates", "radix"):
+            raise ValueError("Unknown TopK candidate protocol")
+        if cfg.sparse_decoder_backend not in ("torch", "triton"):
+            raise ValueError("Unknown sparse decoder backend")
+        if cfg.topk_backend != "legacy" and (
+            cfg.topk_key_backend == "triton" or (
+                cfg.topk_backend == "sharded_sparse" and cfg.sparse_decoder_backend == "triton"
+            )
+        ):
+            # Fail BEFORE distributed training, never silently densify a global latent.
+            from sae_lens.sharded_triton import triton_sparse_decode  # noqa: F401
         if runtime is not None:
             runtime_group = runtime.require_local().tp_group
             if tp_group is not None and tp_group is not runtime_group:
@@ -87,7 +109,9 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         super().__init__(copy.deepcopy(cfg), use_error_term)
         self._tp_group = tp_group
         self.parallel_context = runtime
-        self.hook_sae_acts_post = SparseHookPoint(self.cfg.d_sae)
+        self.hook_sae_acts_post = SparseHookPoint(
+            self.cfg.d_sae // self.tp_size if self.sharded_latents else self.cfg.d_sae
+        )
         self.setup()
 
     @classmethod
@@ -174,15 +198,54 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         active = bool(enabled and buffered and available)
         self.gradient_accumulation_fusion = active
         for linear in (self.encoder, self.decoder):
-            linear.gradient_accumulation_fusion = active
-            linear.config.gradient_accumulation_fusion = active
+            linear_active = active and not (
+                linear is self.decoder and self.cfg.topk_backend == "sharded_sparse"
+            )
+            linear.gradient_accumulation_fusion = linear_active
+            # Some Megatron versions share one config between both linears.
+            # Never mutate the encoder's flag while disabling decoder fusion.
+            linear.config = copy.copy(linear.config)
+            linear.config.gradient_accumulation_fusion = linear_active
         # The decoder also receives ordinary autograd gradients through its
         # norms. Megatron's native escape hatch returns zero dummy wgrads and
         # adds the residual autograd gradient; otherwise DDP silently drops it.
         self.decoder.weight.zero_out_wgrad = (
-            active and self.cfg.rescale_acts_by_decoder_norm
+            self.decoder.gradient_accumulation_fusion
+            and self.cfg.rescale_acts_by_decoder_norm
         )
         return active
+
+    @property
+    def sharded_latents(self) -> bool:
+        return self.cfg.topk_backend != "legacy"
+
+    def _check_sharded_post_hooks(self) -> None:
+        # A global post-activation edit cannot be emulated on one feature shard.
+        # Never silently execute such a callback on a different tensor layout.
+        if self.sharded_latents and self.tp_size > 1:
+            point = self.hook_sae_acts_post
+            if point._forward_hooks or point._backward_hooks:
+                raise NotImplementedError(
+                    "Global post-latent hooks are incompatible with sharded TopK. "
+                    "Consume the explicit local encode() output, or select legacy."
+                )
+
+    def _build_train_step_output(self, step_input, feature_acts, hidden_pre, sae_out):
+        if self.sharded_latents and step_input.sae_in.shape[0] == 0:
+            # Empty replicas must still produce connected zero parameter gradients.
+            zero = sae_out.sum() * 0.0 + hidden_pre.sum() * 0.0
+            result = TrainStepOutput(
+                sae_in=step_input.sae_in, sae_out=sae_out,
+                feature_acts=feature_acts, hidden_pre=hidden_pre,
+                loss=zero, losses={"mse_loss": zero, "auxiliary_reconstruction_loss": zero},
+            )
+        else:
+            result = super()._build_train_step_output(
+                step_input, feature_acts, hidden_pre, sae_out
+            )
+        if self.sharded_latents:
+            result.feature_firing_counts = sharded_firing_counts(feature_acts, self._tp_group)
+        return result
 
     def get_activation_fn(self) -> TopK:
         # Megatron's linear modules consume dense activations. The sparse flag
@@ -249,13 +312,61 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         sae_in = self.process_sae_in(x)
         shape = sae_in.shape[:-1]
         local, _ = self.encoder(sae_in.reshape(-1, self.cfg.d_in))
-        local = self.hook_sae_acts_pre(local.reshape(*shape, -1))
+        local = self.hook_sae_acts_pre(local.reshape(*shape, self.cfg.d_sae // self.tp_size))
         if self.cfg.rescale_acts_by_decoder_norm:
             local = local * self._decoder_norm()
+        if self.sharded_latents:
+            self._check_sharded_post_hooks()
+            acts = sharded_topk(
+                local, self.cfg.k, self._tp_group,
+                sparse=self.cfg.topk_backend == "sharded_sparse",
+                protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
+            )
+            return self.hook_sae_acts_post(acts), local
         hidden_pre = megatron_tp_allgather(local, self._tp_group)
         return self.hook_sae_acts_post(self.activation_fn(hidden_pre)), hidden_pre
 
+    def _decode_local(self, feature_acts: torch.Tensor, norm: torch.Tensor | None = None,
+                      *, wavefront: bool = False) -> torch.Tensor:
+        width = self.cfg.d_sae // self.tp_size
+        if feature_acts.shape[-1] != width:
+            raise ValueError("Sharded decode requires local [*, d_sae/TP] features")
+        local = feature_acts
+        if self.cfg.rescale_acts_by_decoder_norm:
+            norm = self._decoder_norm() if norm is None else norm
+            local = scale_sparse_features(local, norm.reciprocal())
+        if self.cfg.topk_backend == "sharded_sparse":
+            # TP1 hooks may supply local dense acts; convert ONLY this local shard.
+            if not local.is_sparse:
+                local = local.to_sparse()
+            partial = sparse_decode(local, self.decoder.weight,
+                                    backend=self.cfg.sparse_decoder_backend)
+            if wavefront or self.tp_size == 1:
+                return partial
+            return require_megatron_core().reduce_from_tensor_model_parallel_region(
+                partial, group=self._tp_group
+            )
+        if local.is_sparse:
+            local = local.to_dense()  # width checked above; always local
+        if not wavefront:
+            result, _ = self.decoder(local.reshape(-1, width))
+        else:
+            decoder = self.decoder
+            if (not decoder.input_is_parallel or decoder.sequence_parallel
+                or decoder.explicit_expert_comm or decoder.bias is not None
+                or decoder.config._cpu_offloading_context is not None):
+                raise RuntimeError("Unsupported RowParallelLinear wavefront configuration")
+            result = decoder._forward_impl(
+                input=local.reshape(-1, width), weight=decoder.weight, bias=None,
+                gradient_accumulation_fusion=decoder.gradient_accumulation_fusion,
+                allreduce_dgrad=False, sequence_parallel=False,
+                tp_group=None, grad_output_buffer=None,
+            )
+        return result.reshape(*local.shape[:-1], self.cfg.d_in)
+
     def _decode_features(self, feature_acts: torch.Tensor) -> torch.Tensor:
+        if self.sharded_latents:
+            return self._decode_local(feature_acts)
         if feature_acts.is_sparse:
             feature_acts = feature_acts.to_dense()
         width = self.cfg.d_sae // self.tp_size
@@ -292,7 +403,19 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 )
             k_aux = self.cfg.d_in // 2
             scale = min(num_dead / k_aux, 1.0)
-            aux = calculate_topk_aux_acts(min(k_aux, num_dead), hidden_pre, mask)
+            if self.sharded_latents:
+                width = self.cfg.d_sae // self.tp_size
+                if mask.shape != (self.cfg.d_sae,):
+                    raise ValueError("Dead mask must be the existing global [d_sae] summary")
+                local_mask = mask.narrow(0, self.tp_rank * width, width)
+                aux = sharded_topk(
+                    hidden_pre, min(k_aux, num_dead), self._tp_group,
+                    eligible=local_mask, relu=False,
+                    sparse=self.cfg.topk_backend == "sharded_sparse",
+                    protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
+                )
+            else:
+                aux = calculate_topk_aux_acts(min(k_aux, num_dead), hidden_pre, mask)
             recons = self.reshape_fn_out(self._decode_features(aux), self.d_head)
             residual = (step_input.sae_in - sae_out).detach()
             loss = (
@@ -315,18 +438,37 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             raise RuntimeError("TP wavefront requires a CUDA SAE with TP > 1")
         sae_in = self.process_sae_in(step_input.sae_in)
         local, _ = self.encoder(sae_in.reshape(-1, self.cfg.d_in))
-        local = self.hook_sae_acts_pre(local.reshape(*sae_in.shape[:-1], -1))
+        local = self.hook_sae_acts_pre(local.reshape(*sae_in.shape[:-1], self.cfg.d_sae // self.tp_size))
         norm = None
         if self.cfg.rescale_acts_by_decoder_norm:
             norm = self.decoder.weight.norm(dim=0)
             local = local * norm
+        if self.sharded_latents:
+            self._check_sharded_post_hooks()
+            gather = launch_sharded_topk(
+                local, self.cfg.k, self._tp_group,
+                sparse=self.cfg.topk_backend == "sharded_sparse",
+                stream=_wavefront_stream(local.device),
+                protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
+            )
+        else:
+            gather = megatron_tp_launch(local, self._tp_group, gather=True)
         return MegatronTPWavefrontState(
             step_input=step_input, hidden_pre_local=local,
-            gather=megatron_tp_launch(local, self._tp_group, gather=True),
+            gather=gather,
             decoder_norm=norm,
         )
 
     def tp_wavefront_decode_launch(self, state: MegatronTPWavefrontState) -> None:
+        if self.sharded_latents:
+            self._check_sharded_post_hooks()
+            feature_acts = self.hook_sae_acts_post(state.gather.wait())
+            recons = self._decode_local(feature_acts, state.decoder_norm, wavefront=True)
+            state.hidden_pre = state.hidden_pre_local
+            state.feature_acts = feature_acts
+            state.decode_bias = self.b_dec
+            state.reduce = megatron_tp_launch(recons, self._tp_group, gather=False)
+            return
         hidden_pre = state.gather.wait()
         feature_acts = self.hook_sae_acts_post(self.activation_fn(hidden_pre))
         dense = feature_acts.to_dense() if feature_acts.is_sparse else feature_acts

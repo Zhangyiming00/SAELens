@@ -41,6 +41,7 @@ from sae_lens.profiling import cuda_nvtx_range, nccl_nvtx_range
 from sae_lens.sae_runtime import SAERuntime
 from sae_lens.saes.sae import TrainingSAE, TrainStepInput, TrainStepOutput
 from sae_lens.saes.topk_sae import TopKTrainingSAE
+from sae_lens.sharded_topk import feature_counts_from_output
 from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.ddp_overlap_v2 import (
     DDPOptimizerOverlapState,
@@ -1628,7 +1629,7 @@ class MultiSAETrainer:
         if local_n == 0:
             firing_counts = torch.zeros_like(self.act_freq_scores_by_hook[hook_name])
         else:
-            firing_counts = output.feature_acts.bool().float().sum(0)
+            firing_counts = feature_counts_from_output(output)
             if firing_counts.is_sparse:
                 firing_counts = firing_counts.to_dense()
         did_fire = firing_counts.bool()

@@ -346,6 +346,12 @@ class TopKTrainingSAEConfig(TrainingSAEConfig):
 
     k: int = 100
     use_sparse_activations: bool = False
+    # Explicit opt-in. Sharded modes change training encode() to LOCAL features.
+    # Neither sharded mode may fall back to a full-latent all-gather.
+    topk_backend: str = "legacy"  # legacy | sharded_dense | sharded_sparse
+    topk_key_backend: str = "torch"  # torch | triton (fused comparison-key generation)
+    topk_candidate_protocol: str = "auto"  # auto | candidates | radix
+    sparse_decoder_backend: str = "torch"  # torch | triton
     aux_loss_coefficient: float = 1.0
     rescale_acts_by_decoder_norm: bool = True
 
@@ -379,6 +385,8 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
         return False
 
     def __init__(self, cfg: TopKTrainingSAEConfig, use_error_term: bool = False):
+        if cfg.topk_backend != "legacy":
+            raise ValueError("Sharded TopK requires MegatronTopKSAE via the training runner")
         super().__init__(cfg, use_error_term)
         self.hook_sae_acts_post = SparseHookPoint(self.cfg.d_sae)
         self.setup()
