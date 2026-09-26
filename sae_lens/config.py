@@ -360,6 +360,11 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     multi_sae_param_gather_schedule: Literal[
         "eager", "one_hook_lag", "after_backward"
     ] = "eager"
+    # Runtime only: preserve the eager control, or finish/backward hooks lazily.
+    multi_sae_tp_wavefront_schedule: Literal["eager", "lazy", "bounded"] = "bounded"
+    multi_sae_tp_wavefront_max_live_hooks: int = 2
+    # auto: summaries in fit, full outputs for direct train-step callers.
+    sae_runtime_output_retention: Literal["auto", "full", "summary"] = "auto"
     sae_single_replica_fast_path: bool = True
     sae_gradient_accumulation_fusion: bool = True
     sae_ga1_loss_normalization: bool = True
@@ -447,6 +452,12 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             raise ValueError(
                 "multi_sae_optimizer_overlap must be 'off', 'on', or 'non_tp_only'"
             )
+        if self.multi_sae_tp_wavefront_schedule not in ("eager", "lazy", "bounded"):
+            raise ValueError("Invalid multi_sae_tp_wavefront_schedule")
+        if type(self.multi_sae_tp_wavefront_max_live_hooks) is not int or self.multi_sae_tp_wavefront_max_live_hooks < 1:
+            raise ValueError("multi_sae_tp_wavefront_max_live_hooks must be positive")
+        if self.sae_runtime_output_retention not in ("auto", "full", "summary"):
+            raise ValueError("Invalid sae_runtime_output_retention")
         if self.multi_sae_param_gather_schedule not in (
             "eager", "one_hook_lag", "after_backward"
         ):
@@ -826,6 +837,9 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             ddp_zero_optimizer=self.ddp_zero_optimizer,
             multi_sae_param_gather_overlap=self.multi_sae_param_gather_overlap,
             multi_sae_param_gather_schedule=self.multi_sae_param_gather_schedule,
+            multi_sae_tp_wavefront_schedule=self.multi_sae_tp_wavefront_schedule,
+            multi_sae_tp_wavefront_max_live_hooks=self.multi_sae_tp_wavefront_max_live_hooks,
+            sae_runtime_output_retention=self.sae_runtime_output_retention,
             sae_single_replica_fast_path=self.sae_single_replica_fast_path,
             sae_gradient_accumulation_fusion=self.sae_gradient_accumulation_fusion,
             sae_ga1_loss_normalization=self.sae_ga1_loss_normalization,
@@ -1154,6 +1168,11 @@ class SAETrainerConfig:
     multi_sae_param_gather_schedule: Literal[
         "eager", "one_hook_lag", "after_backward"
     ] = "eager"
+    # Runtime only: preserve the eager control, or finish/backward hooks lazily.
+    multi_sae_tp_wavefront_schedule: Literal["eager", "lazy", "bounded"] = "bounded"
+    multi_sae_tp_wavefront_max_live_hooks: int = 2
+    # auto: summaries in fit, full outputs for direct train-step callers.
+    sae_runtime_output_retention: Literal["auto", "full", "summary"] = "auto"
     sae_single_replica_fast_path: bool = True
     sae_gradient_accumulation_fusion: bool = True
     sae_ga1_loss_normalization: bool = True

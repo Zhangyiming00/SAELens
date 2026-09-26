@@ -45,11 +45,17 @@ from sae_lens.training.multi_sae_trainer import MULTI_SAE_MANIFEST_FILENAME
 from sae_lens.topology_control import BufferParams, read_control_state, write_control_state
 from sae_lens.util import extract_layer_from_tlens_hook_name
 
+# SAE_V5_RUNNER_WIRING
+from sae_lens.v5_cli import (
+    add_v5_arguments, resolve_experiment_policy_defaults,
+    set_experiment_policy_defaults, v5_config_kwargs,
+)
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # 1. vLLM parameters
     parser.add_argument("--model-name", "--model", default="/root/models/Llama-3.1-8B")
-    parser.add_argument("--dataset-path", "--dataset", default="/mnt/L202500425/dzl/datasets/wikitext2_tokenized_llama31_ctx2048")
+    parser.add_argument("--dataset-path", "--dataset", default="/root/datasets/wikitext2_tokenized_llama31_ctx2048")
     parser.add_argument("--context-size", type=int, default=2048)
     parser.add_argument("--max-model-len", type=int, default=2049)
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
@@ -422,9 +428,17 @@ def parse_args() -> argparse.Namespace:
 
     # 7. General settings
     parser.add_argument(
-        "--sae-topk-backend", choices=["legacy", "sharded_dense", "sharded_sparse"],
-        default="legacy", help="Sharded modes NEVER gather full latent activations.",
+        "--sae-topk-backend", choices=['legacy', 'sharded_dense', 'sharded_sparse', 'sharded_ragged'],
+        default="sharded_ragged", help="Sharded modes NEVER gather full latent activations.",
     )
+    parser.add_argument('--sae-ragged-engine', choices=['openai', 'triton', 'torch_reference'], default='openai')
+    parser.add_argument('--sae-ragged-main-compute', choices=['sparse', 'auto', 'local_dense', 'compact_dense'], default='sparse')
+    parser.add_argument('--sae-ragged-aux-compute', choices=['sparse', 'auto', 'local_dense', 'compact_dense'], default='sparse')
+    parser.add_argument('--sae-ragged-wgrad-split', type=int, choices=[1, 2, 4, 8], default=1)
+    parser.add_argument('--sae-ragged-index-backend', choices=['sort', 'histogram'], default='sort')
+    parser.add_argument('--sae-ragged-openai-page-k', type=int, choices=[32, 64, 128, 256, 512], default=512)
+    parser.add_argument('--sae-ragged-openai-workspace-mib', type=int, default=64)
+    parser.add_argument('--sae-ragged-openai-forward', choices=['bucketed', 'coo'], default='bucketed')
     parser.add_argument(
         "--sae-topk-keys", choices=["torch", "triton"], default="torch",
         help="Torch comparison keys or explicitly enabled fused Triton key generation.",
@@ -434,8 +448,8 @@ def parse_args() -> argparse.Namespace:
         default="auto", help="Exact candidate keys; auto uses radix if candidates exceed a shard.",
     )
     parser.add_argument(
-        "--sae-sparse-decoder", choices=["torch", "triton"], default="torch",
-        help="Local weighted embedding_bag or optional Triton sparse decoder.",
+        "--sae-sparse-decoder", choices=["torch", "sae", "triton"], default="torch",
+        help="Local decoder: torch embedding_bag, built-in SAE sparse.mm, or Triton.",
     )
     parser.add_argument(
         "--use-sparse-activations", action=argparse.BooleanOptionalAction, default=False,
@@ -504,7 +518,7 @@ def parse_args() -> argparse.Namespace:
         help="Sync interval for --multi-sae-stats-sync-mode=periodic.",
     )
     parser.add_argument(
-        "--multi-sae-distributed-architecture", default="legacy_per_hook_wrapper",
+        "--multi-sae-distributed-architecture", default="unified_multi_hook",
         choices=["legacy_per_hook_wrapper", "unified_multi_hook"],
         help=(
             "Multi-layer SAE forward scheduling: unified_multi_hook enables "
@@ -512,6 +526,22 @@ def parse_args() -> argparse.Namespace:
             "Megatron routing retains independent per-hook DDP/optimizer units "
             "with either choice. TP1 or one local hook runs serially."
         ),
+    )
+    parser.add_argument(
+        "--multi-sae-tp-wavefront-schedule", choices=["eager", "lazy", "bounded"],
+        default="lazy", help="Runtime TP schedule: original eager, lazy AuxK finish, or bounded live hooks.",
+    )
+    parser.add_argument(
+        "--multi-sae-tp-wavefront-max-live-hooks", type=int, default=2,
+        help="Maximum unfinished main-forward hook states in bounded wavefront (positive).",
+    )
+    parser.add_argument(
+        "--sae-runtime-output-retention", choices=["auto", "full", "summary"], default="auto",
+        help="auto: fit keeps summaries, direct train-step returns full outputs; full is the compatibility control.",
+    )
+    parser.add_argument(
+        "--sae-auxk-selection", choices=["auto", "legacy"], default="auto",
+        help="Sharded AuxK: select-all shortcut + compact radix, or the original protocol.",
     )
     parser.add_argument(
         "--multi-sae-tp-phase-fence", default="auto", choices=["auto", "always", "off"],
@@ -602,7 +632,13 @@ def parse_args() -> argparse.Namespace:
                 continue
         argv.append(token)
 
+    add_v5_arguments(parser)
+    # Training experiments use independent Main/Aux policies. Resolve omitted
+    # policies after parsing so an explicit legacy/dense backend still works,
+    # and an explicit 'inherit' remains an actual opt-out of the V5 policy.
+    set_experiment_policy_defaults(parser)
     args = parser.parse_args(argv)
+    resolve_experiment_policy_defaults(args, argv)
 
     if args.elastic_streaming:
         args.streaming_mode = True
@@ -942,6 +978,11 @@ def _append_total_runtime_record(
 
 
 def main() -> None:
+    import sys
+    if "--sae-profile" in sys.argv[1:]:
+        from sae_lens.v5_profile import main_from_runner
+        main_from_runner(sys.argv[1:])
+        return
     args = parse_args()
     os.environ.setdefault("SAE_ADAM_IMPL", "fused")
 
@@ -1307,6 +1348,7 @@ def main() -> None:
     )
     cfg = LanguageModelSAERunnerConfig(
         sae=TopKTrainingSAEConfig(
+            **v5_config_kwargs(args, exclude=('d_in', 'd_sae', 'k', 'device', 'dtype', 'use_sparse_activations', 'topk_backend', 'ragged_decoder_engine', 'ragged_main_compute', 'ragged_aux_compute', 'ragged_wgrad_split', 'ragged_index_backend', 'ragged_openai_page_k', 'ragged_openai_workspace_mib', 'ragged_openai_forward', 'topk_key_backend', 'topk_candidate_protocol', 'sparse_decoder_backend', 'auxk_selection', 'rescale_acts_by_decoder_norm')),
             d_in=d_in,
             d_sae=args.d_sae,
             k=args.k,
@@ -1314,9 +1356,18 @@ def main() -> None:
             dtype=args.dtype,
             use_sparse_activations=args.use_sparse_activations,
             topk_backend=args.sae_topk_backend,
+            ragged_decoder_engine=args.sae_ragged_engine,
+            ragged_main_compute=args.sae_ragged_main_compute,
+            ragged_aux_compute=args.sae_ragged_aux_compute,
+            ragged_wgrad_split=args.sae_ragged_wgrad_split,
+            ragged_index_backend=args.sae_ragged_index_backend,
+            ragged_openai_page_k=args.sae_ragged_openai_page_k,
+            ragged_openai_workspace_mib=args.sae_ragged_openai_workspace_mib,
+            ragged_openai_forward=args.sae_ragged_openai_forward,
             topk_key_backend=args.sae_topk_keys,
             topk_candidate_protocol=args.sae_topk_protocol,
             sparse_decoder_backend=args.sae_sparse_decoder,
+            auxk_selection=args.sae_auxk_selection,
             rescale_acts_by_decoder_norm=args.rescale_acts_by_decoder_norm,
         ),
         model_name=args.model_name,
@@ -1379,6 +1430,9 @@ def main() -> None:
         multi_sae_seed_mode=args.multi_sae_seed_mode,
         multi_sae_distributed_architecture=args.multi_sae_distributed_architecture,
         multi_sae_tp_phase_fence=args.multi_sae_tp_phase_fence,
+        multi_sae_tp_wavefront_schedule=args.multi_sae_tp_wavefront_schedule,
+        multi_sae_tp_wavefront_max_live_hooks=args.multi_sae_tp_wavefront_max_live_hooks,
+        sae_runtime_output_retention=args.sae_runtime_output_retention,
         multi_sae_optimizer_overlap=args.multi_sae_optimizer_overlap,
         ddp_zero_optimizer=args.ddp_zero_optimizer,
         multi_sae_param_gather_overlap=args.multi_sae_param_gather_overlap,
@@ -1423,6 +1477,16 @@ def main() -> None:
     if hook_names is not None:
         print(f"  hooks={','.join(hook_names)}")
     print(f"  d_in={d_in} d_sae={args.d_sae} k={args.k}")
+    print(
+        f"  sae_topk_backend={cfg.sae.topk_backend} "
+        f"ragged_engine={cfg.sae.ragged_decoder_engine} "
+        f"main_compute={cfg.sae.v5_main_compute} aux_compute={cfg.sae.v5_aux_compute}"
+    )
+    print(
+        f"  tp_wavefront_schedule={cfg.multi_sae_tp_wavefront_schedule} "
+        f"output_retention={cfg.sae_runtime_output_retention} "
+        f"gradient_accumulation_fusion={cfg.sae_gradient_accumulation_fusion}"
+    )
     print(
         "  training_tokens="
         f"{args.training_tokens} train_batch_size_tokens={args.train_batch_size_tokens} "

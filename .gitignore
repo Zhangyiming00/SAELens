@@ -228,3 +228,4 @@ docs/validation/*
 tests/native_reference/vendor/sae_lens-6.37.6-py3-none-any.whl
 tests/native_reference/golden.safetensors
 tests/native_reference/inputs.safetensors
+docs/context/

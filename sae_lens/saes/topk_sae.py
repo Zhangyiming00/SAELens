@@ -348,10 +348,53 @@ class TopKTrainingSAEConfig(TrainingSAEConfig):
     use_sparse_activations: bool = False
     # Explicit opt-in. Sharded modes change training encode() to LOCAL features.
     # Neither sharded mode may fall back to a full-latent all-gather.
-    topk_backend: str = "legacy"  # legacy | sharded_dense | sharded_sparse
+    topk_backend: str = "legacy"  # legacy | sharded_dense | sharded_sparse | sharded_ragged
     topk_key_backend: str = "torch"  # torch | triton (fused comparison-key generation)
     topk_candidate_protocol: str = "auto"  # auto | candidates | radix
-    sparse_decoder_backend: str = "torch"  # torch | triton
+    sparse_decoder_backend: str = "torch"  # torch (embedding_bag) | sae (sparse.mm) | triton
+    # auto bypasses select-all AuxK and uses compact, int32-safe radix otherwise.
+    # legacy retains the original fixed 64-bit selection protocol for comparison.
+    auxk_selection: str = "auto"  # auto | legacy
+    # Independent AuxK cliff controls; original local-dense/TopK remain available.
+    auxk_decoder_backend: str = "auto"  # auto | local_dense | compact_dense
+    auxk_complement: str = "auto"  # auto | off; legacy/radix selection disables it
+    # Opt-in sharded_ragged: selected-entry decoder forward/dvalues/dW.
+    ragged_decoder_engine: str = "triton"  # openai | triton (v3 custom) | torch_reference (debug)
+    ragged_main_compute: str = "sparse"  # sparse | auto | local_dense | compact_dense
+    ragged_aux_compute: str = "sparse"  # sparse | auto | local_dense | compact_dense
+    ragged_wgrad_split: int = 1  # 1 deterministic sorted reduce; 2/4/8 atomic partials
+    ragged_index_backend: str = "sort"  # sort | histogram (nondeterministic order)
+    # Actual upstream OpenAI kernels. Existing triton remains the v3 custom code.
+    ragged_openai_page_k: int = 512  # bound each original sampled-gradient launch
+    ragged_openai_workspace_mib: int = 64  # adapter row-tile workspace target
+    ragged_openai_forward: str = "bucketed"  # bucketed original fwd | original COO
+
+    # V5 opt-in execution policy. Old V4 dispatch remains active with inherit.
+    auxk: int | None = None  # None preserves d_in//2; not a diagnostic override.
+    topk_tie_policy: str = "stable_id"  # stable_id | torch_tp1 (explicit native tie experiment)
+    v5_main_compute: str = "inherit"
+    v5_aux_compute: str = "inherit"
+    v5_main_forward: str = "inherit"
+    v5_main_dvalues: str = "inherit"
+    v5_main_dweight: str = "inherit"
+    v5_aux_forward: str = "inherit"
+    v5_aux_dvalues: str = "inherit"
+    v5_aux_dweight: str = "inherit"
+    v5_main_threshold: int = 512
+    v5_aux_threshold: int = 512
+    v5_main_forward_threshold: int | None = None
+    v5_main_dvalues_threshold: int | None = None
+    v5_main_dweight_threshold: int | None = None
+    v5_aux_forward_threshold: int | None = None
+    v5_aux_dvalues_threshold: int | None = None
+    v5_aux_dweight_threshold: int | None = None
+    v5_k_metric: str = "mean"  # local entries/rows, or explicit max-row readback
+    v5_compact_max_ratio: float = 0.5
+    v5_compact_min_density: float = 0.25
+    v5_workspace_mib: int = 128  # tile scratch target, not whole-step memory cap
+
+
+
     aux_loss_coefficient: float = 1.0
     rescale_acts_by_decoder_norm: bool = True
 

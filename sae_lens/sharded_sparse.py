@@ -1,7 +1,8 @@
 """Local sparse SAE decoder; never gathers or reconstructs a global latent.
 
 The default backend reuses PyTorch's weighted embedding_bag (dense PARAMETER
-weight gradients). The optional Triton backend uses the same three operations
+weight gradients). The ``sae`` backend reuses SAELens' native sparse.mm decoder.
+The optional Triton backend uses the same three operations
 as the OpenAI SAE decoder: sparse-dense, sampled dense-dense, sparse.T-dense.
 It is independently implemented for arbitrary decoder strides and ragged nnz.
 Encoder autograd remains native and may allocate a *local* dense latent gradient.
@@ -52,19 +53,34 @@ def sparse_decode(
     strides; torch embedding_bag may make a local weight-layout copy internally.
     No sparse PARAMETER gradient is exposed to DDP/Adam.
     """
-    if backend not in ("torch", "triton"):
-        raise ValueError("Sparse decoder backend must be torch or triton")
+    if backend not in ("torch", "sae", "triton"):
+        raise ValueError("Sparse decoder backend must be torch, sae, or triton")
     if acts.shape[-1] != weight.shape[1]:
         raise ValueError("Sparse decoder consumes only this rank's feature shard")
     if acts.device != weight.device:
         raise ValueError("Latents and decoder weights must share a device")
-    row, feature, values, rows = flatten_coo(acts)
+    if not acts.is_sparse or acts.ndim < 2:
+        raise TypeError("Expected a COO latent with at least two dimensions")
     device_type = weight.device.type
     dtype = (
         torch.get_autocast_dtype(device_type)
         if torch.is_autocast_enabled(device_type)
         else weight.dtype
     )
+    if backend == "sae":
+        # Reuse the built-in decoder on this feature shard only. The caller
+        # already applied the shared decoder norm and owns the TP reduction.
+        from sae_lens.saes.topk_sae import act_times_W_dec
+
+        with torch.autocast(device_type=device_type, enabled=False):
+            local, decoder = acts.to(dtype), weight.to(dtype)
+            # Like the torch embedding_bag path, preserve BF16 rounding before
+            # using FP32 for the CUDA sparse operation and its backward.
+            if weight.is_cuda and dtype == torch.bfloat16:
+                local, decoder = local.float(), decoder.float()
+            out = act_times_W_dec(local, decoder.T, False)
+        return out.to(dtype)
+    row, feature, values, rows = flatten_coo(acts)
     with torch.autocast(device_type=device_type, enabled=False):
         values = values.to(dtype)
         weight = weight.to(dtype)

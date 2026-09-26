@@ -38,17 +38,20 @@ from sae_lens.saes.topk_sae import (
     _fold_norm_topk,
     calculate_topk_aux_acts,
 )
+from sae_lens.auxk_compact import prepare_auxk_dense, compact_aux_decode
 from sae_lens.sharded_sparse import scale_sparse_features, sparse_decode
 from sae_lens.sharded_topk import (
     launch_sharded_topk,
     sharded_firing_counts,
     sharded_topk,
+    sharded_auxk,
 )
 
 
 @dataclass
 class MegatronTPWavefrontState(TopKTPWavefrontState):
     decoder_norm: torch.Tensor | None = None
+    decoder_vectors: torch.Tensor | None = None
 
 
 class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
@@ -75,13 +78,23 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         runtime: SAERuntime | None = None,
     ):
         require_megatron_core()
-        if cfg.topk_backend not in ("legacy", "sharded_dense", "sharded_sparse"):
+        from sae_lens.adaptive_sae import validate_config
+        validate_config(cfg)
+        if cfg.topk_backend not in ("legacy", "sharded_dense", "sharded_sparse", "sharded_ragged"):
             raise ValueError("Unknown TopK backend: " + str(cfg.topk_backend))
         if cfg.topk_key_backend not in ("torch", "triton"):
             raise ValueError("Unknown TopK comparison-key backend")
         if cfg.topk_candidate_protocol not in ("auto", "candidates", "radix"):
             raise ValueError("Unknown TopK candidate protocol")
-        if cfg.sparse_decoder_backend not in ("torch", "triton"):
+        if cfg.auxk_selection not in ("auto", "legacy"):
+            raise ValueError("Unknown AuxK selection policy")
+        if cfg.auxk_decoder_backend not in ("auto", "local_dense", "compact_dense"):
+            raise ValueError("Unknown AuxK dense decoder backend")
+        if cfg.auxk_complement not in ("auto", "off"):
+            raise ValueError("Unknown AuxK complement selection mode")
+        if cfg.topk_backend != "sharded_dense" and cfg.auxk_decoder_backend == "compact_dense":
+            raise ValueError("Compact AuxK decoder requires sharded_dense")
+        if cfg.sparse_decoder_backend not in ("torch", "sae", "triton"):
             raise ValueError("Unknown sparse decoder backend")
         if cfg.topk_backend != "legacy" and (
             cfg.topk_key_backend == "triton" or (
@@ -90,6 +103,30 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         ):
             # Fail BEFORE distributed training, never silently densify a global latent.
             from sae_lens.sharded_triton import triton_sparse_decode  # noqa: F401
+        if cfg.topk_backend == "sharded_ragged":
+            if cfg.ragged_decoder_engine not in ("openai", "triton", "torch_reference"):
+                raise ValueError("Unknown ragged decoder engine")
+            for policy in (cfg.ragged_main_compute, cfg.ragged_aux_compute):
+                if policy not in ("sparse", "auto", "local_dense", "compact_dense"):
+                    raise ValueError("Unknown ragged compute policy")
+            if cfg.ragged_wgrad_split not in (1, 2, 4, 8) or cfg.ragged_index_backend not in ("sort", "histogram"):
+                raise ValueError("Invalid ragged weight-gradient configuration")
+            if cfg.ragged_decoder_engine == "openai":
+                if cfg.ragged_wgrad_split != 1 or cfg.ragged_index_backend != "sort":
+                    raise ValueError("OpenAI kernel engine requires the original sorted-COO wgrad path (split=1, sort)")
+                if cfg.ragged_openai_page_k not in (32, 64, 128, 256, 512):
+                    raise ValueError("Invalid OpenAI page K")
+                if not 1 <= cfg.ragged_openai_workspace_mib <= 4096:
+                    raise ValueError("Invalid OpenAI workspace budget")
+                if cfg.ragged_openai_forward not in ("bucketed", "coo"):
+                    raise ValueError("Invalid OpenAI forward adapter")
+                # Import original upstream functions before the first collective.
+                from sae_lens.openai_sae_adapter import _kernels
+                _kernels()
+            if cfg.ragged_decoder_engine == "triton":
+                # Eager import catches missing dependency before any forward
+                # collective. No runtime dense fallback on import/JIT errors.
+                from sae_lens.ragged_sae_triton import forward as _ragged_forward
         if runtime is not None:
             runtime_group = runtime.require_local().tp_group
             if tp_group is not None and tp_group is not runtime_group:
@@ -102,6 +139,8 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         self._init_tp_group = tp_group
         self.tp_size = dist.get_world_size(tp_group)
         self.tp_rank = dist.get_rank(tp_group)
+        if getattr(cfg, "topk_tie_policy", "stable_id") == "torch_tp1" and self.tp_size != 1:
+            raise ValueError("torch_tp1 ties are only defined for TP1; no full gather is allowed to emulate torch ties")
         if cfg.d_sae % self.tp_size:
             raise ValueError("d_sae must be divisible by SAE TP size")
         if cfg.d_in < 2 or not 0 < cfg.k <= cfg.d_sae:
@@ -199,7 +238,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         self.gradient_accumulation_fusion = active
         for linear in (self.encoder, self.decoder):
             linear_active = active and not (
-                linear is self.decoder and self.cfg.topk_backend == "sharded_sparse"
+                linear is self.decoder and self.cfg.topk_backend in ("sharded_sparse", "sharded_ragged")
             )
             linear.gradient_accumulation_fusion = linear_active
             # Some Megatron versions share one config between both linears.
@@ -207,11 +246,15 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             linear.config = copy.copy(linear.config)
             linear.config.gradient_accumulation_fusion = linear_active
         # The decoder also receives ordinary autograd gradients through its
-        # norms. Megatron's native escape hatch returns zero dummy wgrads and
+        # norms AND packed AuxK index-select. The native escape hatch returns
+        # zero dummy wgrads and
         # adds the residual autograd gradient; otherwise DDP silently drops it.
         self.decoder.weight.zero_out_wgrad = (
             self.decoder.gradient_accumulation_fusion
-            and self.cfg.rescale_acts_by_decoder_norm
+            and (self.cfg.rescale_acts_by_decoder_norm or (
+                self.cfg.topk_backend == "sharded_dense"
+                and getattr(self.cfg, "auxk_decoder_backend", "auto") != "local_dense"
+            ))
         )
         return active
 
@@ -222,7 +265,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
     def _check_sharded_post_hooks(self) -> None:
         # A global post-activation edit cannot be emulated on one feature shard.
         # Never silently execute such a callback on a different tensor layout.
-        if self.sharded_latents and self.tp_size > 1:
+        if self.sharded_latents and (self.tp_size > 1 or self.cfg.topk_backend == "sharded_ragged"):
             point = self.hook_sae_acts_post
             if point._forward_hooks or point._backward_hooks:
                 raise NotImplementedError(
@@ -256,18 +299,21 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         return {}
 
     @contextmanager
-    def _share_decoder_norm(self, norm: torch.Tensor | None = None):
+    def _share_decoder_norm(self, norm: torch.Tensor | None = None, vectors: torch.Tensor | None = None):
         """Share one differentiable norm node within this forward only.
 
         Its vector gradients combine before expanding to the decoder matrix.
         Restore the scope on exceptions/nested calls; never reuse across steps.
         """
         previous = getattr(self, "_decoder_norm_scope", None)
+        previous_vectors = getattr(self, "_decoder_vectors_scope", None)
         self._decoder_norm_scope = [norm]
+        self._decoder_vectors_scope = [vectors]
         try:
             yield
         finally:
             self._decoder_norm_scope = previous
+            self._decoder_vectors_scope = previous_vectors
 
     def _decoder_norm(self) -> torch.Tensor:
         scope = getattr(self, "_decoder_norm_scope", None)
@@ -276,6 +322,69 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         if scope[0] is None:
             scope[0] = self.decoder.weight.norm(dim=0)
         return scope[0]
+
+    def _decoder_vectors(self):
+        """One feature-major differentiable LOCAL weight copy per live forward.
+
+        No cached Parameter or optimizer state, no stale cross-step copy. Main
+        and AuxK share this Tensor through normal and wavefront scopes.
+        """
+        scope = getattr(self, "_decoder_vectors_scope", None)
+        if scope is None:
+            return self.decoder.weight.T.contiguous()
+        if scope[0] is None:
+            scope[0] = self.decoder.weight.T.contiguous()
+        return scope[0]
+
+    def _decode_ragged_partial(self, acts, norm=None, *, auxiliary=False, known_columns=None):
+        from sae_lens.ragged_sae import (RaggedLatents, decode_ragged,
+                                        dense_ragged_reference, packed_diagnostics,
+                                        compact_ragged_dense)
+        if not isinstance(acts, RaggedLatents):
+            raise TypeError("sharded_ragged decode requires explicit selected-entry metadata")
+        if self.cfg.rescale_acts_by_decoder_norm:
+            norm = self._decoder_norm() if norm is None else norm
+            acts = acts.scale(norm.reciprocal())
+        from sae_lens.adaptive_sae import active, decode_adaptive
+        if active(self.cfg, auxiliary):
+            result, diagnostic = decode_adaptive(acts, self._decoder_vectors(), self.cfg,
+                                                 auxiliary=auxiliary, known_columns=known_columns)
+            if auxiliary:
+                self._last_auxk_execution = diagnostic
+            else:
+                self._last_main_execution = diagnostic
+            return result
+        engine = getattr(self.cfg, "ragged_decoder_engine", "triton")
+        policy = getattr(self.cfg, "ragged_aux_compute" if auxiliary else "ragged_main_compute", "sparse")
+        # 'auto' is an explicit structural policy, NOT a measured fastest-kernel
+        # planner: compact only when all eligible columns are selected; sparse otherwise.
+        actual = ("compact_dense" if auxiliary and acts.selection == "select_all" else "sparse") if policy == "auto" else policy
+        vectors = self._decoder_vectors()
+        if actual == "sparse":
+            out = decode_ragged(acts, vectors, engine=engine,
+                                split=getattr(self.cfg, "ragged_wgrad_split", 1),
+                                index_backend=getattr(self.cfg, "ragged_index_backend", "sort"),
+                                openai_page_k=getattr(self.cfg, "ragged_openai_page_k", 512),
+                                openai_workspace_mib=getattr(self.cfg, "ragged_openai_workspace_mib", 64),
+                                openai_forward=getattr(self.cfg, "ragged_openai_forward", "bucketed"))
+        elif actual == "local_dense":
+            out = dense_ragged_reference(acts, vectors)
+        elif actual == "compact_dense":
+            out = compact_ragged_dense(acts, vectors)
+        else:
+            raise ValueError("Unknown ragged computation policy")
+        diagnostic = packed_diagnostics(acts, engine, actual)
+        if engine == "openai" and actual == "sparse":
+            from sae_lens.openai_sae_adapter import upstream_identity
+            diagnostic.update(upstream_identity())
+            diagnostic.update(page_k=getattr(self.cfg, "ragged_openai_page_k", 512),
+                              forward_adapter=getattr(self.cfg, "ragged_openai_forward", "bucketed"),
+                              workspace_mib=getattr(self.cfg, "ragged_openai_workspace_mib", 64))
+        if auxiliary:
+            self._last_auxk_execution = diagnostic
+        else:
+            self._last_main_execution = diagnostic
+        return out
 
     def training_forward_pass(self, step_input: TrainStepInput) -> TrainStepOutput:
         with self._share_decoder_norm():
@@ -320,7 +429,9 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             acts = sharded_topk(
                 local, self.cfg.k, self._tp_group,
                 sparse=self.cfg.topk_backend == "sharded_sparse",
+                packed=self.cfg.topk_backend == "sharded_ragged",
                 protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
+                tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"),
             )
             return self.hook_sae_acts_post(acts), local
         hidden_pre = megatron_tp_allgather(local, self._tp_group)
@@ -331,6 +442,11 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         width = self.cfg.d_sae // self.tp_size
         if feature_acts.shape[-1] != width:
             raise ValueError("Sharded decode requires local [*, d_sae/TP] features")
+        if self.cfg.topk_backend == "sharded_ragged":
+            partial = self._decode_ragged_partial(feature_acts, norm)
+            if wavefront or self.tp_size == 1:
+                return partial
+            return require_megatron_core().reduce_from_tensor_model_parallel_region(partial, group=self._tp_group)
         local = feature_acts
         if self.cfg.rescale_acts_by_decoder_norm:
             norm = self._decoder_norm() if norm is None else norm
@@ -392,6 +508,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
     ) -> dict[str, torch.Tensor]:
         mask = step_input.dead_neuron_mask
         if mask is None or (num_dead := int(mask.sum())) == 0:
+            self._last_auxk_execution = {"selection": "skipped", "decoder": "skipped", "num_dead": 0}
             loss = sae_out.new_tensor(0.0)
         else:
             if self.cfg.normalize_activations in (
@@ -401,22 +518,85 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 raise ValueError(
                     "TopK auxiliary loss does not support activation normalization"
                 )
-            k_aux = self.cfg.d_in // 2
+            configured_auxk = getattr(self.cfg, "auxk", None)
+            k_aux = self.cfg.d_in // 2 if configured_auxk is None else int(configured_auxk)
             scale = min(num_dead / k_aux, 1.0)
             if self.sharded_latents:
                 width = self.cfg.d_sae // self.tp_size
                 if mask.shape != (self.cfg.d_sae,):
                     raise ValueError("Dead mask must be the existing global [d_sae] summary")
                 local_mask = mask.narrow(0, self.tp_rank * width, width)
-                aux = sharded_topk(
-                    hidden_pre, min(k_aux, num_dead), self._tp_group,
-                    eligible=local_mask, relu=False,
-                    sparse=self.cfg.topk_backend == "sharded_sparse",
-                    protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
-                )
+                if self.cfg.topk_backend == "sharded_ragged":
+                    from sae_lens.ragged_sae import ragged_auxk
+                    from sae_lens.adaptive_sae import active, try_direct_aux
+                    enabled = active(self.cfg, True)
+                    direct = None
+                    if enabled:
+                        norm = self._decoder_norm() if self.cfg.rescale_acts_by_decoder_norm else None
+                        direct = try_direct_aux(hidden_pre, local_mask, num_dead, k_aux,
+                                                self.decoder.weight, norm, self.cfg)
+                    if direct is not None:
+                        recons, self._last_auxk_execution = direct
+                    else:
+                        aux = ragged_auxk(hidden_pre, min(k_aux, num_dead), local_mask, num_dead, self._tp_group,
+                                          policy=getattr(self.cfg, "auxk_selection", "auto"),
+                                          protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
+                                          complement=getattr(self.cfg, "auxk_complement", "auto"),
+                                          tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"))
+                        # Eligible IDs are shared across this batch, not values.
+                        columns = local_mask.nonzero(as_tuple=True)[0] if enabled else None
+                        recons = self._decode_ragged_partial(aux, auxiliary=True, known_columns=columns)
+                    self._last_auxk_execution.update(num_dead=num_dead, k=min(k_aux, num_dead))
+                    if self.tp_size > 1:
+                        recons = require_megatron_core().reduce_from_tensor_model_parallel_region(recons, group=self._tp_group)
+                elif self.cfg.topk_backend == "sharded_dense":
+                    aux, columns, plan = prepare_auxk_dense(
+                        hidden_pre, min(k_aux, num_dead), local_mask, num_dead, self._tp_group,
+                        decoder=getattr(self.cfg, "auxk_decoder_backend", "auto"),
+                        complement=getattr(self.cfg, "auxk_complement", "auto"),
+                        selection_policy=getattr(self.cfg, "auxk_selection", "auto"),
+                        protocol=self.cfg.topk_candidate_protocol,
+                        key_backend=self.cfg.topk_key_backend,
+                        tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"),
+                    )
+                    # Diagnostics retain scalars only; never tensors/autograd state.
+                    self._last_auxk_execution = {
+                        "selection": plan.selection, "decoder": plan.decoder,
+                        "num_dead": num_dead, "k": plan.k, "exclude_k": plan.exclude_k,
+                        "compact_width": None if columns is None else columns.numel(),
+                        "comparison_key_backend": (
+                            "torch" if plan.selection.startswith("complement") else
+                            "none" if plan.selection == "select_all" else self.cfg.topk_key_backend
+                        ),
+                    }
+                    if columns is not None:
+                        if (self.decoder.gradient_accumulation_fusion and
+                            not getattr(self.decoder.weight, "zero_out_wgrad", False)):
+                            raise RuntimeError(
+                                "Compact AuxK needs zero_out_wgrad for fused main + ordinary auxiliary "
+                                "gradients. Configure auxk_decoder_backend before wrapping native DDP "
+                                "and call configure_gradient_accumulation_fusion again after changing it."
+                            )
+                        norm = self._decoder_norm() if self.cfg.rescale_acts_by_decoder_norm else None
+                        recons = compact_aux_decode(aux, columns, self.decoder.weight, norm)
+                        if self.tp_size > 1:
+                            recons = require_megatron_core().reduce_from_tensor_model_parallel_region(
+                                recons, group=self._tp_group
+                            )
+                    else:
+                        recons = self._decode_features(aux)
+                else:
+                    aux = sharded_auxk(
+                        hidden_pre, min(k_aux, num_dead), local_mask, num_dead, self._tp_group,
+                        sparse=True, policy=getattr(self.cfg, "auxk_selection", "auto"),
+                        protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
+                        tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"),
+                    )
+                    recons = self._decode_features(aux)
             else:
                 aux = calculate_topk_aux_acts(min(k_aux, num_dead), hidden_pre, mask)
-            recons = self.reshape_fn_out(self._decode_features(aux), self.d_head)
+                recons = self._decode_features(aux)
+            recons = self.reshape_fn_out(recons, self.d_head)
             residual = (step_input.sae_in - sae_out).detach()
             loss = (
                 self.cfg.aux_loss_coefficient
@@ -448,8 +628,10 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             gather = launch_sharded_topk(
                 local, self.cfg.k, self._tp_group,
                 sparse=self.cfg.topk_backend == "sharded_sparse",
+                packed=self.cfg.topk_backend == "sharded_ragged",
                 stream=_wavefront_stream(local.device),
                 protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
+                tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"),
             )
         else:
             gather = megatron_tp_launch(local, self._tp_group, gather=True)
@@ -463,7 +645,9 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         if self.sharded_latents:
             self._check_sharded_post_hooks()
             feature_acts = self.hook_sae_acts_post(state.gather.wait())
-            recons = self._decode_local(feature_acts, state.decoder_norm, wavefront=True)
+            with self._share_decoder_norm(state.decoder_norm, state.decoder_vectors):
+                recons = self._decode_local(feature_acts, state.decoder_norm, wavefront=True)
+                state.decoder_vectors = self._decoder_vectors_scope[0]
             state.hidden_pre = state.hidden_pre_local
             state.feature_acts = feature_acts
             state.decode_bias = self.b_dec
@@ -506,7 +690,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         out = self.reshape_fn_out(out, self.d_head)
         # Auxiliary reconstruction keeps the ordinary native decoder path,
         # including the encode bias-edge reduction and input-gradient fallback.
-        with self._share_decoder_norm(state.decoder_norm):
+        with self._share_decoder_norm(state.decoder_norm, state.decoder_vectors):
             return self._build_train_step_output(
                 state.step_input, state.feature_acts, state.hidden_pre, out
             )

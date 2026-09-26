@@ -57,6 +57,7 @@ from sae_lens.training.ddp_zero_optimizer import (
     optimizer_state_by_parameter,
     set_optimizer_parameter_state,
 )
+from sae_lens.training.step_summary import TrainStepSummary
 from sae_lens.training.gradient_window import (
     configure_update_batch,
     fit_window_batches,
@@ -954,12 +955,13 @@ class MultiSAETrainer:
         batch_by_hook: dict[str, torch.Tensor],
         local_n: int,
         *, _fit_window: bool = False,
-    ) -> tuple[dict[str, TrainStepOutput], dict[str, float]]:
+    ) -> tuple[dict[str, TrainStepOutput | TrainStepSummary], dict[str, float]]:
         if self.units and set(batch_by_hook) != set(self.units):
             raise ValueError("Every synchronous step must contain exactly the local SAE hooks")
         if self.units:
             return train_runtime_window(
-                self, fit_window_batches(self, batch_by_hook) if _fit_window else [batch_by_hook]
+                self, fit_window_batches(self, batch_by_hook) if _fit_window else [batch_by_hook],
+                retain_full_outputs=not _fit_window,
             )
         self._validate_unified_hook_set(batch_by_hook)
         if self.multi_sae_distributed_architecture == "unified_multi_hook":
@@ -1634,7 +1636,9 @@ class MultiSAETrainer:
                 firing_counts = firing_counts.to_dense()
         did_fire = firing_counts.bool()
         did_fire_int = did_fire.to(torch.int32).contiguous()
-        self.act_freq_scores_by_hook[hook_name] += firing_counts
+        global_frequency_delta = firing_counts.clone()
+        self._all_reduce_sum(global_frequency_delta)
+        self.act_freq_scores_by_hook[hook_name] += global_frequency_delta
         if self.stats_sync_mode == "immediate":
             self._apply_stats_from_global(
                 hook_name=hook_name,
@@ -1985,6 +1989,8 @@ class MultiSAETrainer:
         state = {
             **optimizer_state,
             "format": "multi_independent_sae_v1",
+            "feature_statistics_version": 2,
+            "statistics_dp_size": dp_size,
             "hook_names": self.hook_names,
             "n_training_samples": self.n_training_samples,
             "token_count_remainder": getattr(self, "_token_count_remainder", 0),
@@ -2023,6 +2029,8 @@ class MultiSAETrainer:
                             self.lr_scheduler.schedulers[hook_name].state_dict()
                             if self.units else self.lr_scheduler.state_dict()
                         ),
+                        "feature_statistics_version": 2,
+                        "statistics_dp_size": dp_size,
                         "act_freq_scores": self.act_freq_scores_by_hook[hook_name],
                         "n_forward_passes_since_fired": self.n_forward_passes_since_fired_by_hook[hook_name],
                         "n_frac_active_samples": self.n_frac_active_samples_by_hook[hook_name],
@@ -2168,7 +2176,16 @@ class MultiSAETrainer:
                     "n_frac_active_samples_by_hook"
                 ][hook_name]
 
+        # Runtime rank files may override the aggregate trainer's statistics.
+        # Migrate AFTER that load, never before an old local statistic overwrite.
+        self._v5_statistics_restored = False
         load_runtime_trainer_state(self, checkpoint_path)
+        if not self._v5_statistics_restored:
+            from sae_lens.training.v5_statistics import migrate_frequency_history
+            migrate_frequency_history(
+                self, state.get("feature_statistics_version", 1),
+                saved_dp_size=state.get("statistics_dp_size", self._dp_world_size()),
+            )
 
     def _checkpoint_if_needed(self) -> None:
         if (
@@ -2454,7 +2471,7 @@ class MultiSAETrainer:
     @torch.no_grad()
     def _record_mse_if_needed(
         self,
-        outputs: dict[str, TrainStepOutput],
+        outputs: dict[str, TrainStepOutput | TrainStepSummary],
         local_n: int,
     ) -> None:
         if not self._should_record_mse_step():
@@ -2471,7 +2488,8 @@ class MultiSAETrainer:
                 continue
             mse_loss = output.losses.get("mse_loss")
             if mse_loss is None:
-                mse_loss = (output.sae_out - output.sae_in).pow(2).mean()
+                mse_loss = (output.reconstruction_mse if hasattr(output, "reconstruction_mse")
+                            else (output.sae_out - output.sae_in).pow(2).mean())
             hook_record = {
                 # Match single-SAE logging semantics: record writer-rank local
                 # metrics without DP aggregation so single vs multi traces are

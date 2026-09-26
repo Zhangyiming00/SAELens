@@ -3994,8 +3994,11 @@ class LanguageModelSAETrainingRunner:
                 self._streaming_save_checkpoint(checkpoint_path)
             raise
         finally:
-            if isinstance(provider, GpuDirectDataProvider):
-                provider.close()
+            close_provider = getattr(provider, "close", None)
+            if close_provider is not None:
+                # SHM consumers also own ingress/H2D/logger threads. Join them
+                # before closing the buffer or tearing down CUDA/process groups.
+                close_provider()
 
         if self._streaming_buffer is not None:
             self._streaming_buffer.close()
@@ -4078,8 +4081,9 @@ class LanguageModelSAETrainingRunner:
                 )
             raise
         finally:
-            if isinstance(provider, GpuDirectDataProvider):
-                provider.close()
+            close_provider = getattr(provider, "close", None)
+            if close_provider is not None:
+                close_provider()
 
         if self._streaming_buffer is not None:
             self._streaming_buffer.close()

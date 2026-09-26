@@ -54,6 +54,7 @@ from sae_lens.training.ddp_zero_optimizer import (
     optimizer_state_by_parameter,
     set_optimizer_parameter_state,
 )
+from sae_lens.training.step_summary import TrainStepSummary
 from sae_lens.training.gradient_window import (
     configure_update_batch,
     fit_window_batches,
@@ -921,7 +922,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         sae: T_TRAINING_SAE,
         sae_in: torch.Tensor,
         *, _fit_window: bool = False,
-    ) -> tuple[TrainStepOutput, float, dict[str, float]]:
+    ) -> tuple[TrainStepOutput | TrainStepSummary, float, dict[str, float]]:
         sae.train()
         if os.environ.get("SAELENS_DEBUG_PREFIX_TP") == "1":
             _debug_prefix_tp("train_step forward start")
@@ -959,7 +960,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         if self.unit is not None:
             first = {self.unit.hook_name: sae_in}
             outputs, timing = train_runtime_window(
-                self, fit_window_batches(self, first) if _fit_window else [first]
+                self, fit_window_batches(self, first) if _fit_window else [first],
+                retain_full_outputs=not _fit_window,
             )
             return outputs[self.unit.hook_name], timing["sae_post_backward_time_s"], {}
 
@@ -1235,7 +1237,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         }
 
     @torch.no_grad()
-    def _record_mse_if_needed(self, step_output: TrainStepOutput) -> None:
+    def _record_mse_if_needed(self, step_output: TrainStepOutput | TrainStepSummary) -> None:
         if self.mse_history_path is None:
             return
         if (self.n_training_steps + 1) % self.cfg.save_mse_every_n_steps != 0:
@@ -1243,7 +1245,8 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
 
         mse_loss = step_output.losses.get("mse_loss")
         if mse_loss is None:
-            mse_loss = (step_output.sae_out - step_output.sae_in).pow(2).mean()
+            mse_loss = (step_output.reconstruction_mse if hasattr(step_output, "reconstruction_mse")
+                        else (step_output.sae_out - step_output.sae_in).pow(2).mean())
 
         record = {
             "step": self.n_training_steps + 1,

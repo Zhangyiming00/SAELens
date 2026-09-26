@@ -106,7 +106,8 @@ def _local_candidates(
 
 @torch.no_grad()
 def _radix_threshold(
-    local_keys: torch.Tensor, k: int, group: dist.ProcessGroup | None
+    local_keys: torch.Tensor, k: int, group: dist.ProcessGroup | None, *,
+    global_features: int | None = None,
 ) -> torch.Tensor:
     """Find the kth largest unique signed int64 key using bounded histograms.
 
@@ -119,18 +120,32 @@ def _radix_threshold(
     threshold = torch.zeros_like(remaining)
     # Use smaller digits for tiny shards/candidate sets. No rank-dependent loop.
     digit_bits = min(8, max(1, int(math.log2(max(2, local_keys.shape[1])))))
-    positions = list(range(0, 64, digit_bits))[::-1]
-    for shift in positions:
-        bits = min(digit_bits, 64 - shift)
+    if global_features is None:
+        digits = [(shift, min(digit_bits, 64 - shift))
+                  for shift in list(range(0, 64, digit_bits))[::-1]]
+        count_dtype = torch.int64
+    else:
+        if not 1 <= global_features <= (1 << 32):
+            raise ValueError("global_features must fit uint32 feature indices")
+        id_bits = (global_features - 1).bit_length()
+        # Upper score bits are all informative; inverse-ID upper bits are
+        # constant ones for EVERY eligible feature and need no collective.
+        threshold.fill_(((1 << 32) - 1) ^ ((1 << id_bits) - 1))
+        digits = [(32 + shift, min(digit_bits, 32 - shift))
+                  for shift in list(range(0, 32, digit_bits))[::-1]]
+        digits += [(shift, min(digit_bits, id_bits - shift))
+                   for shift in list(range(0, id_bits, digit_bits))[::-1]]
+        count_dtype = torch.int32 if global_features <= torch.iinfo(torch.int32).max else torch.int64
+    for shift, bits in digits:
         bins = 1 << bits
         digit = (local_keys >> shift) & (bins - 1)
         if shift + bits == 64:
             digit = digit ^ (bins // 2)  # signed to unsigned lexicographic order
-        hist = torch.zeros((rows, bins), dtype=torch.int64, device=local_keys.device)
-        hist.scatter_add_(1, digit, active.to(torch.int64))
+        hist = torch.zeros((rows, bins), dtype=count_dtype, device=local_keys.device)
+        hist.scatter_add_(1, digit, active.to(count_dtype))
         if _group_size(group) > 1:
             dist.all_reduce(hist, group=group)
-        tail = hist.flip(1).cumsum(1)
+        tail = hist.flip(1).cumsum(1, dtype=count_dtype)
         pos = (tail < remaining[:, None]).sum(1)
         bucket = bins - 1 - pos
         before = tail.gather(1, (pos - 1).clamp_min(0)[:, None]).squeeze(1)
@@ -163,6 +178,21 @@ def _sparse_from_padded(
     ).coalesce()
 
 
+class _LocalSelectedValues(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, scores, indices):
+        ctx.shape = scores.shape
+        ctx.save_for_backward(indices)
+        return scores.gather(1, indices)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (indices,) = ctx.saved_tensors
+        # Same dense LOCAL dZ as torch.gather backward; no full latent or
+        # sparse Parameter gradient. No need to save the forward score values.
+        return grad.new_zeros(ctx.shape).scatter_add_(1, indices, grad), None
+
+
 @dataclass
 class PendingShardedTopK:
     scores: torch.Tensor
@@ -174,6 +204,7 @@ class PendingShardedTopK:
     sparse: bool
     protocol: str
     ready: torch.cuda.Event | None = None
+    packed: bool = False
 
     def wait(self) -> torch.Tensor:
         if self.ready is not None:
@@ -182,8 +213,14 @@ class PendingShardedTopK:
             self.threshold.record_stream(stream)
         # Only the local scores participate in autograd. No communication edge
         # has a backward collective and no dense [rows, global_features] exists.
-        live = self.scores.reshape(-1, self.scores.shape[-1]).gather(1, self.indices)
         keep = (self.keys >= self.threshold[:, None]) & (self.keys != _MIN_KEY)
+        if self.packed:
+            from sae_lens.ragged_sae import from_candidates
+            return from_candidates(self.scores, self.indices, keep, relu=self.relu,
+                                   selection=self.protocol)
+        live = _LocalSelectedValues.apply(
+            self.scores.reshape(-1, self.scores.shape[-1]), self.indices
+        )
         # where, not multiplication, also discards NaN values of ineligible slots.
         values = torch.where(keep, live, 0.0)
         if self.relu:
@@ -207,6 +244,9 @@ def launch_sharded_topk(
     stream: torch.cuda.Stream | None = None,
     protocol: str = "auto",
     key_backend: str = "torch",
+    compact_radix: bool = False,
+    packed: bool = False,
+    tie_policy: str = "stable_id",
 ) -> PendingShardedTopK:
     """Submit exact selection for a *uniform-width, feature-sharded* tensor.
 
@@ -216,6 +256,10 @@ def launch_sharded_topk(
     fallback to the old full-latent gather is permitted.
     """
     p, rank = _group_size(group), _group_rank(group)
+    if tie_policy not in ("stable_id", "torch_tp1"):
+        raise ValueError("Unknown tie policy")
+    if tie_policy == "torch_tp1" and p != 1:
+        raise ValueError("torch_tp1 is forbidden for TP>1; use stable_id for reproducible shard ownership")
     if key_backend not in ("torch", "triton"):
         raise ValueError("key_backend must be torch or triton")
     if scores.ndim < 2 or scores.shape[-1] <= 0:
@@ -245,6 +289,21 @@ def launch_sharded_topk(
             raise ValueError("eligible must be a local-width boolean feature mask")
         if eligible.device != scores.device:
             raise ValueError("eligible and scores must be on the same device")
+    if tie_policy == "torch_tp1":
+        # Explicit comparison with native torch.topk's device-dependent ties.
+        # A distributed implementation cannot promise those ties without a full
+        # gather; reject TP>1 above instead of silently changing the algorithm.
+        with torch.no_grad():
+            ranked = scores.reshape(rows, width)
+            if eligible is not None:
+                ranked = torch.where(eligible, ranked, -torch.inf)
+            indices = torch.topk(ranked, k, dim=1, sorted=False).indices
+            local_keys = torch.ones_like(indices)
+            if eligible is not None:
+                local_keys = torch.where(eligible[indices], local_keys, _MIN_KEY)
+            threshold = torch.ones(rows, dtype=torch.int64, device=scores.device)
+        return PendingShardedTopK(scores, indices, local_keys, threshold, leading,
+                                  relu, sparse, 'torch_tp1', None, packed)
     local_keys, indices = _local_candidates(
         scores.reshape(rows, width), nlocal, rank * width, eligible, key_backend
     )
@@ -255,7 +314,10 @@ def launch_sharded_topk(
         if p == 1:
             return local_keys.topk(k, dim=1, sorted=False).values.amin(1)
         if chosen == "radix":
-            return _radix_threshold(local_keys, k, group)
+            return _radix_threshold(
+                local_keys, k, group,
+                global_features=p * width if compact_radix else None,
+            )
         recv = torch.empty((p * rows, nlocal), dtype=torch.int64, device=scores.device)
         dist.all_gather_into_tensor(recv, local_keys.contiguous(), group=group)
         candidates = (
@@ -279,7 +341,7 @@ def launch_sharded_topk(
         with torch.no_grad():
             threshold = select()
     return PendingShardedTopK(
-        scores, indices, local_keys, threshold, leading, relu, sparse, chosen, ready
+        scores, indices, local_keys, threshold, leading, relu, sparse, chosen, ready, packed
     )
 
 
@@ -289,11 +351,45 @@ def sharded_topk(
     return launch_sharded_topk(scores, k, group, **kwargs).wait()
 
 
+def sharded_auxk(scores, k, eligible, num_eligible, group=None, *, sparse=False,
+                 policy="auto", protocol="auto", key_backend="torch", tie_policy="stable_id"):
+    """Exact AuxK selection; never gather full latent or change the loss budget.
+
+    ``num_eligible`` is the ALREADY known global dead count (same on TP ranks),
+    and k=min(d_in//2,num_eligible). The all-eligible path needs no selection
+    communication. It must retain selected zero/negative values and gradients.
+    """
+    if policy not in ("auto", "legacy"):
+        raise ValueError("AuxK selection policy must be auto or legacy")
+    if eligible.dtype != torch.bool or eligible.shape != (scores.shape[-1],):
+        raise ValueError("AuxK needs a local boolean dead-feature mask")
+    if eligible.device != scores.device or not 0 < k <= num_eligible:
+        raise ValueError("Invalid AuxK mask device or global selection budget")
+    if policy == "auto" and k == num_eligible:
+        if not sparse:
+            # where removes ineligible NaN/inf values too, unlike multiplication.
+            return torch.where(eligible, scores, 0.0)
+        # Sparse compatibility: selected zeros must remain entries (AuxK has no
+        # ReLU). nonzero examines only the 1-D mask, never the [B,S] scores.
+        ids = eligible.nonzero(as_tuple=True)[0]
+        rows = math.prod(scores.shape[:-1])
+        indices = ids.expand(rows, -1)
+        values = _LocalSelectedValues.apply(scores.reshape(rows, scores.shape[-1]), indices)
+        return _sparse_from_padded(indices, values, tuple(scores.shape[:-1]), scores.shape[-1])
+    return sharded_topk(
+        scores, k, group, eligible=eligible, relu=False, sparse=sparse,
+        protocol=protocol, key_backend=key_backend, compact_radix=policy == "auto", tie_policy=tie_policy,
+    )
+
+
 @torch.no_grad()
 def sharded_firing_counts(
     acts: torch.Tensor, group: dist.ProcessGroup | None
 ) -> torch.Tensor:
     """Replicate only the [global_features] summary, never token-by-feature data."""
+    from sae_lens.ragged_sae import RaggedLatents, packed_feature_counts
+    if isinstance(acts, RaggedLatents):
+        return packed_feature_counts(acts, group)
     width = acts.shape[-1]
     local = torch.zeros(width, dtype=torch.float32, device=acts.device)
     if acts.is_sparse:

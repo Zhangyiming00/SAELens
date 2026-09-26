@@ -398,7 +398,7 @@ class AsyncStreamingActivationProvider:
             self._pages_per_batch,
             (self._capacity_pages // self._pages_per_batch) * self._pages_per_batch,
         )
-        self._capacity_tokens = self._capacity_pages * self._page_tokens
+        self._round_pages = self._capacity_pages
 
         desired_replace_pages = math.ceil(self._capacity_pages * (1.0 - self._mix_fraction))
         desired_replace_pages = max(
@@ -408,6 +408,19 @@ class AsyncStreamingActivationProvider:
         )
         desired_replace_pages = math.ceil(desired_replace_pages / self._pages_per_batch) * self._pages_per_batch
         self._replace_pages_per_round = min(self._capacity_pages, desired_replace_pages)
+
+        # Ingress admits whole chunks, whereas prefetch frees whole batches.
+        # If these boundaries differ, waiting for an exactly full reservoir can
+        # deadlock with fewer than one chunk's worth of free pages. Keep bounded
+        # ingress headroom beyond the mixing window (never an LCM-sized buffer).
+        self._chunk_headroom = (
+            self._pages_per_chunk - 1
+            if self._round_pages % self._pages_per_chunk
+            or self._replace_pages_per_round % self._pages_per_chunk
+            else 0
+        )
+        self._capacity_pages += self._chunk_headroom
+        self._capacity_tokens = self._capacity_pages * self._page_tokens
 
         self._rng = random.Random(int(mixing_seed) + 1000003 * int(mixing_shard_index))
         self._cv = threading.Condition()
@@ -441,6 +454,7 @@ class AsyncStreamingActivationProvider:
         self._page_valid = [0] * self._capacity_pages
         self._page_state = [0] * self._capacity_pages  # 0=EMPTY, 1=FILLING, 2=READY
         self._free_pages: deque[int] = deque(range(self._capacity_pages))
+        self._arrival_pages: deque[int] = deque()
 
         pin = self._device.type == "cuda" and torch.cuda.is_available()
         self._slots: list[_BatchSlot] = []
@@ -838,6 +852,8 @@ class AsyncStreamingActivationProvider:
                 n = min(self._page_tokens, valid_per_hook - cursor)
                 self._page_valid[p] = n
                 self._page_state[p] = 2
+                if self._chunk_headroom:
+                    self._arrival_pages.append(p)
                 cursor += n
             self._cv.notify_all()
 
@@ -846,27 +862,26 @@ class AsyncStreamingActivationProvider:
     # ------------------------------------------------------------------
 
     def _ready_page_ids(self) -> list[int]:
+        if self._chunk_headroom:
+            # TP/PP readers may be at different ingress positions. Selecting
+            # the same prefix of arrival order keeps their token shuffle equal.
+            return list(self._arrival_pages)
         return [i for i, s in enumerate(self._page_state) if s == 2 and self._page_valid[i] > 0]
 
     def _wait_for_round_pages(self, *, initial: bool) -> list[int]:
+        del initial
         while True:
             self._raise_if_error()
             with self._cv:
                 ready = self._ready_page_ids()
-                if initial:
-                    full = len(ready) == self._capacity_pages
-                    enough_at_eof = self._eof and bool(ready)
-                    if full or enough_at_eof:
-                        return ready
-                else:
-                    # Before EOF, preserve rolling-buffer semantics: the consumed
-                    # slots must be replenished before reshuffling the next round.
-                    if self._eof:
-                        if ready:
-                            return ready
-                        return []
-                    if len(ready) == self._capacity_pages:
-                        return ready
+                if self._stop.is_set():
+                    return []
+                # Full rounds have the same schedule even if one TP/PP reader
+                # already observed EOF. Only a short final round drains at once.
+                if len(ready) >= self._round_pages:
+                    return ready[:self._round_pages]
+                if self._eof:
+                    return ready
                 self._cv.wait(timeout=0.02)
 
     def _prefetch_main(self) -> None:
@@ -882,7 +897,7 @@ class AsyncStreamingActivationProvider:
                 if self._shuffle:
                     self._rng.shuffle(ready_pages)
 
-                if self._eof:
+                if len(ready_pages) < self._round_pages:
                     round_pages = len(ready_pages)
                 else:
                     round_pages = min(self._replace_pages_per_round, len(ready_pages))
@@ -962,6 +977,8 @@ class AsyncStreamingActivationProvider:
         # ingress may immediately recycle these reservoir pages while SAE trains.
         with self._cv:
             for p in pages:
+                if self._chunk_headroom:
+                    self._arrival_pages.remove(p)
                 self._page_valid[p] = 0
                 self._page_state[p] = 0
                 self._free_pages.append(p)

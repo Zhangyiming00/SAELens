@@ -170,6 +170,8 @@ def save_runtime_trainer_state(trainer, checkpoint_path):
         dict(
             version=1,
             optimizer_backend="distributed" if sharded else "fp32",
+            feature_statistics_version=(2 if hasattr(trainer, "act_freq_scores_by_hook") else 1),
+            statistics_dp_size=context.dp_group.size(),
             unit_update_counts={h: u.update_count for h, u in units.items()},
             identity=_identity(trainer, runtime),
             n_training_samples=trainer.n_training_samples,
@@ -253,6 +255,13 @@ def load_runtime_trainer_state(trainer, checkpoint_path):
 
         for name, value in state.get("local_statistics", {}).items():
             setattr(trainer, name, to_device(value))
+        if hasattr(trainer, "act_freq_scores_by_hook") and "local_statistics" in state:
+            from sae_lens.training.v5_statistics import migrate_frequency_history
+            migrate_frequency_history(
+                trainer, state.get("feature_statistics_version", 1),
+                saved_dp_size=state.get("statistics_dp_size", len(identity["dp_ranks"])),
+            )
+            trainer._v5_statistics_restored = True
         from sae_lens.training.gradient_window import runtime_units
 
         for h, unit in runtime_units(trainer).items():

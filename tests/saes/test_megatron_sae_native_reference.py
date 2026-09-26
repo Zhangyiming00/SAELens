@@ -36,8 +36,12 @@ def test_oracle_integrity():
 
 
 @pytest.mark.parametrize("case", range(4))
-@pytest.mark.parametrize("topk_backend", ["legacy", "sharded_dense", "sharded_sparse"])
-def test_tp1_math_against_native_oracle(case, topk_backend):
+@pytest.mark.parametrize(
+    "topk_backend,sparse_decoder_backend",
+    [("legacy", "torch"), ("sharded_dense", "torch"),
+     ("sharded_sparse", "torch"), ("sharded_sparse", "sae")],
+)
+def test_tp1_math_against_native_oracle(case, topk_backend, sparse_decoder_backend):
     """Real Megatron TP1 math; the singleton test group has no communication."""
     pytest.importorskip("megatron.core")
     import torch.testing._internal.distributed.fake_pg  # noqa: F401
@@ -50,6 +54,7 @@ def test_tp1_math_against_native_oracle(case, topk_backend):
         cfg = TopKTrainingSAEConfig.from_dict(manifest["configs"][case])
         cfg.device = "cpu"
         cfg.topk_backend = topk_backend
+        cfg.sparse_decoder_backend = sparse_decoder_backend
         sae = MegatronTopKSAE(cfg, tp_group=dist.group.WORLD)
         sae.import_saelens_state_dict(
             {

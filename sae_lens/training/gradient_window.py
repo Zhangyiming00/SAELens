@@ -22,6 +22,7 @@ from sae_lens.saes.sae import TrainStepInput, TrainStepOutput
 from sae_lens.sharded_topk import feature_counts_from_output
 from sae_lens.training.megatron_optimizer import is_megatron_optimizer
 from sae_lens.training.sae_train_unit import HookPhase, SAETrainUnit
+from sae_lens.training.step_summary import TrainStepSummary, summarize_step
 
 
 def runtime_units(trainer: Any) -> dict[str, SAETrainUnit]:
@@ -96,11 +97,20 @@ def fit_window_batches(
 
 
 def train_runtime_window(
-    trainer: Any, batches: Iterable[dict[str, torch.Tensor]]
-) -> tuple[dict[str, TrainStepOutput], dict[str, float]]:
+    trainer: Any, batches: Iterable[dict[str, torch.Tensor]], *,
+    retain_full_outputs: bool = True,
+) -> tuple[dict[str, TrainStepOutput | TrainStepSummary], dict[str, float]]:
     """Run one update; ``batches`` yields already-scaled per-hook tensors."""
     units = runtime_units(trainer)
     single = getattr(trainer, "unit", None) is not None
+    retention = getattr(trainer.cfg, "sae_runtime_output_retention", "auto")
+    if retention not in ("auto", "full", "summary"):
+        raise ValueError("Unknown runtime output retention policy")
+    keep_full = retention == "full" or (retention == "auto" and retain_full_outputs)
+    # Single-SAE detailed loggers compute variance from the actual reconstruction.
+    # Preserve that API even under explicit summary mode on those logging steps.
+    if single and trainer._is_logging_step():
+        keep_full = True
     # A full configured window has a known final microbatch. Explicitly sized
     # input (e.g. a direct one-batch train step) may be shorter. Do not look
     # ahead into the provider: unknown-length tails use explicit window-end
@@ -152,6 +162,9 @@ def train_runtime_window(
     # Leave the active marker set on failure: partial gradients/provider state
     # must never be saved as an apparently complete, resumable update.
     for batch in batches:
+        # Only the final microbatch output is returned. Do not retain the previous
+        # microbatch's detached storage while constructing the next graph.
+        outputs.clear()
         if set(batch) != set(units):
             raise ValueError(
                 "Every microbatch must contain exactly the local SAE hooks"
@@ -182,7 +195,8 @@ def train_runtime_window(
 
             t = perf_counter()
             wave_outputs = runtime_wavefront_forward(trainer, units, inputs)
-            trainer._tp_phase_fence_if_needed()
+            if not getattr(wave_outputs, "incremental", False):
+                trainer._tp_phase_fence_if_needed()
             timing["sae_forward_time_s"] += perf_counter() - t
         for h, unit in units.items():
             acts = batch[h]
@@ -191,7 +205,12 @@ def train_runtime_window(
             native_sync = is_final_microbatch and unit.early_grad_sync
             with nullcontext() if native_sync else unit.no_sync():
                 if wave_outputs:
+                    t = perf_counter()
                     output = wave_outputs.pop(h)
+                    if getattr(wave_outputs, "incremental", False):
+                        # Preserve the TP -> backward/DP communicator hand-off.
+                        trainer._tp_phase_fence_if_needed()
+                    timing["sae_forward_time_s"] += perf_counter() - t
                 else:
                     t = perf_counter()
                     with trainer.autocast_if_enabled:
@@ -223,15 +242,19 @@ def train_runtime_window(
                 del backward_loss
                 timing["sae_backward_time_s"] += perf_counter() - t
             # Retain only one detached output per hook for existing logging.
-            outputs[h] = replace(
-                output,
-                **{
-                    field.name: getattr(output, field.name).detach()
-                    for field in fields(output)
-                    if isinstance(getattr(output, field.name), torch.Tensor)
-                },
-                losses={k: v.detach() for k, v in output.losses.items()},
-            )
+            if keep_full:
+                outputs[h] = replace(
+                    output,
+                    **{
+                        field.name: getattr(output, field.name).detach()
+                        for field in fields(output)
+                        if isinstance(getattr(output, field.name), torch.Tensor)
+                        or (field.name == "feature_acts" and hasattr(output.feature_acts, "detach"))
+                    },
+                    losses={k: v.detach() for k, v in output.losses.items()},
+                )
+            else:
+                outputs[h] = summarize_step(output)
             del output
             if is_final_microbatch and getattr(
                 trainer, "_runtime_optimizer_overlap", False
@@ -275,6 +298,8 @@ def train_runtime_window(
                         else HookPhase.PARAMS_ENQUEUED
                     )
                 submitted.add(h)
+        # Neither scheduler states nor old TrainStepInputs outlive this microbatch.
+        del wave_outputs, inputs
 
     trainer._last_window_local_tokens = local_tokens[next(iter(units))]
     trainer._last_global_tokens_by_hook = global_tokens
@@ -296,12 +321,21 @@ def train_runtime_window(
                 unit.zero_grad()
             continue
         t = perf_counter()
-        did_fire = counts[h].bool().to(torch.int32)
-        if group.size() > 1:
-            dist.all_reduce(did_fire, op=dist.ReduceOp.MAX, group=group)
+        if single:
+            did_fire = counts[h].bool().to(torch.int32)
+            if group.size() > 1:
+                dist.all_reduce(did_fire, op=dist.ReduceOp.MAX, group=group)
+            frequency_delta = counts[h]
+        else:
+            # Both numerator and denominator are GLOBAL over DP. Work only on
+            # this window's delta, never re-reduce an already-global history.
+            frequency_delta = counts[h].clone()
+            if group.size() > 1:
+                dist.all_reduce(frequency_delta, op=dist.ReduceOp.SUM, group=group)
+            did_fire = frequency_delta.bool()
         ages[h].add_(1)
         ages[h][did_fire.bool()] = 0
-        frequencies[h].add_(counts[h])
+        frequencies[h].add_(frequency_delta)
         if single:
             trainer.n_frac_active_samples += local_tokens[h]
         else:
@@ -345,6 +379,20 @@ def train_runtime_window(
         denom = max(local_tokens[h], 1)
         output.loss = loss_sums[h]["loss"] / denom
         output.losses = {k: loss_sums[h][k] / denom for k in output.losses}
+        if isinstance(output, TrainStepSummary):
+            output.feature_firing_counts = counts[h].detach()
+            output.n_tokens = local_tokens[h]
+            output.reconstruction_mse = output.losses.get("mse_loss", output.reconstruction_mse)
+            output.metrics.update(statistics_scope="dp_local_update_window",
+                                  global_n_tokens=global_tokens[h],
+                                  window_microbatches=trainer._last_window_microbatches)
+        elif hasattr(output, "metrics"):
+            # Full activation tensors still represent the final microbatch.
+            # Do not change their counts behind feature_counts_from_output().
+            output.metrics.update(window_feature_firing_counts=counts[h].detach(),
+                                  window_n_tokens=local_tokens[h],
+                                  global_n_tokens=global_tokens[h],
+                                  statistics_scope="final_microbatch_with_window_metrics")
     trainer._gradient_window_active = False
     return outputs, timing
 

@@ -7,7 +7,7 @@ import torch.distributed as dist
 
 from sae_lens import logger
 from sae_lens.training.megatron_ddp import is_megatron_ddp
-from sae_lens.training.multi_hook_sae import forward_tp_wavefront
+from sae_lens.training.multi_hook_sae import PendingWavefrontOutputs, forward_tp_wavefront
 
 
 def configure_tp_wavefront(trainer, units):
@@ -39,6 +39,31 @@ def configure_tp_wavefront(trainer, units):
     enabled = bool(supported.item())
     if not enabled and reason is None:
         reason = "disabled by another rank in this placement"
+    schedule = getattr(trainer.cfg, "multi_sae_tp_wavefront_schedule", "bounded")
+    window = getattr(trainer.cfg, "multi_sae_tp_wavefront_max_live_hooks", 2)
+    if schedule not in ("eager", "lazy", "bounded"):
+        raise ValueError("Unknown TP wavefront schedule")
+    if type(window) is not int or window < 1:
+        raise ValueError("multi_sae_tp_wavefront_max_live_hooks must be positive")
+    if enabled:
+        # Mixed schedules/windows on TP/DP members would change collective order.
+        setting = torch.tensor([("eager", "lazy", "bounded").index(schedule), window], device=device)
+        low, high = setting.clone(), setting.clone()
+        if context.tp_group.size() * context.dp_group.size() > 1:
+            dist.all_reduce(low, op=dist.ReduceOp.MIN, group=context.groups.tp_dp_cp)
+            dist.all_reduce(high, op=dist.ReduceOp.MAX, group=context.groups.tp_dp_cp)
+        if not torch.equal(low, high):
+            raise ValueError("All ranks must use the same wavefront schedule and window")
+        if schedule != "eager":
+            # Interleaved updates are only valid for independent SAE parameters.
+            seen = set()
+            for unit in units.values():
+                ids = {id(p) for p in unit.model.parameters()}
+                if seen.intersection(ids):
+                    raise ValueError("Lazy/bounded wavefront requires independent hook parameters")
+                seen.update(ids)
+    trainer._runtime_tp_wavefront_schedule = schedule
+    trainer._runtime_tp_wavefront_max_live_hooks = window
     trainer._runtime_tp_wavefront = enabled
     trainer._runtime_tp_wavefront_reason = reason
     logger.info(
@@ -46,6 +71,8 @@ def configure_tp_wavefront(trainer, units):
         "reason=%s; per-hook DDP/optimizer ownership is unchanged",
         mode, enabled, context.domain.name, list(units), reason,
     )
+    logger.info("SAE TP wavefront schedule=%s max_live_hooks=%s", schedule,
+                window if schedule == "bounded" else "all")
 
 
 def runtime_wavefront_forward(trainer, units, inputs):
@@ -62,6 +89,15 @@ def runtime_wavefront_forward(trainer, units, inputs):
             raise RuntimeError("TP wavefront cannot bypass native parameter-gather pre-hooks")
         yield
 
+    schedule = getattr(trainer, "_runtime_tp_wavefront_schedule", "bounded")
+    if schedule != "eager":
+        return PendingWavefrontOutputs(
+            list(units), {h: u.model for h, u in units.items()}, inputs,
+            forward_context,
+            autocast_context=lambda: trainer.autocast_if_enabled,
+            max_live_hooks=(0 if schedule == "lazy" else
+                            getattr(trainer, "_runtime_tp_wavefront_max_live_hooks", 2)),
+        )
     with trainer.autocast_if_enabled:
         return forward_tp_wavefront(
             list(units), {h: u.model for h, u in units.items()}, inputs,

@@ -48,6 +48,67 @@ def forward_tp_wavefront(
     return outputs
 
 
+class PendingWavefrontOutputs:
+    """Finish hooks in caller order, at most ``max_live_hooks`` main graphs at once.
+
+    ``pop`` returns ownership of the output to the trainer; this object NEVER
+    retains it. Each finished hook can backward/update before the next AuxK is
+    constructed. A zero window means all main forwards (lazy finish only).
+    All ranks must consume exactly the same ordered hooks. This runtime-only
+    scheduler is not used to bypass Torch DDP's pre/post-forward lifecycle.
+    """
+
+    incremental = True
+
+    def __init__(self, hook_names, sae_by_hook, inputs_by_hook,
+                 forward_context=lambda _: contextlib.nullcontext(), *,
+                 autocast_context=lambda: contextlib.nullcontext(), max_live_hooks=2):
+        if not hook_names or len(set(hook_names)) != len(hook_names):
+            raise ValueError("Wavefront requires a nonempty unique hook order")
+        if type(max_live_hooks) is not int or max_live_hooks < 0:
+            raise ValueError("max_live_hooks must be a nonnegative integer")
+        self.hooks = tuple(hook_names)
+        self.saes = sae_by_hook
+        self.inputs = inputs_by_hook
+        self.context = forward_context
+        self.autocast = autocast_context
+        self.window = max_live_hooks or len(self.hooks)
+        self.cursor = 0
+        self.states = {}
+
+    def __bool__(self):
+        return self.cursor < len(self.hooks)
+
+    def _launch_window(self):
+        hooks = self.hooks[self.cursor:self.cursor + self.window]
+        # Match the accepted AG(A), AG(B), AR(A), ... ordering within a window.
+        current = hooks[0]
+        with self.autocast(), self.context(current), cuda_nvtx_range(f"sae:{current}:wavefront_encode"):
+            state = self.saes[current].tp_wavefront_encode_launch(self.inputs[current])
+        for following in hooks[1:]:
+            with self.autocast(), self.context(following), cuda_nvtx_range(f"sae:{following}:wavefront_encode"):
+                next_state = self.saes[following].tp_wavefront_encode_launch(self.inputs[following])
+            with self.autocast(), self.context(current), cuda_nvtx_range(f"sae:{current}:wavefront_decode"):
+                self.saes[current].tp_wavefront_decode_launch(state)
+            self.states[current] = state
+            current, state = following, next_state
+        with self.autocast(), self.context(current), cuda_nvtx_range(f"sae:{current}:wavefront_decode"):
+            self.saes[current].tp_wavefront_decode_launch(state)
+        self.states[current] = state
+        # Local aliases disappear when this method returns; no yielded state is retained.
+
+    def pop(self, hook):
+        if not self or hook != self.hooks[self.cursor]:
+            raise RuntimeError("Wavefront outputs must be consumed once in fixed hook order")
+        if not self.states:
+            self._launch_window()
+        state = self.states.pop(hook)
+        with self.autocast(), self.context(hook), cuda_nvtx_range(f"sae:{hook}:wavefront_finish"):
+            output = self.saes[hook].tp_wavefront_finish(state)
+        self.cursor += 1
+        return output
+
+
 class MultiHookSAE(torch.nn.Module):
     """Single state owner for a fixed ordered set of hook SAEs."""
 
