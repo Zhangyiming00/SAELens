@@ -504,7 +504,7 @@ class StreamingActivationProvider:
             return
         if self._pool is not None and self._pool_start < self._pool_len:
             leftover = self._pool[self._pool_start:]
-            self._pool = torch.cat([leftover, new_data], dim=0)
+            self._pool = self._cat_prepared_batches([leftover, new_data])
         else:
             self._pool = new_data
         self._pool_start = 0
@@ -523,7 +523,7 @@ class StreamingActivationProvider:
             self._pool_start = 0
             self._pool_len = 0
             return
-        combined = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+        combined = self._cat_prepared_batches(parts)
 
         take_size = self._batch_size * self._num_hooks
         chunk_rows = int(getattr(self._buffer, "_chunk_size_tokens", take_size))
@@ -551,6 +551,30 @@ class StreamingActivationProvider:
         self._pool_start = 0
         self._pool_len = self._pool.shape[0]
         self._mixing_pool = combined[serving_cutoff:]
+
+    def _cat_prepared_batches(self, parts: list[torch.Tensor]) -> torch.Tensor:
+        """Join prepared pools without treating a partial hook block as a full one."""
+        if len(parts) == 1:
+            return parts[0]
+        take_size = self._batch_size * self._num_hooks
+        if not self._is_multi_hook or all(p.shape[0] % take_size == 0 for p in parts[:-1]):
+            return torch.cat(parts, dim=0)
+        # SHM slots may deliver a partial chunk before a full one, including
+        # when different producers reach EOF independently. Reblock each hook
+        # before joining; plain concatenation changes the implied boundaries.
+        per_hook_parts: list[list[torch.Tensor]] = [[] for _ in range(self._num_hooks)]
+        for part in parts:
+            for block in part.split(take_size):
+                if block.shape[0] % self._num_hooks:
+                    raise ValueError("Partial prepared block has unequal hook sizes")
+                for hook, values in enumerate(block.chunk(self._num_hooks)):
+                    per_hook_parts[hook].append(values)
+        per_hook = [torch.cat(values, dim=0) for values in per_hook_parts]
+        return torch.cat([
+            values[start:start + self._batch_size]
+            for start in range(0, per_hook[0].shape[0], self._batch_size)
+            for values in per_hook
+        ], dim=0)
 
     def _shuffle_prepared_multi_hook_data(self, data: torch.Tensor) -> torch.Tensor:
         """Shuffle multi-hook prepared data without mixing rows between hooks."""
@@ -635,7 +659,7 @@ class StreamingActivationProvider:
             self._pool_len = 0
             self._mixing_pool = None
             return
-        self._pool = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+        self._pool = self._cat_prepared_batches(parts)
         self._pool_start = 0
         self._pool_len = self._pool.shape[0]
         self._mixing_pool = None

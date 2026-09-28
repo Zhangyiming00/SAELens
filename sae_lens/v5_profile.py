@@ -77,7 +77,9 @@ def parse(argv=None):
 
 
 def cases(args):
-    from sae_lens.v5_cli import v5_config_kwargs
+    from types import SimpleNamespace
+    from sae_lens.adaptive_sae import requests
+    from sae_lens.v5_cli import v5_config_kwargs, compute_workspace_for_stages
     tp,dp=args.sae_tp_size,args.sae_dp_size
     if min(tp,dp,args.d_sae,args.sae_profile_d_in,args.k,args.train_batch_size_tokens,
            args.gradient_accumulation_steps,args.sae_profile_steps,args.sae_profile_repeats)<1:
@@ -104,14 +106,17 @@ def cases(args):
         if any(len(v)!=2 or any(x not in allowed for x in v) for v in policies):
             raise ValueError('Policies must be Main/Aux pairs of known computation modes')
     ks=args.sae_profile_main_ks or [args.k]
-    aks=args.sae_profile_aux_ks or [args.sae_aux_k or args.sae_profile_d_in//2]
-    if any(k<1 or k>args.d_sae for k in ks) or any(k<1 for k in aks):
+    aks=args.sae_profile_aux_ks or [args.sae_profile_d_in//2 if args.sae_aux_k is None else args.sae_aux_k]
+    if any(k<1 or k>args.d_sae for k in ks) or any(k<0 for k in aks):
         raise ValueError('Invalid Main/Aux K')
     common=v5_config_kwargs(args)
     plans=[]
     for i,(layout,k,ak,policy,repeat) in enumerate(itertools.product(layouts,ks,aks,policies,range(args.sae_profile_repeats))):
         opts={key:value for key,value in common.items() if key.startswith('v5_') or key=='topk_tie_policy'}
         opts.update(v5_main_compute=policy[0],v5_aux_compute=policy[1])
+        if getattr(args, '_compute_workspace_auto', False):
+            cfg = SimpleNamespace(**dict(common, **opts))
+            opts['v5_workspace_mib'] = compute_workspace_for_stages(requests(cfg))
         if args.sae_topk_backend!='sharded_ragged' and any(v!='inherit' for v in policy):
             raise ValueError('V5 policies require sharded_ragged; profile legacy/dense in a separate invocation')
         name=f'{i:04d}_k{k}_aux{ak}_dead-'+'-'.join(map(str,layout))+f'_{policy[0]}-{policy[1]}_r{repeat}'

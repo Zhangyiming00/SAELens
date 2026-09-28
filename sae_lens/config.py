@@ -38,6 +38,22 @@ T_TRAINING_SAE_CONFIG = TypeVar(
 HfDataset = DatasetDict | Dataset | IterableDatasetDict | IterableDataset
 
 
+def resolve_tp_overlap(cfg):
+    mode = getattr(cfg, "sae_tp_overlap", None)
+    if mode is None:
+        return  # An old checkpoint or an old programmatic caller.
+    if mode not in ("lazy", "bounded", "eager", "off"):
+        raise ValueError("sae_tp_overlap must be lazy/bounded/eager/off")
+    window = getattr(cfg, "sae_tp_overlap_max_live_hooks", 2)
+    if type(window) is not int or window < 1:
+        raise ValueError("sae_tp_overlap_max_live_hooks must be positive")
+    cfg.multi_sae_distributed_architecture = (
+        "legacy_per_hook_wrapper" if mode == "off" else "unified_multi_hook"
+    )
+    cfg.multi_sae_tp_wavefront_schedule = "lazy" if mode == "off" else mode
+    cfg.multi_sae_tp_wavefront_max_live_hooks = window
+
+
 def _timestamp_run_id() -> str:
     return datetime.now().strftime("%y%m%d_%H%M%S")
 
@@ -350,6 +366,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     multi_sae_nvtx_detailed: bool = False
     multi_sae_overlap_trace_dir: str = DEFAULT_OVERLAP_TRACE_DIR
     multi_sae_overlap_max_steps: int = 0
+    sae_tp_overlap: Literal["lazy", "bounded", "eager", "off"] | None = None
+    sae_tp_overlap_max_live_hooks: int = 2
     multi_sae_distributed_architecture: Literal[
         "legacy_per_hook_wrapper", "unified_multi_hook"
     ] = "legacy_per_hook_wrapper"
@@ -411,6 +429,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     streaming_consumer_prefill_chunks: int = 0
 
     def __post_init__(self):
+        resolve_tp_overlap(self)
         if self.multi_sae_seed_mode not in ("same", "offset"):
             raise ValueError("multi_sae_seed_mode must be 'same' or 'offset'")
         if self.multi_sae_backward_order not in ("forward", "reverse", "largest_first"):
@@ -436,6 +455,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
                 stacklevel=2,
             )
             self.multi_sae_distributed_architecture = "legacy_per_hook_wrapper"
+            if self.sae_tp_overlap is not None:
+                self.sae_tp_overlap = "off"
         if self.multi_sae_distributed_architecture not in (
             "legacy_per_hook_wrapper",
             "unified_multi_hook",
@@ -474,7 +495,12 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
         if type(self.gradient_accumulation_steps) is not int or self.gradient_accumulation_steps < 1:
             raise ValueError("gradient_accumulation_steps must be a positive integer")
         if self.streaming_mode and self.gradient_accumulation_steps != 1:
-            raise ValueError("Gradient accumulation currently requires static routing")
+            if (self.streaming_dp_batch_mode != "exact"
+                    or self.streaming_use_gpu_direct
+                    or self.sae.architecture() != "topk"):
+                raise ValueError(
+                    "Streaming gradient accumulation requires exact SHM TopK runtime training"
+                )
         if self.fsdp_backward_prefetch not in (
             "backward_pre",
             "backward_post",
@@ -832,6 +858,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             multi_sae_overlap_trace_dir=self.multi_sae_overlap_trace_dir,
             multi_sae_overlap_max_steps=self.multi_sae_overlap_max_steps,
             multi_sae_distributed_architecture=self.multi_sae_distributed_architecture,
+            sae_tp_overlap=self.sae_tp_overlap,
+            sae_tp_overlap_max_live_hooks=self.sae_tp_overlap_max_live_hooks,
             multi_sae_tp_phase_fence=self.multi_sae_tp_phase_fence,
             multi_sae_optimizer_overlap=self.multi_sae_optimizer_overlap,
             ddp_zero_optimizer=self.ddp_zero_optimizer,
@@ -1158,6 +1186,8 @@ class SAETrainerConfig:
     multi_sae_nvtx_detailed: bool = False
     multi_sae_overlap_trace_dir: str = DEFAULT_OVERLAP_TRACE_DIR
     multi_sae_overlap_max_steps: int = 0
+    sae_tp_overlap: Literal["lazy", "bounded", "eager", "off"] | None = None
+    sae_tp_overlap_max_live_hooks: int = 2
     multi_sae_distributed_architecture: Literal[
         "legacy_per_hook_wrapper", "unified_multi_hook"
     ] = "legacy_per_hook_wrapper"

@@ -359,6 +359,12 @@ ARCH_CONFIGS: dict[str, dict[str, tuple[str, Callable, bool, Callable | None]]] 
     ]
 }
 
+# These decoders honor _sae_stop_at_layer in the local vLLM layer loop.
+# Qwen3Model inherits the implementation from Qwen2Model.
+_EARLY_STOP_ARCHS = frozenset({
+    "LlamaForCausalLM", "MistralForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM",
+})
+
 # ---------------------------------------------------------------------------
 # Hook name parsing
 # ---------------------------------------------------------------------------
@@ -714,21 +720,68 @@ def _stop_vllm_memory_timeline(model: nn.Module) -> str | None:
                 delattr(model, attr)
 
 
+def _resolve_capture_stop_layer(
+    model: nn.Module,
+    hook_names: list[str],
+    stop_at_layer: int | str | None,
+) -> int | None:
+    """Resolve an exclusive decoder boundary before installing any hooks.
+
+    Explicit None preserves a full forward. Auto skips layers after the deepest
+    requested hook on supported decoders. Embedding-only capture keeps one block
+    so the ordinary vLLM norm/logits/sampling path can complete unchanged.
+    """
+    layers = model.model.layers
+    depth = len(layers)
+    requested_layers = [
+        layer for name in hook_names
+        if (layer := _parse_hook_name(name)[1]) is not None
+    ]
+    if any(layer >= depth for layer in requested_layers):
+        raise ValueError(f"Hook layer exceeds model depth ({depth} decoder layers)")
+    required = max(requested_layers, default=0) + 1
+    if stop_at_layer is None:
+        return None
+    if stop_at_layer == "auto":
+        if _get_arch_name(model) not in _EARLY_STOP_ARCHS:
+            return None
+        # Multi-stage vLLM needs a separate cross-stage capture protocol.
+        if getattr(model.model, "start_layer", 0) != 0 or getattr(
+            model.model, "end_layer", depth
+        ) != depth:
+            return None
+        return required
+    if type(stop_at_layer) is not int or not 1 <= stop_at_layer <= depth:
+        raise ValueError(f"stop_at_layer must be 'auto', None, or an integer in [1, {depth}]")
+    if stop_at_layer < required:
+        raise ValueError(
+            f"stop_at_layer={stop_at_layer} would skip a requested hook; "
+            f"use at least {required}"
+        )
+    if _get_arch_name(model) not in _EARLY_STOP_ARCHS and stop_at_layer < depth:
+        raise ValueError(f"Early stop is not implemented for {_get_arch_name(model)}")
+    return stop_at_layer
+
+
 def _register_hooks(
     model: nn.Module,
     hook_specs: list[tuple[str, str, Callable, bool, Callable | None]],
     total_tokens: int,
-    stop_at_layer: int | None,
+    stop_at_layer: int | str | None,
 ) -> None:
     """Register SAE capture hooks on the worker's model."""
+    stop_at_layer = _resolve_capture_stop_layer(
+        model, [spec[0] for spec in hook_specs], stop_at_layer
+    )
+    # Resolve every path before mutating the worker, including invalid requests.
+    modules = [model.get_submodule(spec[1]) for spec in hook_specs]
     # Use lists to accumulate chunks from chunked prefill.
     model._sae_captures: dict[str, list[torch.Tensor]] = {}  # type: ignore[attr-defined]
     model._sae_handles: list = []  # type: ignore[attr-defined]
     if stop_at_layer is not None:
         model.model._sae_stop_at_layer = stop_at_layer  # type: ignore[attr-defined]
 
-    for hook_name, path, extractor, is_pre, _gather_fn in hook_specs:
-        module = model.get_submodule(path)
+    for (hook_name, _path, extractor, is_pre, _gather_fn), module in zip(hook_specs, modules):
 
         if is_pre:
 
@@ -928,7 +981,7 @@ class HookedVLLMModel:
     def __init__(
         self,
         model_name: str,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: PreTrainedTokenizerBase | None,
         dtype: torch.dtype = torch.bfloat16,
         capture_batch_size: int | None = None,
         capture_context_size: int | None = None,
@@ -1372,7 +1425,7 @@ class HookedVLLMModel:
         self,
         batch_tokens: torch.Tensor,  # (B, S)
         names_filter: list[str],
-        **kwargs: Any,  # stop_at_layer, prepend_bos, etc. accepted but ignored
+        **kwargs: Any,
     ) -> tuple[None, dict[str, torch.Tensor]]:
         """
         Run prefill on batch_tokens and return captured activations.
@@ -1381,6 +1434,10 @@ class HookedVLLMModel:
             batch_tokens: integer token ids of shape (B, S).
             names_filter: list of TransformerLens-style hook names, e.g.
                 ``["blocks.21.hook_resid_post", "blocks.21.attn.hook_q"]``.
+            stop_at_layer: Defaults to "auto": Llama/Mistral/Qwen2/Qwen3 stop
+                after the deepest requested block. An integer is an exclusive
+                layer boundary (blocks.2 needs at least 3); None runs all layers.
+                This skips computation, not weight loading or KV allocation.
 
         Returns:
             (None, {hook_name: tensor of shape (B, S, d)})
@@ -1397,7 +1454,7 @@ class HookedVLLMModel:
         B, S = batch_tokens.shape
         arch_config = ARCH_CONFIGS[self._arch]
         total_tokens = B * S
-        stop_at_layer: int | None = kwargs.get("stop_at_layer", None)
+        stop_at_layer: int | str | None = kwargs.get("stop_at_layer", "auto")
         memory_probe_layer: int | None = kwargs.get("vllm_memory_probe_layer", None)
         memory_probe_path: str | Path | None = kwargs.get("vllm_memory_history_path", None)
         memory_probe_step: int = int(kwargs.get("vllm_memory_step", 0))
@@ -1662,6 +1719,11 @@ class HookedVLLMModel:
         if move_to_device is not False:
             raise ValueError(
                 "Only works with move_to_device=False, to match ActivationsStore usage"
+            )
+        if self.tokenizer is None:
+            raise ValueError(
+                "Text tokenization requires a tokenizer. Disable skip_tokenizer_init "
+                "or supply a pretokenized dataset / token IDs."
             )
         tokens = self.tokenizer(
             input,

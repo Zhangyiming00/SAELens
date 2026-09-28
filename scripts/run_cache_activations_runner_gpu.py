@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hook-name", default="blocks.21.hook_resid_post")
     parser.add_argument(
         "--hook-names",
-        default="blocks.21.hook_resid_post,blocks.31.hook_resid_post",
+        default=None,
         help="Comma-separated hook names for multi-hook caching.",
     )
     parser.add_argument(
@@ -77,6 +77,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-batch-size", type=int, default=16)
     parser.add_argument("--max-model-len", type=int, default=2049)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
+    parser.add_argument("--vllm-load-format", choices=["auto", "dummy"], default="auto",
+                        help="Use dummy for config-only validation without downloading weights.")
+    parser.add_argument("--vllm-skip-tokenizer-init", action="store_true",
+                        help="Use existing token IDs without loading a tokenizer; requires a tokenized dataset.")
     parser.add_argument("--dtype", default="float32")
     parser.add_argument("--autocast-lm", action="store_true")
     parser.add_argument("--buffer-size-gb", type=float, default=4.0)
@@ -127,7 +131,18 @@ def parse_args() -> argparse.Namespace:
         "allocator history for that 0-based cache-batch step and write "
         "vllm_cache_memory_timeline_rank{N}.pickle. -1 disables.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.vllm_skip_tokenizer_init and not args.is_dataset_tokenized:
+        parser.error("--vllm-skip-tokenizer-init requires --is-dataset-tokenized")
+    if (args.vllm_skip_tokenizer_init or args.vllm_load_format != "auto") and args.model_class_name != "VLLMModel":
+        parser.error("vLLM loading options require --model-class-name VLLMModel")
+    if args.hook_names is not None:
+        hooks = [h.strip() for h in args.hook_names.split(",") if h.strip()]
+        if not hooks:
+            parser.error("--hook-names must contain at least one hook")
+        args.hook_name = hooks[0]
+        args.hook_names = ",".join(hooks) if len(hooks) > 1 else None
+    return args
 
 
 def _resolve_device() -> str:
@@ -307,6 +322,10 @@ def main() -> None:
             "tensor_parallel_size": args.tp_size,
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            "load_format": args.vllm_load_format,
+            "skip_tokenizer_init": args.vllm_skip_tokenizer_init,
+            "capture_batch_size": args.model_batch_size,
+            "capture_context_size": args.context_size,
         }
 
     # With VLLMModel TP>1 (no torchrun), vLLM's MultiprocExecutor assigns

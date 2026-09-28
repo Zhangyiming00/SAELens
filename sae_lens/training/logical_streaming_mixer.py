@@ -108,6 +108,7 @@ class LogicalStreamingMixingProvider(Iterator[ActivationBatch]):
                     mix_fraction=mix_fraction,
                     generator=generator,
                     shuffle=shuffle,
+                    drop_last=False,
                 )
             )
 
@@ -119,10 +120,18 @@ class LogicalStreamingMixingProvider(Iterator[ActivationBatch]):
         return self
 
     def __next__(self) -> ActivationBatch:
-        batches = [next(mixer) for mixer in self._mixers]
+        batches = []
+        for mixer in self._mixers:
+            try:
+                batches.append(next(mixer))
+            except StopIteration:
+                # Other logical streams may still own valid queued/mixed rows.
+                continue
+        if not batches:
+            raise StopIteration
         result = _cat_batches(batches)
-        if _batch_tokens(result) != self._global_batch_size:
-            raise RuntimeError("logical streams did not reconstruct one global batch")
+        if _batch_tokens(result) > self._global_batch_size:
+            raise RuntimeError("logical streams exceeded one global batch")
         return result
 
     def _route_next_source_batch(self) -> None:

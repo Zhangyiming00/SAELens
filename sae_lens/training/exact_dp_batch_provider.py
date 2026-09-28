@@ -39,6 +39,8 @@ class ExactDataParallelBatchProvider(Iterator[Batch]):
         current_epoch: int = 0,
         reconfigure_poll: Callable[[], tuple[int, int] | None] | None = None,
         source_dp_idx: int = 0,
+        reconfigure_group: dist.ProcessGroup | None = None,
+        reconfigure_source_global_rank: int | None = None,
     ) -> None:
         if dp_size < 1:
             raise ValueError("ExactDataParallelBatchProvider requires dp_size >= 1")
@@ -61,6 +63,17 @@ class ExactDataParallelBatchProvider(Iterator[Batch]):
         self._hook_names = list(hook_names) if hook_names is not None else None
         self._source_global_rank = dist.get_global_rank(
             dp_group, self._source_dp_idx
+        )
+        if (reconfigure_group is None) != (reconfigure_source_global_rank is None):
+            raise ValueError("reconfigure group and source rank must be specified together")
+        self._reconfigure_group = reconfigure_group if reconfigure_group is not None else dp_group
+        self._reconfigure_source_global_rank = (
+            self._source_global_rank if reconfigure_source_global_rank is None
+            else reconfigure_source_global_rank
+        )
+        self._is_reconfigure_source = (
+            self._dp_idx == self._source_dp_idx if reconfigure_group is None
+            else dist.get_rank() == reconfigure_source_global_rank
         )
         if global_training_tokens is not None and global_training_tokens < 0:
             raise ValueError("global_training_tokens must be nonnegative")
@@ -164,21 +177,37 @@ class ExactDataParallelBatchProvider(Iterator[Batch]):
         self._pending_reconfigure = None
 
     def poll_reconfigure(self) -> bool:
-        """Collectively observe a manual request before fetching the next batch."""
+        """Observe one request at a common boundary for all active SAE ranks.
+
+        Elastic TP and hook placements use a shared training group here. Reading
+        the descriptor independently per DP group can split TP peers across
+        epochs or stop different hook placements after different updates.
+        """
         if self._reconfigure_poll is None:
             return False
-        request = (
-            self._reconfigure_poll()
-            if self._dp_idx == self._source_dp_idx
-            else None
-        )
+        request = None
+        error = None
+        if self._is_reconfigure_source:
+            try:
+                request = self._reconfigure_poll()
+            except Exception as exc:
+                # Every DP member must leave the collective together when the
+                # controller reports a failed rank or an unreadable descriptor.
+                error = str(exc)
+                request = (-2, -2)
         meta = torch.tensor(
             [-1, -1] if request is None else list(request),
             dtype=torch.int64,
             device=self._device,
         )
-        dist.broadcast(meta, src=self._source_global_rank, group=self._dp_group)
+        dist.broadcast(meta, src=self._reconfigure_source_global_rank,
+                       group=self._reconfigure_group)
         epoch = int(meta[0])
+        if epoch == -2:
+            payload = [error]
+            dist.broadcast_object_list(payload, src=self._reconfigure_source_global_rank,
+                                       group=self._reconfigure_group, device=self._device)
+            raise RuntimeError(f"elastic control poll failed: {payload[0]}")
         if epoch <= self._current_epoch:
             return False
         self._pending_reconfigure = (epoch, int(meta[1]))

@@ -422,7 +422,7 @@ class MultiSAETrainer:
         )
         if self.units:
             batch_total = torch.tensor(cfg.train_batch_size_samples, device=cfg.device, dtype=torch.int64)
-            if self._dp_world_size() > 1:
+            if self._dp_world_size() > 1 and not getattr(self.data_provider, "tracks_global_progress", False):
                 dist.all_reduce(batch_total, group=self.dp_group)
             self._progress_batch_total = int(batch_total.item())
             configure_update_batch(self)

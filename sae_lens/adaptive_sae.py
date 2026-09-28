@@ -1,4 +1,4 @@
-"""V5 local SAE compute planner and mixed decoder autograd.
+"""SAE execution policies, local compute planning and mixed decoder autograd.
 
 Selection, TP/DP communication and optimizer ownership stay outside this file.
 A plan may differ between TP ranks; it never changes collective order. No global
@@ -19,13 +19,92 @@ MODES = ('inherit', 'sparse', 'local_dense', 'compact_dense', 'auto')
 STAGES = ('forward', 'dvalues', 'dweight')
 
 
+REPRESENTATIONS = ("none", "full", "sharded_dense", "sharded_ragged")
+COMPUTATIONS = ("none", "sparse", "dense", "compact", "auto")
+DEFAULT_REPRESENTATION = "sharded_ragged"
+DEFAULT_COMPUTE_WORKSPACE_MIB = 128
+DENSE_COMPUTE_WORKSPACE_MIB = 512
+DEFAULT_OPENAI_WORKSPACE_MIB = 256
+
+
+def representation(value):
+    value = "none" if value is None else str(value).lower()
+    value = {"shared_dense": "sharded_dense", "shared_ragged": "sharded_ragged"}.get(
+        value, value
+    )
+    if value not in REPRESENTATIONS:
+        raise ValueError(f"Unknown latent representation: {value}")
+    return value
+
+
+def computation(value):
+    value = "none" if value is None else str(value).lower()
+    value = {"inherit": "none", "local_dense": "dense", "compact_dense": "compact"}.get(
+        value, value
+    )
+    if value not in COMPUTATIONS:
+        raise ValueError(f"Unknown decoder computation: {value}")
+    return value
+
+
+def enabled(cfg):
+    return any(
+        getattr(cfg, f"{branch}_{field}", None) is not None
+        for branch in ("main", "aux")
+        for field in ("representation", "compute")
+    ) or any(
+        computation(getattr(cfg, f"{branch}_{stage}", "none")) != "none"
+        for branch in ("main", "aux")
+        for stage in ("forward", "dvalues", "dweight")
+    )
+
+
+def branch_representation(cfg, auxiliary=False):
+    value = representation(
+        getattr(cfg, ("aux" if auxiliary else "main") + "_representation", None)
+    )
+    return DEFAULT_REPRESENTATION if value == "none" else value
+
+
+def branch_compute(cfg, auxiliary=False):
+    value = computation(
+        getattr(cfg, ("aux" if auxiliary else "main") + "_compute", None)
+    )
+    return ("compact" if auxiliary else "sparse") if value == "none" else value
+
+
+def stage_requests(cfg, auxiliary=False):
+    branch = "aux" if auxiliary else "main"
+    base = branch_compute(cfg, auxiliary)
+    result = []
+    for stage in ("forward", "dvalues", "dweight"):
+        value = computation(getattr(cfg, f"{branch}_{stage}", "none"))
+        value = base if value == "none" else value
+        result.append(
+            {"dense": "local_dense", "compact": "compact_dense"}.get(value, value)
+        )
+    return tuple(result)
+
+
+def validate(cfg):
+    if not enabled(cfg):
+        return
+    for aux in (False, True):
+        branch_representation(cfg, aux)
+        branch_compute(cfg, aux)
+        stage_requests(cfg, aux)
+
+
 def active(cfg, auxiliary=False):
+    if enabled(cfg):
+        return True
     branch = 'aux' if auxiliary else 'main'
     return any(getattr(cfg, 'v5_' + branch + '_' + suffix, 'inherit') != 'inherit'
                for suffix in ('compute', *STAGES))
 
 
 def validate_config(cfg):
+    validate(cfg)
     for branch in ('main', 'aux'):
         for suffix in ('compute', *STAGES):
             if getattr(cfg, f'v5_{branch}_{suffix}', 'inherit') not in MODES:
@@ -42,15 +121,18 @@ def validate_config(cfg):
     for name in ('v5_compact_max_ratio', 'v5_compact_min_density'):
         if not 0 <= getattr(cfg, name, .5 if name.endswith('ratio') else .25) <= 1:
             raise ValueError(name + ' must be in [0,1]')
-    if not 1 <= getattr(cfg, 'v5_workspace_mib', 128) <= 4096:
-        raise ValueError('v5_workspace_mib must be in [1,4096]')
-    if (active(cfg) or active(cfg, True)) and cfg.topk_backend != 'sharded_ragged':
+    for name, default in (('v5_workspace_mib', DEFAULT_COMPUTE_WORKSPACE_MIB),
+                          ('ragged_openai_workspace_mib', DEFAULT_OPENAI_WORKSPACE_MIB)):
+        value = getattr(cfg, name, default)
+        if type(value) is not int or not 1 <= value <= 4096:
+            raise ValueError(name + ' must be an integer in [1,4096] MiB')
+    if not enabled(cfg) and (active(cfg) or active(cfg, True)) and cfg.topk_backend != 'sharded_ragged':
         raise ValueError('V5 compute policies require topk_backend=sharded_ragged (also works at TP1)')
     if getattr(cfg, 'topk_tie_policy', 'stable_id') not in ('stable_id', 'torch_tp1'):
         raise ValueError('Unknown TopK tie policy')
     k = getattr(cfg, 'auxk', None)
-    if k is not None and (type(k) is not int or k < 1):
-        raise ValueError('auxk must be None or a positive integer')
+    if k is not None and (type(k) is not int or k < 0):
+        raise ValueError('auxk must be nonnegative or None')
 
 
 @dataclass(frozen=True)
@@ -79,6 +161,8 @@ class Plan:
 
 
 def requests(cfg, auxiliary=False):
+    if enabled(cfg):
+        return stage_requests(cfg, auxiliary)
     branch = 'aux' if auxiliary else 'main'
     old = getattr(cfg, 'ragged_' + branch + '_compute', 'sparse')
     base = getattr(cfg, 'v5_' + branch + '_compute', 'inherit')
@@ -175,9 +259,9 @@ def options(cfg):
                 split=getattr(cfg, 'ragged_wgrad_split', 1),
                 index_backend=getattr(cfg, 'ragged_index_backend', 'sort'),
                 page_k=getattr(cfg, 'ragged_openai_page_k', 512),
-                openai_workspace_mib=getattr(cfg, 'ragged_openai_workspace_mib', 64),
+                openai_workspace_mib=getattr(cfg, 'ragged_openai_workspace_mib', DEFAULT_OPENAI_WORKSPACE_MIB),
                 forward_mode=getattr(cfg, 'ragged_openai_forward', 'bucketed'),
-                workspace_mib=getattr(cfg, 'v5_workspace_mib', 128))
+                workspace_mib=getattr(cfg, 'v5_workspace_mib', DEFAULT_COMPUTE_WORKSPACE_MIB))
 
 
 class _HybridDecoder(torch.autograd.Function):
@@ -271,7 +355,7 @@ def decode_adaptive(acts, vectors, cfg, *, auxiliary=False, known_columns=None):
     info = packed_diagnostics(acts, getattr(cfg, 'ragged_decoder_engine', 'triton'), 'v5_mixed')
     info.update(plan.diagnostics())
     info['k_metric'] = getattr(cfg, 'v5_k_metric', 'mean')
-    info['workspace_mib'] = getattr(cfg, 'v5_workspace_mib', 128)
+    info['workspace_mib'] = getattr(cfg, 'v5_workspace_mib', DEFAULT_COMPUTE_WORKSPACE_MIB)
     return out.reshape(*acts.leading_shape, vectors.shape[1]), info
 
 
@@ -288,7 +372,7 @@ def try_direct_aux(scores, eligible, num_dead, k_aux, weight, norm, cfg):
         return None
     columns = eligible.nonzero(as_tuple=True)[0]
     rows, m = math.prod(scores.shape[:-1]), columns.numel()
-    if (rows*m + weight.shape[0]*m)*max(4, weight.element_size()) > (getattr(cfg, 'v5_workspace_mib', 128) << 20):
+    if (rows*m + weight.shape[0]*m)*max(4, weight.element_size()) > (getattr(cfg, 'v5_workspace_mib', DEFAULT_COMPUTE_WORKSPACE_MIB) << 20):
         return None
     plan = choose_plan(cfg, auxiliary=True, rows=rows, width=scores.shape[-1], entries=rows*m,
                        columns=m, max_k=m, select_all=True)

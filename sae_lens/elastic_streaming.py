@@ -386,6 +386,8 @@ class ElasticStreamingController:
     def finish(self, *, epoch: int) -> ElasticControlState:
         with self._locked():
             current = self._read_unlocked()
+            if current.phase == "failed":
+                raise RuntimeError(f"elastic streaming failed: {current.error}")
             # A request that acquired the lock first must complete. Returning
             # it lets workers perform that cutover even if training consumed
             # its final batch immediately before observing the request.
@@ -414,7 +416,7 @@ class ElasticStreamingController:
     def fail(self, *, epoch: int, error: str) -> ElasticControlState:
         with self._locked():
             current = self._read_unlocked()
-            if current.epoch != epoch:
+            if current.epoch != epoch or current.phase == "failed":
                 return current
             failed = ElasticControlState(
                 **{
@@ -434,6 +436,8 @@ class ElasticStreamingController:
         require_ready: bool = False,
     ) -> tuple[int, int] | None:
         state = self.read()
+        if state.phase == "failed":
+            raise RuntimeError(f"elastic streaming failed: {state.error}")
         if (
             state.phase == "switching"
             and state.epoch > local_epoch
@@ -548,18 +552,24 @@ class ElasticSAEContext:
     def get_sae_tp_group(self) -> Any | None:
         if not self.is_consumer():
             return None
+        if self.runtime.training_runtimes:
+            return self.runtime.training_runtime(self.sae_dp).require_local().tp_group
         endpoint_idx = self._replica_idx * self.layout.sae_pp_size + self._pp_rank
         return self.runtime.groups[self.sae_dp].tp_groups[endpoint_idx]
 
     def get_sae_tp_cpu_group(self) -> Any | None:
         if not self.is_consumer():
             return None
+        if self.runtime.training_runtimes:
+            return self.runtime.training_runtime(self.sae_dp).require_local().tp_cpu_group
         endpoint_idx = self._replica_idx * self.layout.sae_pp_size + self._pp_rank
         return self.runtime.groups[self.sae_dp].tp_cpu_groups[endpoint_idx]
 
     def get_sae_dp_group(self) -> Any | None:
         if not self.is_consumer():
             return None
+        if self.runtime.training_runtimes:
+            return self.runtime.training_runtime(self.sae_dp).require_local().dp_group
         group_idx = self._pp_rank * self.layout.sae_tp_size + self._tp_rank
         return self.runtime.groups[self.sae_dp].dp_groups[group_idx]
 
@@ -588,12 +598,30 @@ class ElasticSAEContext:
 class ElasticDistributedRuntime:
     """Pre-created SAE min/max groups plus a cutover-only Gloo group."""
 
-    def __init__(self, layout: ElasticStreamingLayout) -> None:
+    def __init__(self, layout: ElasticStreamingLayout, *, initial_runtime=None,
+                 hook_names: tuple[str, ...] = (), backend: str = "nccl") -> None:
         if not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized first")
         if dist.get_world_size() != layout.world_size:
             raise ValueError("distributed world size does not match elastic layout")
         self.layout = layout
+        self.training_runtimes = {}
+        if initial_runtime is not None:
+            from sae_lens.distributed_v2 import hooks_for_pp_rank
+            from sae_lens.sae_runtime import SAERuntime, SAETrainingDomain
+
+            self.training_runtimes[layout.min_sae_dp] = initial_runtime
+            self.training_runtimes[layout.max_sae_dp] = SAERuntime(tuple(
+                SAETrainingDomain(
+                    name=f"placement_{pp}",
+                    ranks=tuple(sorted(
+                        rank for replica in range(layout.max_sae_dp)
+                        for rank in layout.sae_stage_ranks(replica, pp)
+                    )),
+                    tp_size=layout.sae_tp_size,
+                    hooks=tuple(hooks_for_pp_rank(pp, layout.sae_pp_size, list(hook_names))),
+                ) for pp in range(layout.sae_pp_size)
+            ), backend=backend)
         self.groups: dict[int, _SAEGroups] = {}
         for sae_dp in (layout.min_sae_dp, layout.max_sae_dp):
             tp_groups = []
@@ -601,8 +629,9 @@ class ElasticDistributedRuntime:
             for replica_idx in range(sae_dp):
                 for pp_rank in range(layout.sae_pp_size):
                     ranks = list(layout.sae_stage_ranks(replica_idx, pp_rank))
-                    tp_groups.append(dist.new_group(ranks, backend="nccl"))
-                    tp_cpu_groups.append(dist.new_group(ranks, backend="gloo"))
+                    if not self.training_runtimes:
+                        tp_groups.append(dist.new_group(ranks, backend=backend))
+                        tp_cpu_groups.append(dist.new_group(ranks, backend="gloo"))
             dp_groups = []
             for pp_rank in range(layout.sae_pp_size):
                 for tp_rank in range(layout.sae_tp_size):
@@ -610,7 +639,8 @@ class ElasticDistributedRuntime:
                         layout.sae_stage_ranks(replica_idx, pp_rank)[tp_rank]
                         for replica_idx in range(sae_dp)
                     ]
-                    dp_groups.append(dist.new_group(ranks, backend="nccl"))
+                    if not self.training_runtimes:
+                        dp_groups.append(dist.new_group(ranks, backend=backend))
             pp_root_groups: list[Any | None] = []
             for replica_idx in range(sae_dp):
                 if layout.sae_pp_size == 1:
@@ -620,7 +650,7 @@ class ElasticDistributedRuntime:
                     layout.sae_stage_ranks(replica_idx, pp_rank)[0]
                     for pp_rank in range(layout.sae_pp_size)
                 ]
-                pp_root_groups.append(dist.new_group(ranks, backend="nccl"))
+                pp_root_groups.append(dist.new_group(ranks, backend=backend))
             self.groups[sae_dp] = _SAEGroups(
                 tp_groups=tuple(tp_groups),
                 tp_cpu_groups=tuple(tp_cpu_groups),
@@ -634,6 +664,10 @@ class ElasticDistributedRuntime:
 
     def context(self, sae_dp: int) -> ElasticSAEContext:
         return ElasticSAEContext(self, sae_dp)
+
+    def training_runtime(self, sae_dp: int):
+        """The same native training domain used by static SAE training."""
+        return self.training_runtimes[sae_dp]
 
     def is_permanent_vllm(self) -> bool:
         return dist.get_rank() in self.layout.permanent_vllm_ranks

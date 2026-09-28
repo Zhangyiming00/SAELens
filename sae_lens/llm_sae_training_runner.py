@@ -904,7 +904,7 @@ class LanguageModelSAETrainingRunner:
         )
         if (
             overlap_uses_per_hook_ddp
-            and (self.cfg.sae.architecture() != "topk" or elastic_streaming_control_path is not None)
+            and self.cfg.sae.architecture() != "topk"
             and self.cfg.multi_sae_distributed_architecture == "legacy_per_hook_wrapper"
         ):
             logger.warning(
@@ -2132,7 +2132,7 @@ class LanguageModelSAETrainingRunner:
             hook_names=tuple(self.hook_names),
         )
 
-        if elastic_layout is None and cfg.sae.architecture() == "topk" and cfg.sae_dp_mode == "ddp":
+        if cfg.sae.architecture() == "topk" and cfg.sae_dp_mode == "ddp":
             from sae_lens.distributed_v2 import get_sae_runtime
             self.sae_runtime = get_sae_runtime()
 
@@ -2144,7 +2144,12 @@ class LanguageModelSAETrainingRunner:
             assert elastic_runtime_type is not None
             assert elastic_controller_type is not None
             assert self._elastic_streaming_control_path is not None
-            self._elastic_runtime = elastic_runtime_type(elastic_layout)
+            if self.sae_runtime is None:
+                raise ValueError("elastic streaming requires the Megatron TopK SAE runtime")
+            self._elastic_runtime = elastic_runtime_type(
+                elastic_layout, initial_runtime=self.sae_runtime,
+                hook_names=tuple(self.hook_names),
+            )
             self._elastic_controller = elastic_controller_type(
                 self._elastic_streaming_control_path, elastic_layout
             )
@@ -3291,21 +3296,6 @@ class LanguageModelSAETrainingRunner:
         except Exception:
             logger.exception("failed to publish elastic streaming failure state")
 
-    def _elastic_release_sae_wrappers(self, trainer: MultiSAETrainer) -> None:
-        if torch.cuda.is_available():
-            torch.cuda.synchronize(self.device)
-        if trainer._overlap_ddp_state is not None:
-            trainer._overlap_ddp_state.close()
-            trainer._overlap_ddp_state = None
-        if trainer._overlap_tp_post is not None:
-            trainer._overlap_tp_post.close()
-            trainer._overlap_tp_post = None
-        trainer.multi_hook_sae = None
-        trainer.sae_by_hook = dict(trainer.base_sae_by_hook)
-        self.multi_hook_sae = None
-        self.sae_by_hook = {}
-        gc.collect()
-
     def _elastic_drop_sae(self) -> None:
         self.sae_by_hook = {}
         self.base_sae_by_hook = {}
@@ -3424,26 +3414,10 @@ class LanguageModelSAETrainingRunner:
                 require_ready=True,
             ),
             source_dp_idx=source_dp_idx,
+            reconfigure_group=self.sae_runtime.training_group,
+            reconfigure_source_global_rank=self._elastic_runtime.layout.permanent_sae_ranks[0],
         )
         return provider, logical_provider
-
-    def _elastic_broadcast_base_sae_state(self, ds: Any) -> None:
-        runtime = self._elastic_runtime
-        assert runtime is not None
-        dp_group = ds.get_sae_dp_group()
-        if dp_group is None:
-            raise RuntimeError("elastic streaming requires an SAE-DP group")
-        source_global_rank = runtime.layout.sae_stage_ranks(
-            0, ds.get_sae_pp_rank()
-        )[ds.get_sae_tp_rank()]
-        with torch.no_grad():
-            for hook_name in self._pp_hook_names:
-                for tensor in self.base_sae_by_hook[hook_name].state_dict().values():
-                    dist.broadcast(
-                        tensor,
-                        src=source_global_rank,
-                        group=dp_group,
-                    )
 
     def _build_elastic_multi_trainer(
         self,
@@ -3468,6 +3442,7 @@ class LanguageModelSAETrainingRunner:
             backward_mode=self.cfg.multi_sae_backward_mode,
             seed_mode=self.cfg.multi_sae_seed_mode,
             append_logs=True,
+            runtime=self.sae_runtime,
         )
 
     def _elastic_switch_sae_topology(
@@ -3479,8 +3454,11 @@ class LanguageModelSAETrainingRunner:
         target_sae_dp: int,
         joining_prepared: bool = False,
     ) -> tuple[MultiSAETrainer | None, Any | None, Any | None]:
-        from sae_lens.training.elastic_trainer_state import (
-            broadcast_multi_sae_trainer_state,
+        from sae_lens.training.elastic_runtime_state import (
+            broadcast_runtime_models,
+            capture_runtime_state,
+            restore_runtime_state,
+            retire_runtime_trainer,
         )
 
         runtime = self._elastic_runtime
@@ -3491,6 +3469,7 @@ class LanguageModelSAETrainingRunner:
 
         old_global_tokens = 0
         old_step = 0
+        saved_state = None
         if old_trainer is not None:
             old_global_tokens = old_trainer.n_training_samples
             old_step = old_trainer.n_training_steps
@@ -3498,20 +3477,15 @@ class LanguageModelSAETrainingRunner:
                 old_source_global_rank = layout.sae_stage_ranks(
                     0, old_trainer._pp_rank()
                 )[old_trainer._tp_rank()]
-                old_source_dp_rank = dist.get_group_rank(
-                    old_trainer.dp_group, old_source_global_rank
+                saved_state = capture_runtime_state(
+                    old_trainer, source_global_rank=old_source_global_rank
                 )
-                # All ranks in the old DP group participate before elastic
-                # ranks leave it. The permanent SAE rank retains the gathered
-                # state for transfer into the replacement optimizer topology.
-                old_trainer.consolidate_zero_optimizer_state(
-                    to=old_source_dp_rank
-                )
-            self._elastic_release_sae_wrappers(old_trainer)
+            retire_runtime_trainer(old_trainer)
+            self._elastic_drop_sae()
 
         target_context = runtime.context(target_sae_dp)
-        joining_sae = target_context.is_consumer() and old_trainer is None
-        if joining_sae and not joining_prepared:
+        self.sae_runtime = runtime.training_runtime(target_sae_dp)
+        if target_context.is_consumer() and not joining_prepared:
             self._elastic_attach_streaming_buffer()
             self._streaming_create_consumer_multi_base(self.cfg, target_context)
 
@@ -3525,7 +3499,14 @@ class LanguageModelSAETrainingRunner:
             # rank after torch.distributed sorts the expanded group. Seed every
             # replica from the permanent live SAE before constructing DDP so a
             # fresh elastic module cannot overwrite trained weights.
-            self._elastic_broadcast_base_sae_state(target_context)
+            source_global_rank = layout.sae_stage_ranks(
+                0, target_context.get_sae_pp_rank()
+            )[target_context.get_sae_tp_rank()]
+            broadcast_runtime_models(
+                saved_state, self.base_sae_by_hook,
+                group=target_context.get_sae_dp_group(),
+                source_global_rank=source_global_rank,
+            )
             self._streaming_wrap_consumer_multi(target_context)
             new_provider, logical_provider = self._build_elastic_streaming_provider(
                 target_context,
@@ -3537,23 +3518,14 @@ class LanguageModelSAETrainingRunner:
             new_trainer = self._build_elastic_multi_trainer(
                 new_provider, target_context
             )
-            source_global_rank = layout.sae_stage_ranks(
-                0, target_context.get_sae_pp_rank()
-            )[target_context.get_sae_tp_rank()]
-            broadcast_multi_sae_trainer_state(
-                source=(
-                    old_trainer
-                    if dist.get_rank() == source_global_rank
-                    else None
-                ),
-                target=new_trainer,
-                group=target_context.get_sae_dp_group(),
+            restored_scalars = restore_runtime_state(
+                saved_state, new_trainer,
                 source_global_rank=source_global_rank,
-                device=self.device,
             )
+            provider_step = restored_scalars.get("provider_step_index")
             new_provider.restore_progress(
                 global_tokens=new_trainer.n_training_samples,
-                step=new_trainer.n_training_steps,
+                step=(new_trainer.n_training_steps if provider_step is None else provider_step),
                 epoch=epoch,
             )
         else:
@@ -3629,6 +3601,7 @@ class LanguageModelSAETrainingRunner:
                         return None
                     self._elastic_destroy_vllm()
                     target_context = runtime.context(request[1])
+                    self.sae_runtime = runtime.training_runtime(request[1])
                     self._elastic_attach_streaming_buffer()
                     self._streaming_create_consumer_multi_base(
                         self.cfg, target_context

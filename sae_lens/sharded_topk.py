@@ -66,6 +66,8 @@ def _local_candidates(
     offset: int,
     eligible: torch.Tensor | None,
     key_backend: str,
+    *,
+    workspace_bytes: int = 256 * 1024 * 1024,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Bound comparison-key scratch independently of token batch size.
 
@@ -85,9 +87,12 @@ def _local_candidates(
         from sae_lens.sharded_triton import make_score_keys
 
         key_kernel = make_score_keys
-    # GPU key buffer <=32 MiB. Torch fallback has several elementwise temporaries.
+    # Match the full-logit path's bounded key-workspace target. A 32 MiB
+    # target gave only 32 rows at width=16384 with the torch fallback, causing
+    # thousands of tiny key/TopK launches even at TP1. Outputs and torch.topk's
+    # internal workspace are separate from this comparison-key tile budget.
     scratch_per_element = 8 if key_kernel else 64
-    tile = max(1, (32 * 1024 * 1024) // (width * scratch_per_element))
+    tile = max(1, workspace_bytes // (width * scratch_per_element))
     for start in range(0, rows, tile):
         block = scores[start : start + tile]
         keys = (
@@ -312,7 +317,8 @@ def launch_sharded_topk(
         if rows == 0:
             return torch.empty(0, dtype=torch.int64, device=scores.device)
         if p == 1:
-            return local_keys.topk(k, dim=1, sorted=False).values.amin(1)
+            # The local candidates already contain exactly k winners.
+            return local_keys.amin(1)
         if chosen == "radix":
             return _radix_threshold(
                 local_keys, k, group,
@@ -430,3 +436,61 @@ def gather_feature_summary(
     output = torch.empty(p * local.numel(), dtype=local.dtype, device=local.device)
     dist.all_gather_into_tensor(output, local.contiguous(), group=group)
     return output
+
+
+def full_topk(
+    scores,
+    k,
+    *,
+    rank,
+    shard_width,
+    packed,
+    relu=True,
+    eligible=None,
+    key_backend="torch",
+    tie_policy="stable_id",
+):
+    """Select on already gathered scores, without a second TP collective.
+
+    Keep the same exact score/index ordering as the sharded selector. Full
+    storage uses the same bounded key workspace as sharded selection.
+    Decoder policy remains independent.
+    """
+    from sae_lens.ragged_sae import SelectedEntries
+
+    width = scores.shape[-1]
+    flat = scores.reshape(-1, width)
+    if not 0 < k <= width:
+        raise ValueError(f"k must be in [1, {width}]")
+    if tie_policy == "torch_tp1":
+        if shard_width != width:
+            raise ValueError("torch_tp1 requires singleton TP")
+        with torch.no_grad():
+            ranked = (
+                flat if eligible is None else torch.where(eligible, flat, -torch.inf)
+            )
+            indices = ranked.topk(k, dim=-1, sorted=False).indices
+    elif tie_policy == "stable_id":
+        _, indices = _local_candidates(
+            flat, k, 0, eligible, key_backend, workspace_bytes=256 * 1024 * 1024
+        )
+    else:
+        raise ValueError("Unknown tie policy")
+    values = _LocalSelectedValues.apply(flat, indices)
+    if relu:
+        values = values.relu()
+    dense = (
+        flat.new_zeros(flat.shape).scatter_(1, indices, values).reshape(scores.shape)
+    )
+    if packed:
+        offset = rank * shard_width
+        keep = (indices >= offset) & (indices < offset + shard_width)
+        positions = keep.reshape(-1).nonzero(as_tuple=True)[0]
+        rows = positions // k
+        columns = indices.reshape(-1).index_select(0, positions) - offset
+        counts = torch.bincount(rows, minlength=flat.shape[0])
+        offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
+        dense._sae_selected_entries = SelectedEntries(
+            offsets, rows, columns, shard_width, "full_topk"
+        )
+    return dense

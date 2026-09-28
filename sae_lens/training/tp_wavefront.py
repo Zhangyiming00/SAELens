@@ -7,10 +7,15 @@ import torch.distributed as dist
 
 from sae_lens import logger
 from sae_lens.training.megatron_ddp import is_megatron_ddp
-from sae_lens.training.multi_hook_sae import PendingWavefrontOutputs, forward_tp_wavefront
+from sae_lens.training.multi_hook_sae import (
+    PendingWavefrontOutputs,
+    forward_tp_wavefront,
+)
 
 
 def configure_tp_wavefront(trainer, units):
+    from sae_lens.config import resolve_tp_overlap
+    resolve_tp_overlap(trainer.cfg)
     mode = getattr(trainer.cfg, "multi_sae_distributed_architecture", "legacy_per_hook_wrapper")
     if mode not in ("legacy_per_hook_wrapper", "unified_multi_hook"):
         raise ValueError("Invalid multi_sae_distributed_architecture")
@@ -18,7 +23,7 @@ def configure_tp_wavefront(trainer, units):
     device = next(next(iter(units.values())).model.parameters()).device
     reason = None
     if mode != "unified_multi_hook":
-        reason = "disabled by legacy_per_hook_wrapper"
+        reason = "TP overlap is off"
     elif len(units) < 2:
         reason = "one local hook"
     elif context.tp_group.size() == 1:
@@ -42,9 +47,9 @@ def configure_tp_wavefront(trainer, units):
     schedule = getattr(trainer.cfg, "multi_sae_tp_wavefront_schedule", "bounded")
     window = getattr(trainer.cfg, "multi_sae_tp_wavefront_max_live_hooks", 2)
     if schedule not in ("eager", "lazy", "bounded"):
-        raise ValueError("Unknown TP wavefront schedule")
+        raise ValueError("Unknown TP overlap schedule")
     if type(window) is not int or window < 1:
-        raise ValueError("multi_sae_tp_wavefront_max_live_hooks must be positive")
+        raise ValueError("TP overlap max-live-hooks must be positive")
     if enabled:
         # Mixed schedules/windows on TP/DP members would change collective order.
         setting = torch.tensor([("eager", "lazy", "bounded").index(schedule), window], device=device)
@@ -53,25 +58,27 @@ def configure_tp_wavefront(trainer, units):
             dist.all_reduce(low, op=dist.ReduceOp.MIN, group=context.groups.tp_dp_cp)
             dist.all_reduce(high, op=dist.ReduceOp.MAX, group=context.groups.tp_dp_cp)
         if not torch.equal(low, high):
-            raise ValueError("All ranks must use the same wavefront schedule and window")
+            raise ValueError("All ranks must use the same TP overlap schedule and window")
         if schedule != "eager":
             # Interleaved updates are only valid for independent SAE parameters.
             seen = set()
             for unit in units.values():
                 ids = {id(p) for p in unit.model.parameters()}
                 if seen.intersection(ids):
-                    raise ValueError("Lazy/bounded wavefront requires independent hook parameters")
+                    raise ValueError("Lazy/bounded TP overlap requires independent hook parameters")
                 seen.update(ids)
     trainer._runtime_tp_wavefront_schedule = schedule
     trainer._runtime_tp_wavefront_max_live_hooks = window
     trainer._runtime_tp_wavefront = enabled
     trainer._runtime_tp_wavefront_reason = reason
+    trainer._runtime_tp_overlap = enabled
+    trainer._runtime_tp_overlap_schedule = schedule if enabled else 'off'
     logger.info(
-        "SAE TP wavefront requested_architecture=%s effective=%s placement=%s hooks=%s "
+        "SAE TP overlap requested=%s effective=%s placement=%s hooks=%s "
         "reason=%s; per-hook DDP/optimizer ownership is unchanged",
-        mode, enabled, context.domain.name, list(units), reason,
+        schedule if mode == "unified_multi_hook" else "off", enabled, context.domain.name, list(units), reason,
     )
-    logger.info("SAE TP wavefront schedule=%s max_live_hooks=%s", schedule,
+    logger.info("SAE TP overlap schedule=%s max_live_hooks=%s", schedule if enabled else "off",
                 window if schedule == "bounded" else "all")
 
 

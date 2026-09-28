@@ -8,6 +8,7 @@ from torch import nn
 from transformer_lens.hook_points import HookPoint
 from typing_extensions import override
 
+from sae_lens.adaptive_sae import DEFAULT_COMPUTE_WORKSPACE_MIB, DEFAULT_OPENAI_WORKSPACE_MIB
 from sae_lens.saes.sae import (
     SAE,
     SAEConfig,
@@ -346,6 +347,18 @@ class TopKTrainingSAEConfig(TrainingSAEConfig):
 
     k: int = 100
     use_sparse_activations: bool = False
+    # Canonical independent execution policy. Python None is reserved for old
+    # checkpoint/API compatibility; CLI "none" selects documented defaults.
+    main_representation: str | None = None
+    aux_representation: str | None = None
+    main_compute: str | None = None
+    aux_compute: str | None = None
+    main_forward: str = "none"
+    main_dvalues: str = "none"
+    main_dweight: str = "none"
+    aux_forward: str = "none"
+    aux_dvalues: str = "none"
+    aux_dweight: str = "none"
     # Explicit opt-in. Sharded modes change training encode() to LOCAL features.
     # Neither sharded mode may fall back to a full-latent all-gather.
     topk_backend: str = "legacy"  # legacy | sharded_dense | sharded_sparse | sharded_ragged
@@ -366,11 +379,11 @@ class TopKTrainingSAEConfig(TrainingSAEConfig):
     ragged_index_backend: str = "sort"  # sort | histogram (nondeterministic order)
     # Actual upstream OpenAI kernels. Existing triton remains the v3 custom code.
     ragged_openai_page_k: int = 512  # bound each original sampled-gradient launch
-    ragged_openai_workspace_mib: int = 64  # adapter row-tile workspace target
+    ragged_openai_workspace_mib: int = DEFAULT_OPENAI_WORKSPACE_MIB  # adapter row-tile workspace target
     ragged_openai_forward: str = "bucketed"  # bucketed original fwd | original COO
 
     # V5 opt-in execution policy. Old V4 dispatch remains active with inherit.
-    auxk: int | None = None  # None preserves d_in//2; not a diagnostic override.
+    auxk: int | None = None  # Megatron: None uses d_in//2; 0 disables AuxK.
     topk_tie_policy: str = "stable_id"  # stable_id | torch_tp1 (explicit native tie experiment)
     v5_main_compute: str = "inherit"
     v5_aux_compute: str = "inherit"
@@ -391,7 +404,7 @@ class TopKTrainingSAEConfig(TrainingSAEConfig):
     v5_k_metric: str = "mean"  # local entries/rows, or explicit max-row readback
     v5_compact_max_ratio: float = 0.5
     v5_compact_min_density: float = 0.25
-    v5_workspace_mib: int = 128  # tile scratch target, not whole-step memory cap
+    v5_workspace_mib: int = DEFAULT_COMPUTE_WORKSPACE_MIB  # tile scratch target, not whole-step memory cap
 
 
 

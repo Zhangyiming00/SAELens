@@ -107,6 +107,71 @@ class RaggedLatents:
         return self
 
 
+@dataclass(frozen=True)
+class SelectedEntries:
+    offsets: torch.Tensor
+    rows: torch.Tensor
+    columns: torch.Tensor
+    width: int
+    selection: str
+
+
+def represent_latents(acts, kind, group):
+    """Return an actual dense/full tensor or a local RaggedLatents value."""
+    from sae_lens.megatron_tp import megatron_tp_allgather
+
+    if kind == "sharded_ragged":
+        if not isinstance(acts, RaggedLatents):
+            raise TypeError("Ragged representation requires selected entries")
+        return acts
+    metadata = None
+    if isinstance(acts, RaggedLatents):
+        metadata = SelectedEntries(
+            acts.row_offsets, acts.row_ids, acts.feature_ids, acts.width, acts.selection
+        )
+        dense = acts.to_dense()
+    else:
+        dense = acts
+    if kind == "full":
+        dense = megatron_tp_allgather(dense, group)
+    if metadata is not None:
+        dense._sae_selected_entries = metadata
+    return dense
+
+
+def local_latent_tensor(acts, kind, rank, width):
+    return acts.narrow(-1, rank * width, width) if kind == "full" else acts
+
+
+def selected_latents_view(acts, kind, rank, width):
+    """Sparse computation reads dense storage through saved winner indices.
+
+    Do not recover winners with nonzero(): AuxK may select zero-valued entries
+    whose derivative must still be computed.
+    """
+
+    if isinstance(acts, RaggedLatents):
+        return acts
+    meta = getattr(acts, "_sae_selected_entries", None)
+    if meta is None:
+        raise ValueError(
+            "Sparse/compact Main decode requires selection metadata from encode(); "
+            "use dense computation for arbitrary externally supplied activations"
+        )
+    local = local_latent_tensor(acts, kind, rank, width)
+    values = _EntryValues.apply(local, meta.rows, meta.columns)
+    return RaggedLatents(
+        meta.offsets,
+        meta.rows,
+        meta.columns,
+        values,
+        tuple(local.shape[:-1]),
+        width,
+        meta.selection,
+    )
+
+
+
 def _offsets(rows, nrows):
     counts = torch.bincount(rows, minlength=nrows)
     return torch.cat((counts.new_zeros(1), counts.cumsum(0)))

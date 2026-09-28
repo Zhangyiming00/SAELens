@@ -43,6 +43,7 @@ def mixing_buffer(
     shuffle: bool | None = None,
     state: dict | None = None,
     synchronize_batch_count: Callable[[int], int] | None = None,
+    drop_last: bool = True,
 ) -> Iterator[ActivationBatch]:
     """
     A generator that maintains a mix of old and new activations for better training.
@@ -57,6 +58,8 @@ def mixing_buffer(
                       If 0, no shuffling occurs (passthrough mode).
         shuffle: Explicitly enable/disable shuffling. ``None`` preserves the
             historical behavior where ``mix_fraction=0`` disables shuffling.
+        drop_last: Drop an incomplete final batch. Exact streaming disables this
+            so each logical stream retains all valid tokens at EOF.
 
     Yields:
         Batches of activations of shape (batch_size, *activation_dims)
@@ -72,8 +75,15 @@ def mixing_buffer(
     pending = state.get("serving")
     if pending is not None:
         for offset in range(0, _batch_len(pending), batch_size):
-            state["serving"] = _index_batch(pending, slice(offset + batch_size, None))
+            state["serving"] = (
+                _index_batch(pending, slice(offset + batch_size, None))
+                if offset + batch_size < _batch_len(pending) else None
+            )
             yield _index_batch(pending, slice(offset, offset + batch_size))
+    # Even an empty slice owns its entire backing storage. A resumed serving
+    # buffer must not remain alive throughout subsequent refills.
+    del pending
+    state["serving"] = None
     if state.get("exhausted", False):
         return
 
@@ -87,6 +97,10 @@ def mixing_buffer(
                 if storage_buffer is None
                 else _cat_batches(storage_buffer, new_activations)
             )
+        # The appended storage now owns these rows. Drop stale owners before
+        # shuffling or fetching again; no copies or stream synchronization.
+        del new_activations
+        state["storage"] = storage_buffer
 
         ready = _batch_len(storage_buffer) >= buffer_size
         keep_for_mixing = int(buffer_size * mix_fraction)
@@ -111,24 +125,37 @@ def mixing_buffer(
                 # Keep a fixed amount for mixing, serve the rest
                 serving_cutoff = num_serving_batches * batch_size
                 serving_buffer = _index_batch(storage_buffer, slice(0, serving_cutoff))
-                storage_buffer = _index_batch(
-                    storage_buffer, slice(serving_cutoff, None)
+                storage_buffer = (
+                    _index_batch(storage_buffer, slice(serving_cutoff, None))
+                    if serving_cutoff < _batch_len(storage_buffer) else None
                 )
 
             # Yield batches from the serving_buffer
             for batch_idx in range(num_serving_batches):
                 state["storage"] = storage_buffer
-                state["serving"] = _index_batch(serving_buffer, slice((batch_idx + 1) * batch_size, None))
+                state["serving"] = (
+                    _index_batch(serving_buffer, slice((batch_idx + 1) * batch_size, None))
+                    if batch_idx + 1 < num_serving_batches else None
+                )
                 yield _index_batch(
                     serving_buffer,
                     slice(batch_idx * batch_size, (batch_idx + 1) * batch_size),
                 )
+            del serving_buffer
 
     # If there are any remaining activations, yield them
     if storage_buffer is not None:
-        remaining_batches = _batch_len(storage_buffer) // batch_size
+        remaining_tokens = _batch_len(storage_buffer)
+        if drop_last:
+            remaining_tokens = (remaining_tokens // batch_size) * batch_size
         state["storage"] = None
         state["exhausted"] = True
-        for i in range(remaining_batches):
-            state["serving"] = _index_batch(storage_buffer, slice((i + 1) * batch_size, remaining_batches * batch_size))
-            yield _index_batch(storage_buffer, slice(i * batch_size, (i + 1) * batch_size))
+        for start in range(0, remaining_tokens, batch_size):
+            state["serving"] = (
+                _index_batch(storage_buffer, slice(start + batch_size, remaining_tokens))
+                if start + batch_size < remaining_tokens else None
+            )
+            yield _index_batch(storage_buffer, slice(start, min(start + batch_size, remaining_tokens)))
+    state["storage"] = None
+    state["serving"] = None
+    state["exhausted"] = True

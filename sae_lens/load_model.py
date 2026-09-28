@@ -58,8 +58,11 @@ def load_model(
     if model_class_name == "VLLMModel":
         from sae_lens.vllm_model import HookedVLLMModel
 
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
         vllm_kwargs = dict(model_from_pretrained_kwargs)
+        tokenizer = (
+            None if vllm_kwargs.get("skip_tokenizer_init", False)
+            else AutoTokenizer.from_pretrained(model_name)
+        )
         if device is not None:
             vllm_kwargs.setdefault("device", str(device))
         return HookedVLLMModel(model_name, tokenizer, **vllm_kwargs)  # type: ignore

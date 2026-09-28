@@ -1,0 +1,23 @@
+{
+  "upstream_repository": "https://github.com/openai/sparse_autoencoder",
+  "upstream_source": "https://github.com/openai/sparse_autoencoder/blob/main/sparse_autoencoder/kernels.py",
+  "retrieved_date": "2026-09-23",
+  "remote_commit": null,
+  "retrieval": "Official GitHub rendered code was read with web. Raw byte download and git DNS failed. Three computational function bodies transcribed from that source; headers/import scope differ. This file is not claimed byte-identical to the entire upstream module.",
+  "license": "MIT",
+  "bundled_sha256": "835d7500fc0d94dbb1feb01b4369409356fcab8aa01022cc614bbcf8a702373d",
+  "kernel_ast_sha256": {
+    "triton_sparse_transpose_dense_matmul_kernel": "d74951d8ac5cb488884911d977c23be1c64057b033c57c7955637fa07df309a3",
+    "triton_sparse_dense_matmul_kernel": "7d79ed81592e1c9e992acf9748f488a35aa31bc4bbc361cf82904150fe6c5085",
+    "triton_dense_dense_sparseout_matmul_kernel": "986f7b70ba6ae4b1121455a88482ffaf80664444c154f0fe8eb421260a8ae1b6"
+  },
+  "local_kernel_body_modifications": [],
+  "local_adapters": [
+    "row bucketing and bounded K paging",
+    "direct original JIT calls bypassing upstream dense wrapper",
+    "FP32 accumulation and power-of-two channel padding",
+    "COO tail padding for defined masked-lane behavior",
+    "autograd input/output mapping"
+  ],
+  "hardware_validation": "not GPU/JIT tested in delivery environment"
+}
