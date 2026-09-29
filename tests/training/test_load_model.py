@@ -2,7 +2,6 @@ import sys
 
 import pytest
 import torch
-from mamba_lens import HookedMamba
 from transformer_lens import HookedTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -24,12 +23,13 @@ def gpt2_proxy_model():
 
 
 def test_load_model_works_with_mamba():
+    mamba_lens = pytest.importorskip("mamba_lens")
     model = load_model(
         model_class_name="HookedMamba",
         model_name="state-spaces/mamba-130m",
         device="cpu",
     )
-    assert isinstance(model, HookedMamba)
+    assert isinstance(model, mamba_lens.HookedMamba)
 
 
 def test_load_model_works_without_model_kwargs():

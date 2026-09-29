@@ -1008,6 +1008,8 @@ class LanguageModelSAETrainingRunner:
                 ),
                 sae_pp_size=self.sae_pp_size, hook_names=tuple(self.hook_names),
                 training_domains=sae_training_domains,
+                routing_transport=cfg.routing_transport,
+                routing_shm_slots=cfg.routing_shm_slots,
             )
         self._sync_run_paths_across_ranks()
 

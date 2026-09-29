@@ -221,6 +221,9 @@ def computation_dtype(vectors):
 def _columns(acts, known_columns=None):
     if known_columns is not None:
         columns = known_columns
+        if columns.numel() == acts.width:
+            # Sorted unique columns covering the shard are the identity map.
+            return columns, acts.feature_ids
         # O(S) integer map, not O(E) sorting. The selected entries are a subset
         # of the supplied eligible set, whose IDs must be sorted and unique.
         lookup = torch.full((acts.width,), -1, dtype=torch.int64, device=acts.device)
@@ -289,8 +292,9 @@ class _HybridDecoder(torch.autograd.Function):
                 out, ctx.groups = sparse_forward(vectors, values, ids, row_ids, offsets, opts)
             else:
                 out = vectors.new_zeros((nrows, d))
-                ww = vectors if plan.forward == 'local_dense' else vectors.index_select(0, columns)
-                jj = ids if plan.forward == 'local_dense' else inverse
+                identity = plan.forward == 'local_dense' or columns.numel() == width
+                ww = vectors if identity else vectors.index_select(0, columns)
+                jj = ids if identity else inverse
                 for lo, hi, a, b in ctx.tiles:
                     dense = _dense_tile(values, jj, row_ids, lo, hi, a, b, ww.shape[0])
                     out[lo:hi] = dense @ ww
@@ -311,8 +315,9 @@ class _HybridDecoder(torch.autograd.Function):
                     if plan.dvalues == 'sparse':
                         dv = sparse_dvalues(vectors, values, ids, rows, offsets, grad, opts, ctx.groups)
                     else:
-                        ww = vectors if plan.dvalues == 'local_dense' else vectors.index_select(0, ctx.columns)
-                        jj = ids if plan.dvalues == 'local_dense' else ctx.inverse
+                        identity = plan.dvalues == 'local_dense' or ctx.columns.numel() == vectors.shape[0]
+                        ww = vectors if identity else vectors.index_select(0, ctx.columns)
+                        jj = ids if identity else ctx.inverse
                         dv = torch.empty_like(values)
                         for lo, hi, a, b in ctx.tiles:
                             full_grad = grad[lo:hi] @ ww.T
@@ -329,8 +334,15 @@ class _HybridDecoder(torch.autograd.Function):
                         small = torch.zeros((c, vectors.shape[1]), device=vectors.device, dtype=accum_dtype)
                         for lo, hi, a, b in ctx.tiles:
                             dense = _dense_tile(values, jj, rows, lo, hi, a, b, c)
-                            small.add_((dense.T @ grad[lo:hi]).to(accum_dtype))
-                        if plan.dweight == 'local_dense':
+                            if dense.dtype == grad.dtype == accum_dtype:
+                                # Accumulate GEMM directly into dW, avoiding a
+                                # second [columns,d_in] result for every tile.
+                                small.addmm_(dense.T, grad[lo:hi])
+                            else:
+                                # Preserve FP32 accumulation of low-precision
+                                # tile products without upcasting both inputs.
+                                small.add_((dense.T @ grad[lo:hi]).to(accum_dtype))
+                        if plan.dweight == 'local_dense' or c == vectors.shape[0]:
                             dw = small.to(vectors.dtype)
                         else:
                             dw = torch.zeros_like(vectors)

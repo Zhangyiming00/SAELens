@@ -43,6 +43,31 @@ def test_accumulation_config_keeps_provider_batch_and_buffer():
     assert cfg.tokens_per_buffer == 32 * 8 * 4
 
 
+def test_exact_shm_topk_accumulation_keeps_global_microbatch():
+    from sae_lens.saes.topk_sae import TopKTrainingSAEConfig
+    cfg = LanguageModelSAERunnerConfig(
+        sae=TopKTrainingSAEConfig(d_in=32, d_sae=256, k=8),
+        streaming_mode=True, streaming_dp_batch_mode="exact",
+        gradient_accumulation_steps=3, train_batch_size_tokens=65,
+        training_tokens=65*7,
+    )
+    trainer = cfg.to_sae_trainer_config()
+    assert trainer.gradient_accumulation_steps == 3
+    assert trainer.train_batch_size_samples == 65
+    assert trainer.total_training_steps == 3
+
+
+@pytest.mark.parametrize("changes", [dict(streaming_dp_batch_mode="equal_cohort"),
+                                      dict(streaming_use_gpu_direct=True)])
+def test_streaming_accumulation_rejects_unverified_provider(changes):
+    from sae_lens.saes.topk_sae import TopKTrainingSAEConfig
+    with pytest.raises(ValueError, match="exact SHM TopK"):
+        LanguageModelSAERunnerConfig(
+            sae=TopKTrainingSAEConfig(d_in=32,d_sae=256,k=8),
+            **dict(dict(streaming_mode=True, streaming_dp_batch_mode="exact",
+                        gradient_accumulation_steps=2), **changes))
+
+
 @pytest.mark.parametrize("schedule", ["eager", "one_hook_lag", "after_backward"])
 def test_parameter_gather_schedule_reaches_trainer(schedule):
     cfg = LanguageModelSAERunnerConfig(
@@ -139,6 +164,9 @@ def test_LanguageModelSAERunnerConfig_hook_eval_deprecated_usage():
     ("field", "value", "message"),
     [
         ("routing_dp_batch_mode", "invalid", "routing_dp_batch_mode"),
+        ("routing_transport", "invalid", "routing_transport"),
+        ("routing_shm_slots", 0, "routing_shm_slots"),
+        ("routing_shm_slots", True, "routing_shm_slots"),
         ("streaming_dp_batch_mode", "invalid", "streaming_dp_batch_mode"),
     ],
 )
@@ -148,6 +176,17 @@ def test_dp_batch_modes_reject_invalid_values(field, value, message):
             sae=StandardTrainingSAEConfig(d_in=10, d_sae=10),
             **{field: value},
         )
+
+
+def test_routing_transport_defaults_and_checkpoint_config_roundtrip():
+    cfg = LanguageModelSAERunnerConfig(sae=StandardTrainingSAEConfig(d_in=10, d_sae=10))
+    assert cfg.routing_transport == "shm_async"
+    assert cfg.routing_shm_slots == 2
+    cfg.routing_transport = "nccl"
+    cfg.routing_shm_slots = 3
+    restored = LanguageModelSAERunnerConfig.from_dict(cfg.to_dict())
+    assert restored.routing_transport == "nccl"
+    assert restored.routing_shm_slots == 3
 
 
 def test_streaming_mixing_streams_rejects_negative_value():

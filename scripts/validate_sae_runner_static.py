@@ -56,6 +56,7 @@ def _worker(
     uneven_filter=False,
     accumulation_steps=1,
     bucket_cap_mb=None,
+    routing_transport="shm_async",
 ):
     os.environ.update(
         RANK=str(rank),
@@ -138,6 +139,7 @@ def _worker(
         gradient_accumulation_steps=accumulation_steps,
         ddp_bucket_cap_mb=bucket_cap_mb,
         routing_dp_batch_mode=batch_mode,
+        routing_transport=routing_transport,
         activations_mixing_fraction=0.5,
         device=f"cuda:{rank}",
         act_store_device=f"cuda:{rank}",
@@ -461,6 +463,7 @@ def main():
         "--layout", choices=("full", "prefix", "placement", "dp3", "dp1"), default="full"
     )
     parser.add_argument("--batch-mode", choices=("equal", "exact"), default="equal")
+    parser.add_argument("--routing-transport", choices=("shm_async", "nccl"), default="shm_async")
     parser.add_argument("--global-batch", type=int, choices=(32, 4096), default=32)
     parser.add_argument("--placement-amp", action="store_true")
     parser.add_argument("--uneven-filter", action="store_true")
@@ -508,6 +511,7 @@ def main():
         "sae_lens/training/multi_sae_trainer.py",
         "sae_lens/training/runtime_checkpoint.py",
         "sae_lens/training/activations_store.py",
+        "sae_lens/training/async_routing_transport.py",
         "sae_lens/training/mixing_buffer.py",
         "sae_lens/training/sae_train_unit.py",
         "sae_lens/training/gradient_window.py",
@@ -559,6 +563,7 @@ def main():
                     args.uneven_filter,
                     args.accumulation_steps,
                     args.ddp_bucket_cap_mb,
+                    args.routing_transport,
                 ),
                 timeout=120 if args.failure else 600,
             )

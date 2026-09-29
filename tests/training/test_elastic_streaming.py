@@ -34,6 +34,21 @@ from scripts.elastic_streaming_control import (
 )
 
 
+@pytest.mark.parametrize("pending,active", [(True, False), (False, True)])
+def test_native_elastic_capture_rejects_incomplete_gradient_window(pending, active):
+    from sae_lens.training.elastic_runtime_state import capture_runtime_state
+
+    unit = MagicMock()
+    trainer = SimpleNamespace(
+        units={"hook": unit},
+        _runtime_update_pending=pending,
+        _gradient_window_active=active,
+    )
+    with pytest.raises(RuntimeError, match="completed native SAE updates"):
+        capture_runtime_state(trainer, source_global_rank=0)
+    unit.wait_params.assert_not_called()
+
+
 def test_elastic_streaming_cli_implies_streaming_and_uses_default_control_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -617,6 +632,41 @@ def test_exact_provider_cutover_poll_does_not_consume_next_batch(monkeypatch) ->
     assert provider.pending_reconfigure == (5, 3)
     assert provider.global_tokens_consumed == 0
     assert torch.equal(next(provider)[:, 0], torch.arange(12, dtype=torch.float32))
+
+
+def test_failed_cutover_preserves_first_error_and_reaches_every_dp_rank(tmp_path, monkeypatch):
+    layout = ElasticStreamingLayout.from_world_size(
+        world_size=3, vllm_tp_size=1, sae_tp_size=1, sae_pp_size=1,
+        permanent_vllm_dp=1, permanent_sae_dp=1,
+    )
+    controller = ElasticStreamingController(tmp_path / "control.json", layout)
+    controller.initialize()
+    controller.request(2)
+    controller.fail(epoch=1, error="joining rank lost its model")
+    controller.fail(epoch=1, error="secondary stale-epoch failure")
+    assert controller.read().error == "joining rank lost its model"
+    with pytest.raises(RuntimeError, match="joining rank lost its model"):
+        controller.finish(epoch=0)
+    # Replay the collective payload on a non-source DP member. Both must raise
+    # the same original error without consuming an activation or hanging.
+    messages = []
+    objects = []
+    monkeypatch.setattr(dist, "get_global_rank", lambda _group, rank: rank)
+    monkeypatch.setattr(dist, "broadcast", lambda tensor, **_kw: messages.append(tensor.clone()))
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda payload, **_kw: objects.append(payload[0]))
+    def provider(rank):
+        return ExactDataParallelBatchProvider(
+            source=iter([]) if rank == 1 else None, dp_group=MagicMock(), dp_idx=rank,
+            dp_size=2, source_dp_idx=1, device=torch.device("cpu"),
+            dtype=torch.float32, d_model=2,
+            reconfigure_poll=lambda: controller.requested_target(local_epoch=0),
+        )
+    with pytest.raises(RuntimeError, match="joining rank lost its model"):
+        provider(1).poll_reconfigure()
+    monkeypatch.setattr(dist, "broadcast", lambda tensor, **_kw: tensor.copy_(messages.pop(0)))
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda payload, **_kw: payload.__setitem__(0, objects.pop(0)))
+    with pytest.raises(RuntimeError, match="joining rank lost its model"):
+        provider(0).poll_reconfigure()
 
 
 def test_multi_trainer_cutover_stops_before_fetch_and_skips_final_checkpoint() -> None:

@@ -4,10 +4,6 @@ from pathlib import Path
 
 import pytest
 import torch
-from dictionary_learning.trainers.matryoshka_batch_top_k import (
-    MatryoshkaBatchTopKSAE,
-    MatryoshkaBatchTopKTrainer,
-)
 
 from sae_lens.saes.batchtopk_sae import BatchTopKTrainingSAE
 from sae_lens.saes.jumprelu_sae import JumpReLUSAE
@@ -338,7 +334,8 @@ def test_MatryoshkaBatchTopKTrainingSAE_matches_dictionary_learning() -> None:
 
     # Create comparison SAE from dictionary_learning
     # group_sizes=[2, 1, 1, 6] corresponds to widths [2, 3, 4, 10]
-    comparison_sae = MatryoshkaBatchTopKSAE(
+    comparison_module = pytest.importorskip("dictionary_learning.trainers.matryoshka_batch_top_k")
+    comparison_sae = comparison_module.MatryoshkaBatchTopKSAE(
         activation_dim=5,
         dict_size=10,
         k=2,
@@ -391,7 +388,8 @@ def test_MatryoshkaBatchTopKTrainingSAE_matches_dictionary_learning_losses() -> 
 
     # Create comparison trainer from dictionary_learning
     # group_fractions=[0.2, 0.1, 0.1, 0.6] corresponds to widths [2, 3, 4, 10]
-    comparison_trainer = MatryoshkaBatchTopKTrainer(
+    comparison_module = pytest.importorskip("dictionary_learning.trainers.matryoshka_batch_top_k")
+    comparison_trainer = comparison_module.MatryoshkaBatchTopKTrainer(
         steps=100,
         activation_dim=5,
         dict_size=10,

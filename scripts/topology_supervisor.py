@@ -8,7 +8,7 @@ topology change. The /dev/shm buffer survives across restarts.
 Usage:
     python3 scripts/topology_supervisor.py \\
         --run-dir /checkpoints/my_run \\
-        --worker-script scripts/run_sae_runner_gpu.py \\
+        --worker-script run_sae_runner_gpu.py \\
         --worker-args "--model-name /data/Llama-3.1-8B --streaming-mode ..." \\
         --vllm-tp 2 --vllm-dp 2 --sae-tp 1 \\
         --num-gpus 8
@@ -56,7 +56,7 @@ def _active_topology_process_pids(
     markers = _run_dir_markers(run_dir)
     process_markers = (
         "scripts/topology_supervisor.py",
-        "scripts/run_sae_runner_gpu.py",
+        "run_sae_runner_gpu.py",
         "torch.distributed.run",
     )
     pids: list[int] = []
@@ -1350,7 +1350,7 @@ def run_supervisor(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Topology supervisor for streaming SAE training")
     parser.add_argument("--run-dir", required=True, help="Directory for control state and signal files")
-    parser.add_argument("--worker-script", default="scripts/run_sae_runner_gpu.py")
+    parser.add_argument("--worker-script", default="run_sae_runner_gpu.py")
     parser.add_argument(
         "--worker-args",
         default="",

@@ -209,10 +209,8 @@ results*/
 logs/
 scripts/tests/
 scripts/integration_tests/
-scripts/run_sae_runner_gpu.py
 *.tar.gz
 scripts/scripts/*
-scripts/profile/*
 scripts/analyze/*
 scripts/run_sae_runner_*.sh
 scripts/profile_vllm_*

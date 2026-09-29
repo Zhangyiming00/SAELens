@@ -26,6 +26,7 @@ from sae_lens import __version__
 from sae_lens.config import SAETrainerConfig
 from sae_lens.constants import (
     ACTIVATION_SCALER_CFG_FILENAME,
+    DEAD_HISTORY_FILENAME,
     FSDP_OPTIMIZER_STATE_FILENAME_TEMPLATE,
     MSE_HISTORY_FILENAME,
     SAE_CFG_FILENAME,
@@ -153,6 +154,141 @@ Evaluator = Callable[[T_TRAINING_SAE, DataProvider, ActivationScaler], dict[str,
 FSDP_OPTIMIZER_STATE_FORMAT = "fsdp_sharded"
 
 
+class DeadFeatureHistory:
+    """Sample dead candidates and actual AuxK winners for one optimizer update.
+
+    D counts the replicated global mask once. E counts selected entries on each
+    owner TP shard over all DP tokens/microbatches, including selected zeros.
+    Only sampled updates reduce small count tensors; no activation is retained.
+    """
+
+    def __init__(self, cfg, models, *, writer, pp_rank=0, dp_group=None,
+                 runtime=None, append_logs=False):
+        self.interval = getattr(cfg, "save_dead_every_n_steps", 0)
+        if type(self.interval) is not int or self.interval < 0:
+            raise ValueError("save_dead_every_n_steps must be a nonnegative integer")
+        self.path = None
+        self.pending = {}
+        self.pending_aux = {}
+        self.pending_step = None
+        self.enabled = bool(self.interval and cfg.output_path is not None and models)
+        if not self.enabled:
+            return
+        self.models = models
+        distributed = dist.is_available() and dist.is_initialized()
+        context = runtime.require_local() if runtime is not None else None
+        first = next(iter(models.values()))
+        tp_group = context.tp_group if context is not None else getattr(first, "_tp_group", None)
+        rank = dist.get_rank() if distributed else 0
+        tp_ranks = (list(dist.get_process_group_ranks(tp_group))
+                    if distributed and tp_group is not None else [rank])
+        self.tp_size = len(tp_ranks)
+        self.tp_rank = tp_ranks.index(rank)
+        self.tp_group = tp_group
+        self.dp_group = dp_group
+        self.dp_size = dist.get_world_size(dp_group) if distributed and dp_group is not None else 1
+        self.widths = {hook: model.cfg.d_sae for hook, model in models.items()}
+        if any(width % self.tp_size for width in self.widths.values()):
+            raise ValueError("Dead history requires feature widths divisible by TP")
+        self.metadata = dict(
+            schema_version=2, mask_timing="update_start", aux_winner_scope="global_update",
+            writer_rank=rank,
+            pp_rank=pp_rank, tp_size=self.tp_size, tp_global_ranks=tp_ranks,
+            dp_size=self.dp_size,
+            dead_feature_window=cfg.dead_feature_window,
+        )
+        if not writer:
+            return
+        self.path = Path(cfg.output_path) / (
+            DEAD_HISTORY_FILENAME if pp_rank == 0 else f"dead_history_pp{pp_rank}.jsonl"
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not (append_logs or getattr(cfg, "append_history_logs", False)):
+            self.path.write_text("")
+
+    @torch.no_grad()
+    def capture(self, hook, mask, step):
+        if not self.enabled:
+            return
+        model = self.models[hook]
+        model._record_aux_winners = step % self.interval == 0
+        model._aux_winner_entries = None
+        if not model._record_aux_winners:
+            return
+        if mask.ndim != 1 or mask.numel() != self.widths[hook] or mask.dtype != torch.bool:
+            raise ValueError("Dead history expects the full global boolean feature mask")
+        if self.pending_step != step:
+            self.pending.clear()
+            self.pending_aux.clear()
+            self.pending_step = step
+        if self.path is not None:
+            self.pending[hook] = mask.reshape(self.tp_size, -1).sum(dim=1)
+        # E columns, B (only TP0 contributes), missing-observation count.
+        self.pending_aux[hook] = torch.zeros(self.tp_size + 2, device=mask.device, dtype=torch.int64)
+
+    @torch.no_grad()
+    def capture_aux(self, hook, valid_tokens):
+        if hook not in self.pending_aux:
+            return
+        entries = getattr(self.models[hook], "_aux_winner_entries", None)
+        if valid_tokens:
+            if entries is None:
+                self.pending_aux[hook][-1] += 1
+            else:
+                self.pending_aux[hook][self.tp_rank] += entries
+            if self.tp_rank == 0:
+                self.pending_aux[hook][-2] += valid_tokens
+        # Dummy forwards keep the collective schedule, but are not tokens.
+        self.models[hook]._aux_winner_entries = None
+
+    @torch.no_grad()
+    def write(self, step, n_training_samples, **metrics):
+        if not self.pending_aux or self.pending_step != step:
+            return
+        hooks = list(self.pending_aux)
+        aux = torch.stack([self.pending_aux[h] for h in hooks])
+        if self.dp_size > 1:
+            dist.all_reduce(aux, group=self.dp_group)
+        if self.tp_size > 1:
+            dist.all_reduce(aux, group=self.tp_group)
+        self.pending_aux.clear()
+        self.pending_step = None
+        for hook in hooks:
+            self.models[hook]._record_aux_winners = False
+            self.models[hook]._aux_winner_entries = None
+        if self.path is None:
+            return
+        # One small host copy per sampled optimizer update, after training.
+        counts = torch.cat((torch.stack([self.pending[h] for h in hooks]), aux), dim=1).cpu().tolist()
+        self.pending.clear()
+        record = dict(self.metadata, step=step, n_training_samples=n_training_samples,
+                      **metrics, hooks={})
+        for hook, row in zip(hooks, counts):
+            values = row[:self.tp_size]
+            entries, tokens, missing = row[self.tp_size:-2], row[-2], row[-1]
+            width = self.widths[hook]
+            local_width = width // self.tp_size
+            total = sum(values)
+            record["hooks"][hook] = dict(
+                d_sae=width, total_dead=total, dead_fraction=total / width,
+                dead_by_tp_rank=values,
+                dead_fraction_by_tp_rank=[value / local_width for value in values],
+                feature_ranges=[[i * local_width, (i + 1) * local_width]
+                                for i in range(self.tp_size)],
+                max_to_mean=(max(values) * self.tp_size / total if total else None),
+                aux_winner_entries_by_tp_rank=entries if not missing else None,
+                aux_valid_tokens=tokens,
+                aux_winners_per_token_by_tp_rank=(
+                    [value / tokens for value in entries] if tokens and not missing else None
+                ),
+                aux_winner_max_to_mean=(max(entries) * self.tp_size / sum(entries)
+                                        if sum(entries) and not missing else None),
+                aux_winner_observed=not bool(missing),
+            )
+        with self.path.open("a") as handle:
+            handle.write(json.dumps(record, allow_nan=False) + "\n")
+
+
 class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
     """
     Trainer for Sparse Autoencoder (SAE) models.
@@ -206,6 +342,15 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self.timing_history_path: Path | None = None
         self.memory_history_path: Path | None = None
         self.memory_timeline_path: Path | None = None
+        runtime_hooks = runtime.require_local().domain.hooks if runtime is not None else ()
+        self._dead_history_hook = runtime_hooks[0] if runtime_hooks else "sae"
+        self.dead_feature_history = DeadFeatureHistory(
+            cfg, {self._dead_history_hook: self._base_sae},
+            writer=getattr(cfg, "save_dead_every_n_steps", 0) > 0 and self._is_metric_writer_rank(),
+            dp_group=self.dp_group,
+            pp_rank=runtime.domains.index(runtime.require_local().domain) if runtime is not None else 0,
+            runtime=runtime, append_logs=append_logs,
+        )
 
         _update_sae_lens_training_version(self._base_sae)
 
@@ -527,6 +672,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                 self._run_and_log_evals()
 
             self._record_mse_if_needed(step_output)
+            self.dead_feature_history.write(
+                self.n_training_steps + 1, self.n_training_samples, **window_metrics(self),
+            )
             self._record_timing_if_needed(
                 vllm_step_time_s=vllm_step_time_s,
                 transfer_time_s=transfer_time_s,
@@ -976,6 +1124,9 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
             n_training_steps=self.n_training_steps,
             is_logging_step=self._is_logging_step(),
         )
+        self.dead_feature_history.capture(
+            self._dead_history_hook, step_input.dead_neuron_mask, self.n_training_steps + 1,
+        )
         # In FSDP mode self.sae is the FSDP wrapper; calling self.sae(step_input)
         # routes through forward() which triggers FSDP's parameter-gather lifecycle.
         # In manual mode self.sae == self._base_sae and the dispatch in
@@ -1001,6 +1152,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                     self.unit.forward(step_input) if self.unit
                     else self.sae(step_input)  # type: ignore[arg-type]
                 )
+        self.dead_feature_history.capture_aux(self._dead_history_hook, sae_in.shape[0])
 
         if self._profile_memory:
             _peak_fwd_alloc = torch.cuda.max_memory_allocated(self._base_sae.device) / 1024**2

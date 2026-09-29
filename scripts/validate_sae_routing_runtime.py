@@ -19,6 +19,7 @@ from tests.test_sae_runtime import _runtime_worker  # noqa: E402, TID251
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--routing-transport", choices=("shm_async", "nccl"), default="shm_async")
     args = parser.parse_args()
     if torch.cuda.device_count() < 4:
         parser.error("Four CUDA GPUs are required; a skip is not acceptance")
@@ -42,7 +43,7 @@ def main():
     )
     mp.spawn(
         _routing_worker,
-        args=(f"file://{output / 'routing_rdzv'}", str(output)),
+        args=(f"file://{output / 'routing_rdzv'}", str(output), args.routing_transport),
         nprocs=4,
     )
     reports = {
@@ -58,6 +59,7 @@ def main():
         "ddp": "pytorch_per_hook",
         "optimizer": "independent_adam_per_hook",
         "schedule": "synchronous",
+        "routing_transport": args.routing_transport,
         "steps": 6,
         "disk_resume_step": 3,
         "reports": reports,

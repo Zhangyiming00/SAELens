@@ -24,6 +24,8 @@ Disjoint (``disjoint=True``, used by streaming_mode v1):
 
 from __future__ import annotations
 
+from contextlib import suppress
+
 import torch.distributed as dist
 
 from sae_lens.sae_runtime import SAERuntime, SAETrainingDomain
@@ -112,6 +114,19 @@ def _reset() -> None:
     global _streaming_nccl_groups, _gloo_ctrl_group, _pp_coord_groups
 
     global _sae_runtime, _routing_groups
+    if _sae_runtime is not None:
+        transport = getattr(_sae_runtime, "routing_transport_instance", None)
+        if transport is not None:
+            transport.close()
+        directory = getattr(_sae_runtime, "routing_shm_directory", None)
+        if directory is not None:
+            # Each writer owns its ring files. Any last closer may remove the
+            # empty private directory; never touch another run's SHM files.
+            from pathlib import Path
+            path = Path(directory)
+            (path / f"error_rank{dist.get_rank()}").unlink(missing_ok=True)
+            with suppress(OSError):
+                path.rmdir()
     if dist.is_initialized():
         for group in reversed(_routing_groups):
             dist.destroy_process_group(group)
@@ -635,6 +650,7 @@ def initialize_sae_routing(
     *, P: int, Q: int, vllm_tp_size: int, sae_tp_size: int,
     batch_size: int, hook_names: tuple[str, ...], sae_pp_size: int = 1,
     disjoint: bool = False, training_domains: tuple[SAETrainingDomain, ...] | None = None,
+    routing_transport: str = "shm_async", routing_shm_slots: int = 2,
 ) -> SAERuntime:
     """Static routing entry: initialize Megatron domains and register receiver metadata.
 
@@ -643,6 +659,10 @@ def initialize_sae_routing(
     """
     if _initialized:
         raise RuntimeError("SAE routing is already initialized; close the previous runtime first")
+    if routing_transport not in ("shm_async", "nccl"):
+        raise ValueError("routing_transport must be 'shm_async' or 'nccl'")
+    if type(routing_shm_slots) is not int or routing_shm_slots < 1:
+        raise ValueError("routing_shm_slots must be a positive integer")
     if len(set(hook_names)) != len(hook_names) or (Q > 0 and not hook_names):
         raise ValueError("Static SAE routing requires distinct, nonempty hook names")
     runtime = None
@@ -661,6 +681,31 @@ def initialize_sae_routing(
             batch_size=batch_size, sae_pp_size=sae_pp_size, disjoint=disjoint,
             runtime=runtime, hook_names=hook_names,
         )
+        assert _sae_runtime is not None
+        _sae_runtime.routing_transport = routing_transport
+        _sae_runtime.routing_shm_slots = routing_shm_slots
+        if routing_transport == "shm_async" and _routing_table:
+            import socket
+            import tempfile
+            from pathlib import Path
+
+            # Initialization only. Background transport uses no process group.
+            namespace = [None]
+            if dist.get_rank() == 0:
+                try:
+                    namespace[0] = dict(directory=tempfile.mkdtemp(prefix="sae_routing_", dir="/dev/shm"))
+                except OSError as exc:
+                    namespace[0] = dict(error=str(exc))
+            dist.broadcast_object_list(namespace, src=0, group=_sae_runtime.control_group)
+            if "error" in namespace[0]:
+                raise RuntimeError(f"Cannot create routing SHM: {namespace[0]['error']}")
+            directory = namespace[0]["directory"]
+            _sae_runtime.routing_shm_directory = directory
+            peers = [None] * dist.get_world_size()
+            dist.all_gather_object(peers, (socket.gethostname(), Path(directory).is_dir()),
+                                   group=_sae_runtime.control_group)
+            if len({host for host, _ in peers}) != 1 or not all(visible for _, visible in peers):
+                raise ValueError("shm_async routing requires one shared /dev/shm namespace; use routing_transport='nccl' across nodes")
     except BaseException:
         _reset()
         if runtime is not None:

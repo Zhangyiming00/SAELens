@@ -159,7 +159,8 @@ def prepare_auxk_dense(scores: torch.Tensor, k: int, eligible: torch.Tensor,
                        num_eligible: int, group: dist.ProcessGroup | None = None, *,
                        decoder: str = "auto", complement: str = "auto",
                        selection_policy: str = "auto", protocol: str = "auto",
-                       key_backend: str = "torch", tie_policy: str = "stable_id") -> tuple[torch.Tensor, torch.Tensor | None, AuxKDensePlan]:
+                       key_backend: str = "torch", tie_policy: str = "stable_id",
+                       winner_count=None) -> tuple[torch.Tensor, torch.Tensor | None, AuxKDensePlan]:
     """Return local values, optional ORIGINAL local feature columns, and plan.
 
     columns=None: values already have local shard width (native decoder).
@@ -184,12 +185,15 @@ def prepare_auxk_dense(scores: torch.Tensor, k: int, eligible: torch.Tensor,
                           selection_policy=selection_policy, protocol=protocol)
     if plan.selection == "topk":
         acts = sharded_auxk(scores, k, eligible, num_eligible, group, sparse=False,
-                            policy=selection_policy, protocol=protocol, key_backend=key_backend, tie_policy=tie_policy)
+                            policy=selection_policy, protocol=protocol, key_backend=key_backend, tie_policy=tie_policy,
+                            winner_count=winner_count)
         if plan.decoder == "local_dense":
             return acts, None, plan
         columns = eligible.nonzero(as_tuple=True)[0]
         return _DeadColumnValues.apply(acts, columns), columns, plan
     if plan.selection == "select_all" and plan.decoder == "local_dense":
+        if winner_count is not None:
+            winner_count(eligible.sum() * math.prod(scores.shape[:-1]))
         return torch.where(eligible, scores, 0.0), None, plan
     columns = eligible.nonzero(as_tuple=True)[0]
     packed = _DeadColumnValues.apply(scores, columns)
@@ -199,7 +203,11 @@ def prepare_auxk_dense(scores: torch.Tensor, k: int, eligible: torch.Tensor,
         # Torch exact keys are the correctness backend for arbitrary column IDs;
         # main/general TopK still respect topk_key_backend. No dynamic global gather.
         keep = _complement_mask(flat.detach(), ids, plan.exclude_k, group)
+        if winner_count is not None:
+            winner_count(keep.sum())
         packed = torch.where(keep.reshape(packed.shape), packed, 0.0)
+    elif winner_count is not None:
+        winner_count(packed.numel())
     if plan.decoder == "compact_dense":
         return packed, columns, plan
     acts = scores.new_zeros(scores.shape).index_copy(-1, columns, packed)

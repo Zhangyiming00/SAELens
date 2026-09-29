@@ -23,9 +23,11 @@ if "sae_lens" not in sys.modules:
     _pkg.__path__ = [str(Path(__file__).resolve().parents[2] / "sae_lens")]
     sys.modules["sae_lens"] = _pkg
 
+from sae_lens.auxk_compact import compact_aux_decode, prepare_auxk_dense
 from sae_lens.sharded_sparse import scale_sparse_features, sparse_decode
 from sae_lens.sharded_topk import (
     launch_sharded_topk,
+    sharded_auxk,
     sharded_firing_counts,
     sharded_topk,
 )
@@ -166,6 +168,9 @@ def load_harness_class():
         TrainStepOutput=Output,
         launch_sharded_topk=launch_sharded_topk,
         sharded_topk=sharded_topk,
+        sharded_auxk=sharded_auxk,
+        prepare_auxk_dense=prepare_auxk_dense,
+        compact_aux_decode=compact_aux_decode,
         sharded_firing_counts=sharded_firing_counts,
         sparse_decode=sparse_decode,
         scale_sparse_features=scale_sparse_features,
@@ -245,10 +250,12 @@ def make_harness(global_weights, group, backend, rescale=True, protocol="auto"):
     rank = dist.get_rank(group) if group is not None else 0
     width, d = enc.shape[0] // size, enc.shape[1]
     model.tp_size, model.tp_rank, model._tp_group = size, rank, group
+    model._decoupled_execution = False
     model.cfg = SimpleNamespace(
         d_sae=enc.shape[0],
         d_in=d,
         k=2,
+        auxk=None,
         topk_backend=backend,
         topk_candidate_protocol=protocol,
         sparse_decoder_backend="torch",

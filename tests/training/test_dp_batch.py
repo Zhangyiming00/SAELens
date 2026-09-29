@@ -237,6 +237,23 @@ def test_logical_streaming_mixer_matches_independent_legacy_mixers() -> None:
     assert sorted(torch.cat(actual)[:, 0].tolist()) == list(range(120))
 
 
+@pytest.mark.parametrize("total", [1, 2, 6, 8, 149])
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_logical_streaming_mixer_keeps_every_streams_partial_eof(total, shuffle):
+    values = torch.arange(total, dtype=torch.float32).reshape(-1, 1)
+    source = iter([{"h0": part, "h1": part + 1000} for part in values.split(10)])
+    provider = LogicalStreamingMixingProvider(
+        source=source, global_batch_size=7, stream_count=3, buffer_size_per_stream=20,
+        mix_fraction=.5, shuffle=shuffle, seed=42,
+    )
+    batches = list(provider)
+    assert sum(len(batch["h0"]) for batch in batches) == total
+    assert sorted(torch.cat([b["h0"] for b in batches])[:, 0].tolist()) == list(range(total))
+    for batch in batches:
+        assert 0 < len(batch["h0"]) <= 7
+        torch.testing.assert_close(batch["h1"], batch["h0"] + 1000)
+
+
 @pytest.mark.parametrize("stream_count", [3, 5])
 def test_logical_streaming_mixer_nondivisible_batch_conserves_chunked_source(
     stream_count: int,

@@ -84,6 +84,7 @@ from sae_lens.training.runtime_checkpoint import (
 )
 from sae_lens.training.sae_train_unit import SAETrainUnit, UnitOptimizers
 from sae_lens.training.sae_trainer import (
+    DeadFeatureHistory,
     SaveCheckpointFn,
     _log_feature_sparsity,
     _unwrap_item,
@@ -507,6 +508,12 @@ class MultiSAETrainer:
 
         configure_runtime_checkpoints(self)
         should_write_logs = self._is_metric_writer_rank()
+        self.dead_feature_history = DeadFeatureHistory(
+            cfg, self.base_sae_by_hook,
+            writer=bool(self.hook_names) and self._dp_rank() == 0 and self._tp_rank() == 0,
+            pp_rank=self._pp_rank(), dp_group=self.dp_group, runtime=runtime,
+            append_logs=append_logs,
+        )
         if (
             should_write_logs
             and cfg.output_path is not None
@@ -871,6 +878,9 @@ class MultiSAETrainer:
                 memory_stats = {}
 
             self._record_mse_if_needed(outputs, local_n)
+            self.dead_feature_history.write(
+                self.n_training_steps + 1, self.n_training_samples, **window_metrics(self),
+            )
             vllm_step_time_s = data_timing["vllm_step_time_s"]
             transfer_time_s = data_timing["transfer_time_s"]
             timing = self._global_timing_if_needed(
@@ -1018,21 +1028,27 @@ class MultiSAETrainer:
             # No unscale/step/update: the scaler stays READY and its growth
             # counter, like Adam moments and LR, does not advance on empty steps.
             self.optimizer.zero_grad(set_to_none=True)
+            for hook in self.hook_names:
+                self.dead_feature_history.capture_aux(hook, 0)
             return outputs, phase_timing
         if self._ddp_opt_overlap_v2:
-            return self._train_step_ddp_optimizer_overlap_v2(
+            result = self._train_step_ddp_optimizer_overlap_v2(
                 batch_by_hook,
                 local_n,
                 loss_scale,
                 phase_timing,
             )
-        if self.backward_mode == "combined":
-            return self._train_step_combined_backward(
+        elif self.backward_mode == "combined":
+            result = self._train_step_combined_backward(
                 batch_by_hook, local_n, loss_scale, phase_timing
             )
-        return self._train_step_sequential_backward(
-            batch_by_hook, local_n, loss_scale, phase_timing
-        )
+        else:
+            result = self._train_step_sequential_backward(
+                batch_by_hook, local_n, loss_scale, phase_timing
+            )
+        for hook in self.hook_names:
+            self.dead_feature_history.capture_aux(hook, batch_by_hook[hook].shape[0])
+        return result
 
     def _tp_world_size(self) -> int:
         group = self._tp_group()
@@ -1579,12 +1595,12 @@ class MultiSAETrainer:
         return module
 
     def _build_step_input(self, hook_name: str, acts: torch.Tensor) -> TrainStepInput:
+        mask = (self.n_forward_passes_since_fired_by_hook[hook_name]
+                > self.cfg.dead_feature_window).bool()
+        self.dead_feature_history.capture(hook_name, mask, self.n_training_steps + 1)
         return TrainStepInput(
             sae_in=acts,
-            dead_neuron_mask=(
-                self.n_forward_passes_since_fired_by_hook[hook_name]
-                > self.cfg.dead_feature_window
-            ).bool(),
+            dead_neuron_mask=mask,
             coefficients={},
             n_training_steps=self.n_training_steps,
             is_logging_step=False,

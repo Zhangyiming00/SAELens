@@ -119,6 +119,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-batches-in-buffer", type=int, default=None)
     parser.add_argument("--activations-mixing-fraction", type=float, default=0.5)
     parser.add_argument("--act-store-device", default="cuda")
+    parser.add_argument("--routing-transport", choices=["shm_async", "nccl"], default="nccl",
+        help="Routing activation transport: asynchronous SHM (default), or the legacy NCCL P2P/TP broadcast path. Local source-rank slices stay on device.")
+    parser.add_argument("--routing-shm-slots", type=int, default=2,
+        help="Bounded SHM/staging slots per remote routing edge (default 2).")
     parser.add_argument("--routing-dp-batch-mode", choices=["equal", "exact"], default="equal",
         help=(
             "Routing batch ownership. 'equal' keeps the legacy divisible per-DP "
@@ -192,6 +196,10 @@ def parse_args() -> argparse.Namespace:
 
     # 5. Profiling parameters
     parser.add_argument("--save-mse-every-n-steps", type=int, default=32)
+    parser.add_argument(
+        "--save-dead-every-n-steps", type=int, default=0,
+        help="Record dead candidates D and actual AuxK winners E/B by TP shard every N optimizer updates; 0 disables it. Writes dead_history.jsonl (dead_history_ppN.jsonl for later PP stages) under output-path.",
+    )
     parser.add_argument("--save-timing-every-n-steps", type=int, default=512)
     parser.add_argument("--save-memory-every-n-steps", type=int, default=512)
     parser.add_argument(
@@ -240,7 +248,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--append-history-logs", action="store_true", default=False,
         help=(
-            "Append mse/timing history logs instead of truncating them at trainer "
+            "Append mse/dead/timing history logs instead of truncating them at trainer "
             "startup. Topology-supervisor phases use this to preserve each phase."
         ),
     )
@@ -724,12 +732,12 @@ def _cleanup_topology_runner_runtime() -> int:
     """Stop a stale topology runner and remove its shared-memory artifacts."""
     try:
         try:
-            from scripts.run_topology_switch_runner_gpu import (
+            from run_topology_switch_runner_gpu import (
                 _resolve_run_dir,
                 _terminate_existing_run_processes,
             )
         except ImportError:
-            launcher_path = Path(__file__).resolve().parent / "scripts" / "run_topology_switch_runner_gpu.py"
+            launcher_path = Path(__file__).resolve().parent / "run_topology_switch_runner_gpu.py"
             spec = importlib.util.spec_from_file_location(
                 "_saelens_topology_switch_runner", launcher_path
             )
@@ -1369,6 +1377,7 @@ def main() -> None:
         save_final_checkpoint=args.save_final_checkpoint,
         output_path=output_path,
         save_mse_every_n_steps=args.save_mse_every_n_steps,
+        save_dead_every_n_steps=args.save_dead_every_n_steps,
         save_timing_every_n_steps=args.save_timing_every_n_steps,
         save_memory_every_n_steps=args.save_memory_every_n_steps,
         record_memory_empty_cache=args.record_memory_empty_cache,
@@ -1415,6 +1424,8 @@ def main() -> None:
         fsdp_forward_prefetch=args.fsdp_forward_prefetch,
         fsdp_sharding_strategy=args.fsdp_sharding_strategy,
         routing_dp_batch_mode=args.routing_dp_batch_mode,
+        routing_transport=args.routing_transport,
+        routing_shm_slots=args.routing_shm_slots,
         streaming_dp_batch_mode=args.streaming_dp_batch_mode,
         streaming_mode=args.streaming_mode,
         streaming_chunk_size_tokens=args.streaming_chunk_size_tokens,
@@ -1516,6 +1527,8 @@ def main() -> None:
         print(f"  fsdp_sharding_strategy={args.fsdp_sharding_strategy}")
     if args.save_mse_every_n_steps > 0:
         print(f"  save_mse_every_n_steps={args.save_mse_every_n_steps}")
+    if args.save_dead_every_n_steps > 0:
+        print(f"  save_dead_every_n_steps={args.save_dead_every_n_steps}")
     if args.save_timing_every_n_steps > 0:
         print(f"  save_timing_every_n_steps={args.save_timing_every_n_steps}")
     if args.save_vllm_memory_every_n_steps > 0:

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Discrete-event simulator for SAELens SHM streaming scheduling.
+"""Legacy discrete-event simulator for SAELens SHM streaming v1 scheduling.
+
+Its SAE oracle predates native Megatron. For the current timing model and its
+SHM validation limitations see docs/megatron_execution_time.md.
 
 This simulator intentionally separates *intrinsic* operation timing from
 streaming scheduling:
@@ -74,7 +77,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_VLLM_SIM = HERE / "simulate_vllm_time.py"
+DEFAULT_VLLM_SIM = HERE / "other" / "simulate_vllm_time.py"
 DEFAULT_SAE_SIM = HERE / "simulate_sae_step_time_step_v6.py"
 DEFAULT_TRANSFER_PROFILE = (HERE / "profile_results" / "streaming_transfer_profile.csv") if (HERE / "profile_results" / "streaming_transfer_profile.csv").exists() else (HERE / "streaming_transfer_profile.csv")
 

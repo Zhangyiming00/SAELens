@@ -45,7 +45,6 @@ WORKER_ARGS = [
     "--train-batch-size-tokens", "2048",
     "--context-size", "2048",
     "--max-model-len", "2049",
-    "--gpu-memory-utilization", "0.45",
     "--streaming-chunk-size-tokens", "16384",
     "--streaming-num-chunks", str(NUM_CHUNKS),
     "--output-path", str(RUN_DIR / "output"),
@@ -254,7 +253,7 @@ def cmd_run() -> None:
     cmd = [
         sys.executable, "scripts/topology_supervisor.py",
         "--run-dir", str(RUN_DIR),
-        "--worker-script", "scripts/run_sae_runner_gpu.py",
+        "--worker-script", "run_sae_runner_gpu.py",
         "--worker-args", " ".join(WORKER_ARGS),
         "--vllm-tp", "1",
         "--vllm-dp", "1",

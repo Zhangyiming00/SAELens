@@ -1762,18 +1762,26 @@ class ActivationsStore:
         self._add_data_timing(vllm_step_time_s=time.perf_counter() - vllm_stage_t0)
 
         transfer_t0 = time.perf_counter()
-        remote_slices = self._run_nccl_p2p_exchange_v2(outgoing)
+        use_shm = getattr(v2.get_sae_runtime(), "routing_transport", "nccl") == "shm_async"
+        if use_shm:
+            from sae_lens.training.async_routing_transport import exchange
+            with routing_phase(getattr(self, "_routing_probe", None), "shm_async_exchange"):
+                remote_slices = exchange(self, outgoing)
+        else:
+            remote_slices = self._run_nccl_p2p_exchange_v2(outgoing)
         if monitor is not None:
             monitor.check()
 
         assembled: torch.Tensor | dict[str, torch.Tensor] | None = None
-        if i_am_consumer_root:
+        if i_am_consumer_root or (use_shm and i_am_consumer):
             buf_map: dict[int, Any] = {}
             c_routes = routes_for_consumer(routing, c)
             endpoint_root = v2.get_consumer_tp_root(endpoint_idx)
             for route in c_routes:
                 p = route.producer_idx
-                if v2.get_producer_tp_root(p) == endpoint_root:
+                if use_shm:
+                    buf_map[p] = remote_slices[p]
+                elif v2.get_producer_tp_root(p) == endpoint_root:
                     buf_map[p] = local_slices[p]
                 else:
                     buf_map[p] = remote_slices[p]
@@ -1783,9 +1791,8 @@ class ActivationsStore:
                 if isinstance(first_buf, dict):
                     payload_hook_names = self._v2_endpoint_hook_names(endpoint_idx)
                     assembled_payload = {
-                        hook_name: torch.cat(
-                            [buf_map[r.producer_idx][hook_name] for r in c_routes],
-                            dim=0,
+                        hook_name: first_buf[hook_name] if use_shm and len(c_routes) == 1 else torch.cat(
+                            [buf_map[r.producer_idx][hook_name] for r in c_routes], dim=0,
                         )
                         for hook_name in payload_hook_names
                     }
@@ -1794,13 +1801,13 @@ class ActivationsStore:
                         for hook_name in self.hook_names
                     }
                 else:
-                    assembled = torch.cat(
+                    assembled = first_buf if use_shm and len(c_routes) == 1 else torch.cat(
                         [buf_map[r.producer_idx] for r in c_routes], dim=0
                     )
 
             sae_tp_group = v2.get_sae_tp_group()
             sae_tp_size = v2.get_sae_tp_size()
-            if sae_tp_size > 1 and sae_tp_group is not None:
+            if not use_shm and sae_tp_size > 1 and sae_tp_group is not None:
                 with nccl_nvtx_range("nccl:shard_routing_sae_tp_broadcast", sae_tp_group):
                     with routing_phase(getattr(self, "_routing_probe", None), "sae_tp_broadcast"):
                         if isinstance(assembled, dict):
@@ -1940,9 +1947,8 @@ class ActivationsStore:
         All producer TP ranks participate in ``get_raw_llm_batch()``. Only the
         producer TP root prepares slices.
 
-        All slices stay on the original device (GPU) — local routes and remote
-        routes both use GPU tensors, since NCCL P2P handles GPU-to-GPU transfers
-        directly without CPU staging.
+        All slices stay on the original device here. The selected transport
+        stages only remote destinations; local source-rank data stays on device.
 
         No metadata is sent: consumers pre-allocate buffers from the routing
         table (``route.row_end - route.row_start``) and ``self.d_in``.

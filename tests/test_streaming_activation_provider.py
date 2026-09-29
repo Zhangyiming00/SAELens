@@ -128,6 +128,28 @@ def test_final_partial_batch_not_dropped():
     assert sizes == [32, 18]
 
 
+@pytest.mark.parametrize("mix_chunks", [0, 2])
+def test_partial_multi_hook_blocks_can_precede_full_refills(mix_chunks):
+    hooks = ["h0", "h1", "h2"]
+    chunks = []
+    start = 0
+    for count in (12, 7, 10, 3):
+        ids = torch.arange(start, start + count, dtype=torch.float32)
+        chunks.append(torch.cat([torch.stack([ids, ids * 0 + h], dim=1) for h in range(3)]))
+        start += count
+    provider = StreamingActivationProvider(
+        buffer=_make_sequential_buffer(chunks), train_batch_size_tokens=5,
+        prefetch_chunks=1, device=torch.device("cpu"), sae_tp_group=None,
+        sae_tp_rank=0, sae_tp_root_global_rank=0, d_model=2, dtype=torch.float32,
+        hook_names=hooks, shuffle=False, mix_chunks=mix_chunks, mix_fraction=.5,
+    )
+    batches = list(provider)
+    for h, hook in enumerate(hooks):
+        values = torch.cat([batch[hook] for batch in batches])
+        assert (values[:, 1] == h).all()
+        assert values[:, 0].tolist() == list(range(start))
+
+
 def test_drain_local_pool_stops_acquiring_new_chunks():
     d_model = 4
     chunks = [

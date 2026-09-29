@@ -219,6 +219,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             DP size/rank layout as the checkpoint. (default is None).
         output_path (str | None): The path to save outputs. Set to None to disable output saving. (default is "output")
         save_mse_every_n_steps (int): Save an `mse_history.jsonl` record every N training steps. 0 disables it. (default is 0)
+        save_dead_every_n_steps (int): Record dead candidates D and actual AuxK winners E/B by TP shard every N optimizer updates. 0 disables it.
         save_timing_every_n_steps (int): Save a `timing_history.jsonl` record every N training steps with separate `vllm_step_time_s`, `transfer_time_s`, and `sae_time_s` wall times. 0 disables it. (default is 0)
         save_memory_every_n_steps (int): Save a `memory_history_rank{rank}.jsonl` record every N training steps with peak GPU memory stats per training phase. 0 disables it. Uses PyTorch allocator stats (not nvidia-smi). (default is 0)
         record_memory_empty_cache (bool): When memory profiling is enabled, call `torch.cuda.empty_cache()` before every per-phase snapshot so `reserved_mb`/`driver_used_mb` reflect current live tensors rather than the historical allocator watermark. This stalls the device and adds tens of ms per phase, so it is only for memory-profiling runs and should be left off for normal training. (default is False)
@@ -330,6 +331,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     save_final_checkpoint: bool = False
     output_path: str | None = "output"
     save_mse_every_n_steps: int = 0
+    save_dead_every_n_steps: int = 0
     save_timing_every_n_steps: int = 0
     save_memory_every_n_steps: int = 0
     record_memory_empty_cache: bool = False
@@ -407,6 +409,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     # SHM streaming. ``equal`` preserves the legacy per-replica configuration;
     # ``exact`` keeps the CLI batch/token values global and permits remainders.
     routing_dp_batch_mode: Literal["equal", "exact"] = "equal"
+    routing_transport: Literal["shm_async", "nccl"] = "shm_async"
+    routing_shm_slots: int = 2
     streaming_dp_batch_mode: Literal["equal_cohort", "exact"] = "equal_cohort"
 
     # Streaming mode (v1): vLLM and SAE on separate GPU sets, communicate via /dev/shm.
@@ -522,6 +526,10 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             raise ValueError("sae_pp_size must be >= 1")
         if self.routing_dp_batch_mode not in ("equal", "exact"):
             raise ValueError("routing_dp_batch_mode must be 'equal' or 'exact'")
+        if self.routing_transport not in ("shm_async", "nccl"):
+            raise ValueError("routing_transport must be 'shm_async' or 'nccl'")
+        if type(self.routing_shm_slots) is not int or self.routing_shm_slots < 1:
+            raise ValueError("routing_shm_slots must be a positive integer")
         if self.streaming_dp_batch_mode not in ("equal_cohort", "exact"):
             raise ValueError(
                 "streaming_dp_batch_mode must be 'equal_cohort' or 'exact'"
@@ -625,6 +633,10 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             raise ValueError(
                 "save_mse_every_n_steps requires output_path to be set"
             )
+        if type(self.save_dead_every_n_steps) is not int or self.save_dead_every_n_steps < 0:
+            raise ValueError("save_dead_every_n_steps must be a nonnegative integer")
+        if self.save_dead_every_n_steps > 0 and self.output_path is None:
+            raise ValueError("save_dead_every_n_steps requires output_path to be set")
         if self.save_timing_every_n_steps < 0:
             raise ValueError("save_timing_every_n_steps must be >= 0")
         if self.save_timing_every_n_steps > 0 and self.output_path is None:
@@ -840,6 +852,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             save_final_checkpoint=self.save_final_checkpoint,
             output_path=self.output_path,
             save_mse_every_n_steps=self.save_mse_every_n_steps,
+            save_dead_every_n_steps=self.save_dead_every_n_steps,
             save_timing_every_n_steps=self.save_timing_every_n_steps,
             save_memory_every_n_steps=self.save_memory_every_n_steps,
             record_memory_empty_cache=self.record_memory_empty_cache,
@@ -1177,6 +1190,7 @@ class SAETrainerConfig:
     feature_sampling_window: int
     logger: LoggingConfig
     streaming_mode: bool = False
+    save_dead_every_n_steps: int = 0
     routing_dp_batch_mode: Literal["equal", "exact"] = "equal"
     append_history_logs: bool = False
     step_window_profile_start_step: int = 0

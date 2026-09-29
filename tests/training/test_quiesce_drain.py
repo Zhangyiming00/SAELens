@@ -50,6 +50,14 @@ def _minimal_trainer(provider: _DrainProvider, total_training_samples: int) -> S
     trainer.n_training_samples = 0
     trainer.n_training_steps = 0
     trainer.saved_checkpoints = []
+    trainer.unit = None
+    trainer.runtime = None
+    trainer.step_window_profiler = None
+    trainer._profile_memory = False
+    trainer.dead_feature_history = SimpleNamespace(write=lambda *a, **kw: None)
+    trainer._phase_memory_stats = lambda *a, **kw: {}
+    trainer._maybe_start_memory_timeline = lambda: None
+    trainer._maybe_stop_memory_timeline = lambda: None
 
     trainer._is_metric_writer_rank = lambda: True
     trainer._maybe_synchronize_timing = lambda: None

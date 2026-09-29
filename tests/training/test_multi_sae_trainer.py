@@ -469,10 +469,12 @@ def test_append_history_logs_preserves_existing_multi_sae_history(tmp_path: Path
     cfg.output_path = str(tmp_path / "out")
     cfg.save_mse_every_n_steps = 1
     cfg.save_timing_every_n_steps = 1
+    cfg.save_dead_every_n_steps = 1
     output = Path(cfg.output_path)
     output.mkdir()
     (output / "mse_history.jsonl").write_text('{"existing": "mse"}\n')
     (output / "timing_history.jsonl").write_text('{"existing": "timing"}\n')
+    (output / "dead_history.jsonl").write_text('{"existing": "dead"}\n')
 
     sae_by_hook = {hook: _make_sae() for hook in HOOK_NAMES}
     MultiSAETrainer(
@@ -490,6 +492,7 @@ def test_append_history_logs_preserves_existing_multi_sae_history(tmp_path: Path
 
     assert (output / "mse_history.jsonl").read_text() == '{"existing": "mse"}\n'
     assert (output / "timing_history.jsonl").read_text() == '{"existing": "timing"}\n'
+    assert (output / "dead_history.jsonl").read_text() == '{"existing": "dead"}\n'
 
 
 def test_save_final_writes_pp_local_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1539,3 +1542,161 @@ def test_memory_timeline_dumps_pickle_for_target_step(tmp_path: Path) -> None:
     with open(expected, "rb") as f:
         snapshot = pickle.load(f)
     assert snapshot["device_traces"] or snapshot["segments"]
+
+
+def test_dead_history_tp_shards_snapshot_before_age_update(tmp_path, monkeypatch):
+    from sae_lens.training.sae_trainer import DeadFeatureHistory
+
+    cfg = _make_trainer_cfg(tmp_path)
+    cfg.output_path = str(tmp_path / "history")
+    cfg.save_dead_every_n_steps = 2
+    cfg.dead_feature_window = 800
+    group = object()
+    model = SimpleNamespace(cfg=SimpleNamespace(d_sae=16), _tp_group=group)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda *a: 4)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda *a: [4, 5, 6, 7])
+    reductions = []
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, **k: reductions.append(t.numel()))
+    history = DeadFeatureHistory(cfg, {"h": model}, writer=True)
+    history.capture("h", object(), 1)  # unsampled: no mask access
+    ages = torch.full((16,), 800.)
+    ages[[0, 3, 8, 12, 13, 15]] = 801
+    mask = ages > cfg.dead_feature_window
+    history.capture("h", mask, 2)
+    assert sum(t.numel() for t in history.pending.values()) == 4
+    mask.zero_()  # later stats/input changes must not rewrite the snapshot
+    history.write(2, 8192)
+    assert not history.pending
+    record = json.loads(history.path.read_text())
+    assert record["mask_timing"] == "update_start"
+    assert record["tp_global_ranks"] == [4, 5, 6, 7]
+    hook = record["hooks"]["h"]
+    assert hook["dead_by_tp_rank"] == [2, 0, 1, 3]
+    assert hook["total_dead"] == 6
+    assert hook["dead_fraction_by_tp_rank"] == [.5, 0, .25, .75]
+    assert hook["feature_ranges"] == [[0, 4], [4, 8], [8, 12], [12, 16]]
+    assert hook["max_to_mean"] == 2
+    assert reductions == [6]  # Small E/B count vector, not the feature mask.
+
+
+def test_dead_history_disabled_does_no_scan(tmp_path):
+    from sae_lens.training.sae_trainer import DeadFeatureHistory
+
+    cfg = _make_trainer_cfg(tmp_path)
+    cfg.output_path = str(tmp_path / "unused")
+    cfg.save_dead_every_n_steps = 0
+    history = DeadFeatureHistory(cfg, {"h": object()}, writer=True)
+    history.capture("h", object(), 1)
+    history.write(1, 4096)
+    assert not Path(cfg.output_path).exists()
+    assert not history.pending
+
+
+def test_dead_history_nonwriter_collects_winners_without_file(tmp_path):
+    from sae_lens.training.sae_trainer import DeadFeatureHistory
+
+    cfg = _make_trainer_cfg(tmp_path)
+    cfg.output_path = str(tmp_path / "unused")
+    cfg.save_dead_every_n_steps = 1
+    model = SimpleNamespace(cfg=SimpleNamespace(d_sae=8))
+    history = DeadFeatureHistory(cfg, {"h": model}, writer=False)
+    history.capture("h", torch.ones(8, dtype=torch.bool), 1)
+    model._aux_winner_entries = 12
+    history.capture_aux("h", 3)
+    assert history.pending_aux["h"].tolist() == [12, 3, 0]
+    history.write(1, 3)
+    assert not Path(cfg.output_path).exists()
+    assert not history.pending and not history.pending_aux
+    assert model._aux_winner_entries is None and not model._record_aux_winners
+
+
+def test_dead_history_pp_append_and_topology_rebuild(tmp_path, monkeypatch):
+    from sae_lens.training.sae_trainer import DeadFeatureHistory
+
+    cfg = _make_trainer_cfg(tmp_path)
+    cfg.output_path = str(tmp_path / "history")
+    cfg.save_dead_every_n_steps = 1
+    model = SimpleNamespace(cfg=SimpleNamespace(d_sae=8))
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *a, **k: None)
+    for step, (rank, dp) in enumerate(((2, 2), (1, 3)), start=1):
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda *a: rank)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a: dp)
+        history = DeadFeatureHistory(cfg, {"h": model}, writer=True, pp_rank=1,
+                                     dp_group=object(), append_logs=step > 1)
+        history.capture("h", torch.zeros(8, dtype=torch.bool), step)
+        history.write(step, step * 4096)
+    records = [json.loads(s) for s in (Path(cfg.output_path) / "dead_history_pp1.jsonl").read_text().splitlines()]
+    assert [r["step"] for r in records] == [1, 2]
+    assert [r["dp_size"] for r in records] == [2, 3]
+    assert [r["writer_rank"] for r in records] == [2, 1]
+    assert all(r["hooks"]["h"]["max_to_mean"] is None for r in records)
+    assert not (Path(cfg.output_path) / "dead_history.jsonl").exists()
+
+
+def test_fit_dead_history_matches_masks_passed_to_each_hook(tmp_path):
+    cfg = _make_trainer_cfg(tmp_path, total_training_samples=2 * BATCH)
+    cfg.output_path = str(tmp_path / "history")
+    cfg.save_dead_every_n_steps = 1
+    cfg.dead_feature_window = 800
+    models = {hook: _make_sae() for hook in HOOK_NAMES}
+    trainer = MultiSAETrainer(
+        hook_names=HOOK_NAMES, sae_by_hook=models, base_sae_by_hook=models,
+        data_provider=_make_data_provider(2), save_checkpoint_fn=None, cfg=cfg,
+        dp_group=None, token_count_weighted_dp=False, sae_dp_mode="ddp",
+    )
+    expected = {h: [] for h in HOOK_NAMES}
+    for i, hook in enumerate(HOOK_NAMES):
+        ages = trainer.n_forward_passes_since_fired_by_hook[hook]
+        ages.fill_(800)
+        ages[:i + 1] = 801
+        original = models[hook].training_forward_pass
+
+        def observed(step_input, *, h=hook, run=original):
+            expected[h].append(int(step_input.dead_neuron_mask.sum()))
+            return run(step_input)
+
+        models[hook].training_forward_pass = observed
+    trainer.fit()
+    records = [json.loads(s) for s in (Path(cfg.output_path) / "dead_history.jsonl").read_text().splitlines()]
+    assert [r["step"] for r in records] == [1, 2]
+    assert [r["n_training_samples"] for r in records] == [BATCH, 2 * BATCH]
+    for i, hook in enumerate(HOOK_NAMES):
+        assert expected[hook][0] == i + 1
+        assert [r["hooks"][hook]["total_dead"] for r in records] == expected[hook]
+        for r in records:
+            data = r["hooks"][hook]
+            assert data["aux_valid_tokens"] == BATCH
+            assert data["aux_winners_per_token_by_tp_rank"] == [min(data["total_dead"], D_IN // 2)]
+
+
+def test_single_trainer_dead_history_uses_forward_mask(tmp_path):
+    from sae_lens.training.sae_trainer import SAETrainer
+
+    cfg = _make_trainer_cfg(tmp_path, total_training_samples=2 * BATCH)
+    cfg.output_path = str(tmp_path / "single")
+    cfg.save_dead_every_n_steps = 1
+    cfg.dead_feature_window = 800
+    cfg.lr_end = cfg.lr
+    model = _make_sae()
+    trainer = SAETrainer(cfg, model, iter(torch.randn(2, BATCH, D_IN)))
+    trainer.n_forward_passes_since_fired.fill_(800)
+    trainer.n_forward_passes_since_fired[:3] = 801
+    expected = []
+    original = model.training_forward_pass
+
+    def observed(step_input):
+        expected.append(int(step_input.dead_neuron_mask.sum()))
+        return original(step_input)
+
+    model.training_forward_pass = observed
+    trainer.fit()
+    records = [json.loads(s) for s in (Path(cfg.output_path) / "dead_history.jsonl").read_text().splitlines()]
+    assert expected[0] == 3
+    assert [r["hooks"]["sae"]["total_dead"] for r in records] == expected
+    assert [r["step"] for r in records] == [1, 2]
+    for r in records:
+        data = r["hooks"]["sae"]
+        assert data["aux_valid_tokens"] == BATCH
+        assert data["aux_winners_per_token_by_tp_rank"] == [min(data["total_dead"], D_IN // 2)]

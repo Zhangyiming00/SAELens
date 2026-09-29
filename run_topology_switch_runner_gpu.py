@@ -10,8 +10,8 @@ Phase 2 — after switch (2 GPUs):
   GPU 0+1: SAE consumer (vllm_dp=0, sae_tp=2) — no vLLM, SAE spans both GPUs
 
 Usage:
-  python3 scripts/run_topology_switch_runner_gpu.py run                # start supervisor
-  python3 scripts/run_topology_switch_runner_gpu.py run --no_cleanup   # keep runtime shared memory
+  python3 run_topology_switch_runner_gpu.py run                # start supervisor
+  python3 run_topology_switch_runner_gpu.py run --no_cleanup   # keep runtime shared memory
   python3 scripts/demo_topology_switch.py watch                       # watch buffer state
   python3 scripts/demo_topology_switch.py monitor [--verbose]         # auto-switch monitor
   python3 scripts/demo_topology_switch.py switch --topo TOPO_0VLLM_SAE2
@@ -56,7 +56,6 @@ BASE_WORKER_ARGS = [
     "--train-batch-size-tokens", "2048",
     "--context-size", "2048",
     "--max-model-len", "2049",
-    "--gpu-memory-utilization", "0.45",
     "--streaming-mode",
     "--streaming-chunk-size-tokens", "32768",
     "--streaming-num-chunks", str(NUM_CHUNKS),
@@ -685,7 +684,7 @@ def cmd_run(cleanup: bool = True) -> None:
     cmd = [
         sys.executable, "scripts/topology_supervisor.py",
         "--run-dir", str(run_dir),
-        "--worker-script", "scripts/run_sae_runner_gpu.py",
+        "--worker-script", "run_sae_runner_gpu.py",
         "--worker-args", " ".join(worker_args),
         "--vllm-tp", "1",
         "--vllm-dp", "1",

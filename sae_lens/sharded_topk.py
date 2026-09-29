@@ -15,6 +15,7 @@ not a promise of bitwise agreement with torch.topk's unspecified tie ordering.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -78,6 +79,24 @@ def _local_candidates(
     rows, width = scores.shape
     out_keys = torch.empty((rows, n), dtype=torch.int64, device=scores.device)
     out_indices = torch.empty_like(out_keys)
+    columns = None
+    if eligible is not None:
+        # AuxK ranks can own few (or no) eligible features. Scan their actual
+        # columns, while retaining the existing uniform candidate payload and
+        # original global feature-ID tie order. Main TopK is unchanged.
+        eligible_columns = eligible.nonzero(as_tuple=True)[0]
+        if eligible_columns.numel() < width:
+            columns = eligible_columns
+    scan_width = width if columns is None else columns.numel()
+    take = min(n, scan_width)
+    if take < n:
+        out_keys[:, take:].fill_(_MIN_KEY)
+        # Padding must address unique INELIGIBLE columns: dense scatter would
+        # otherwise overwrite a selected feature (often ID 0) with padded zero.
+        padding = (~eligible).nonzero(as_tuple=True)[0][:n - take]
+        out_indices[:, take:].copy_(padding.expand(rows, -1))
+    if not take:
+        return out_keys, out_indices
     key_kernel = None
     if key_backend == "triton":
         if not scores.is_cuda:
@@ -91,20 +110,30 @@ def _local_candidates(
     # target gave only 32 rows at width=16384 with the torch fallback, causing
     # thousands of tiny key/TopK launches even at TP1. Outputs and torch.topk's
     # internal workspace are separate from this comparison-key tile budget.
-    scratch_per_element = 8 if key_kernel else 64
-    tile = max(1, workspace_bytes // (width * scratch_per_element))
+    scratch_per_element = (32 if columns is not None else 8) if key_kernel else 64
+    tile = max(1, workspace_bytes // (scan_width * scratch_per_element))
+    global_ids = columns + offset if columns is not None else None
     for start in range(0, rows, tile):
         block = scores[start : start + tile]
+        if columns is not None:
+            block = block.index_select(1, columns)
         keys = (
-            score_keys(block, offset)
+            score_keys(block, offset if columns is None else 0)
             if key_kernel is None
-            else key_kernel(block, offset)
+            else key_kernel(block, offset if columns is None else 0)
         )
-        if eligible is not None:
-            keys.masked_fill_(~eligible[None, :], _MIN_KEY)
-        values, indices = keys.topk(n, dim=1, sorted=False)
-        out_keys[start : start + tile].copy_(values)
-        out_indices[start : start + tile].copy_(indices)
+        if columns is not None:
+            keys = (keys & ~0xFFFFFFFF) | (0xFFFFFFFF - global_ids[None, :])
+        if take == scan_width and columns is not None:
+            # All LOCAL eligible features are candidates; global TopK still
+            # chooses exactly k winners through the unchanged TP protocol.
+            values, indices = keys, columns.expand(block.shape[0], -1)
+        else:
+            values, indices = keys.topk(take, dim=1, sorted=False)
+            if columns is not None:
+                indices = columns[indices]
+        out_keys[start : start + tile, :take].copy_(values)
+        out_indices[start : start + tile, :take].copy_(indices)
         del keys, values, indices
     return out_keys, out_indices
 
@@ -210,6 +239,7 @@ class PendingShardedTopK:
     protocol: str
     ready: torch.cuda.Event | None = None
     packed: bool = False
+    winner_count: Callable[[torch.Tensor], None] | None = None
 
     def wait(self) -> torch.Tensor:
         if self.ready is not None:
@@ -219,6 +249,8 @@ class PendingShardedTopK:
         # Only the local scores participate in autograd. No communication edge
         # has a backward collective and no dense [rows, global_features] exists.
         keep = (self.keys >= self.threshold[:, None]) & (self.keys != _MIN_KEY)
+        if self.winner_count is not None:
+            self.winner_count(keep.sum())
         if self.packed:
             from sae_lens.ragged_sae import from_candidates
             return from_candidates(self.scores, self.indices, keep, relu=self.relu,
@@ -252,6 +284,7 @@ def launch_sharded_topk(
     compact_radix: bool = False,
     packed: bool = False,
     tie_policy: str = "stable_id",
+    winner_count=None,
 ) -> PendingShardedTopK:
     """Submit exact selection for a *uniform-width, feature-sharded* tensor.
 
@@ -308,7 +341,7 @@ def launch_sharded_topk(
                 local_keys = torch.where(eligible[indices], local_keys, _MIN_KEY)
             threshold = torch.ones(rows, dtype=torch.int64, device=scores.device)
         return PendingShardedTopK(scores, indices, local_keys, threshold, leading,
-                                  relu, sparse, 'torch_tp1', None, packed)
+                                  relu, sparse, 'torch_tp1', None, packed, winner_count)
     local_keys, indices = _local_candidates(
         scores.reshape(rows, width), nlocal, rank * width, eligible, key_backend
     )
@@ -347,7 +380,7 @@ def launch_sharded_topk(
         with torch.no_grad():
             threshold = select()
     return PendingShardedTopK(
-        scores, indices, local_keys, threshold, leading, relu, sparse, chosen, ready, packed
+        scores, indices, local_keys, threshold, leading, relu, sparse, chosen, ready, packed, winner_count
     )
 
 
@@ -358,7 +391,8 @@ def sharded_topk(
 
 
 def sharded_auxk(scores, k, eligible, num_eligible, group=None, *, sparse=False,
-                 policy="auto", protocol="auto", key_backend="torch", tie_policy="stable_id"):
+                 policy="auto", protocol="auto", key_backend="torch", tie_policy="stable_id",
+                 winner_count=None):
     """Exact AuxK selection; never gather full latent or change the loss budget.
 
     ``num_eligible`` is the ALREADY known global dead count (same on TP ranks),
@@ -372,6 +406,8 @@ def sharded_auxk(scores, k, eligible, num_eligible, group=None, *, sparse=False,
     if eligible.device != scores.device or not 0 < k <= num_eligible:
         raise ValueError("Invalid AuxK mask device or global selection budget")
     if policy == "auto" and k == num_eligible:
+        if winner_count is not None:
+            winner_count(eligible.sum() * math.prod(scores.shape[:-1]))
         if not sparse:
             # where removes ineligible NaN/inf values too, unlike multiplication.
             return torch.where(eligible, scores, 0.0)
@@ -385,6 +421,7 @@ def sharded_auxk(scores, k, eligible, num_eligible, group=None, *, sparse=False,
     return sharded_topk(
         scores, k, group, eligible=eligible, relu=False, sparse=sparse,
         protocol=protocol, key_backend=key_backend, compact_radix=policy == "auto", tie_policy=tie_policy,
+        winner_count=winner_count,
     )
 
 
@@ -449,6 +486,7 @@ def full_topk(
     eligible=None,
     key_backend="torch",
     tie_policy="stable_id",
+    winner_count=None,
 ):
     """Select on already gathered scores, without a second TP collective.
 
@@ -482,9 +520,12 @@ def full_topk(
     dense = (
         flat.new_zeros(flat.shape).scatter_(1, indices, values).reshape(scores.shape)
     )
-    if packed:
+    if packed or winner_count is not None:
         offset = rank * shard_width
         keep = (indices >= offset) & (indices < offset + shard_width)
+        if winner_count is not None:
+            winner_count(keep.sum())
+    if packed:
         positions = keep.reshape(-1).nonzero(as_tuple=True)[0]
         rows = positions // k
         columns = indices.reshape(-1).index_select(0, positions) - offset

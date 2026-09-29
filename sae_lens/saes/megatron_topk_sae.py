@@ -430,7 +430,16 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             tie_policy=self.cfg.topk_tie_policy,
         )
 
-    def _execution_full_aux(self, hidden_pre, mask, num_dead, requested):
+    def _record_aux_winner_count(self, entries):
+        # Sampling retains only a detached scalar, never logits or their graph.
+        self._aux_winner_entries = entries.detach() if isinstance(entries, torch.Tensor) else entries
+
+    def _record_aux_winner_indices(self, indices):
+        width = self.cfg.d_sae // self.tp_size
+        offset = self.tp_rank * width
+        self._record_aux_winner_count(((indices >= offset) & (indices < offset + width)).sum())
+
+    def _execution_full_aux(self, hidden_pre, mask, num_dead, requested, winner_count=None):
         """Reuse full Main logits; gather only when Main kept local logits."""
         width = self.cfg.d_sae // self.tp_size
         if hidden_pre.shape[-1] != self.cfg.d_sae:
@@ -445,6 +454,9 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         if k == num_dead:
             acts = torch.where(mask, hidden_pre, 0.0)
             selection = "select_all"
+            if winner_count is not None:
+                winner_count(mask.narrow(0, self.tp_rank * width, width).sum()
+                             * (hidden_pre.numel() // self.cfg.d_sae))
             if stages not in (("local_dense",) * 3, ("compact_dense",) * 3):
                 rows = hidden_pre.numel() // self.cfg.d_sae
                 ids = torch.arange(rows, device=hidden_pre.device)
@@ -466,6 +478,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 eligible=mask,
                 key_backend=self.cfg.topk_key_backend,
                 tie_policy=self.cfg.topk_tie_policy,
+                winner_count=winner_count,
             )
             selection = "full_topk"
         out = self._decode_execution_partial(acts, auxiliary=True, columns=columns)
@@ -548,13 +561,13 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         )
         return out
 
-    def _execution_aux(self, hidden_pre, mask, num_dead, requested):
+    def _execution_aux(self, hidden_pre, mask, num_dead, requested, winner_count=None):
         from sae_lens.adaptive_sae import try_direct_aux
         from sae_lens.ragged_sae import ragged_auxk
 
         kind = execution.branch_representation(self.cfg, True)
         if kind == "full":
-            return self._execution_full_aux(hidden_pre, mask, num_dead, requested)
+            return self._execution_full_aux(hidden_pre, mask, num_dead, requested, winner_count)
         stages = execution.stage_requests(self.cfg, True)
         width = self.cfg.d_sae // self.tp_size
         if hidden_pre.shape[-1] == self.cfg.d_sae and self.tp_size > 1:
@@ -576,6 +589,8 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             )
             if direct is not None:
                 out, diagnostic = direct
+                if winner_count is not None:
+                    winner_count(diagnostic["entries"])
                 diagnostic.update(representation=kind, num_dead=num_dead, k=k)
                 self._last_auxk_execution = diagnostic
                 return out
@@ -602,6 +617,8 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 tie_policy=self.cfg.topk_tie_policy,
             )
             selection = local.selection
+            if winner_count is not None:
+                winner_count(local.nnz)
         else:
             local, _, plan = prepare_auxk_dense(
                 hidden_pre,
@@ -615,6 +632,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 protocol=self.cfg.topk_candidate_protocol,
                 key_backend=self.cfg.topk_key_backend,
                 tie_policy=self.cfg.topk_tie_policy,
+                winner_count=winner_count,
             )
             selection = plan.selection
         acts = represent_latents(local, kind, self._tp_group)
@@ -755,6 +773,10 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         hidden_pre: torch.Tensor,
         sae_out: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        winner_count = None
+        if getattr(self, "_record_aux_winners", False):
+            self._aux_winner_entries = 0
+            winner_count = self._record_aux_winner_count
         if self.cfg.auxk == 0:
             self._last_auxk_execution = {
                 "selection": "disabled", "decoder": "skipped", "k": 0,
@@ -776,7 +798,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             k_aux = self.cfg.d_in // 2 if configured_auxk is None else int(configured_auxk)
             scale = min(num_dead / k_aux, 1.0)
             if self._decoupled_execution:
-                recons = self._execution_aux(hidden_pre, mask, num_dead, k_aux)
+                recons = self._execution_aux(hidden_pre, mask, num_dead, k_aux, winner_count)
                 if self.tp_size > 1:
                     recons = require_megatron_core().reduce_from_tensor_model_parallel_region(recons, group=self._tp_group)
             elif self.sharded_latents:
@@ -795,12 +817,16 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                                                 self.decoder.weight, norm, self.cfg)
                     if direct is not None:
                         recons, self._last_auxk_execution = direct
+                        if winner_count is not None:
+                            winner_count(self._last_auxk_execution["entries"])
                     else:
                         aux = ragged_auxk(hidden_pre, min(k_aux, num_dead), local_mask, num_dead, self._tp_group,
                                           policy=getattr(self.cfg, "auxk_selection", "auto"),
                                           protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
                                           complement=getattr(self.cfg, "auxk_complement", "auto"),
                                           tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"))
+                        if winner_count is not None:
+                            winner_count(aux.nnz)
                         # Eligible IDs are shared across this batch, not values.
                         columns = local_mask.nonzero(as_tuple=True)[0] if enabled else None
                         recons = self._decode_ragged_partial(aux, auxiliary=True, known_columns=columns)
@@ -816,6 +842,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                         protocol=self.cfg.topk_candidate_protocol,
                         key_backend=self.cfg.topk_key_backend,
                         tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"),
+                        winner_count=winner_count,
                     )
                     # Diagnostics retain scalars only; never tensors/autograd state.
                     self._last_auxk_execution = {
@@ -849,10 +876,14 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                         sparse=True, policy=getattr(self.cfg, "auxk_selection", "auto"),
                         protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
                         tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"),
+                        winner_count=winner_count,
                     )
                     recons = self._decode_features(aux)
             else:
-                aux = calculate_topk_aux_acts(min(k_aux, num_dead), hidden_pre, mask)
+                aux = calculate_topk_aux_acts(
+                    min(k_aux, num_dead), hidden_pre, mask,
+                    winner_indices=self._record_aux_winner_indices if winner_count is not None else None,
+                )
                 recons = self._decode_features(aux)
             recons = self.reshape_fn_out(recons, self.d_head)
             residual = (step_input.sae_in - sae_out).detach()

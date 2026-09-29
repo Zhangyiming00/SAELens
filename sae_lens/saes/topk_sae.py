@@ -537,6 +537,8 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
         """
         # Mostly taken from https://github.com/EleutherAI/sae/blob/main/sae/sae.py, except without variance normalization
         # NOTE: checking the number of dead neurons will force a GPU sync, so performance can likely be improved here
+        if getattr(self, "_record_aux_winners", False):
+            self._aux_winner_entries = 0
         if dead_neuron_mask is None or (num_dead := int(dead_neuron_mask.sum())) == 0:
             return sae_out.new_tensor(0.0)
 
@@ -556,6 +558,8 @@ class TopKTrainingSAE(TrainingSAE[TopKTrainingSAEConfig]):
         # Reduce the scale of the loss if there are a small number of dead latents
         scale = min(num_dead / k_aux, 1.0)
         k_aux = min(k_aux, num_dead)
+        if getattr(self, "_record_aux_winners", False):
+            self._aux_winner_entries = k_aux * (hidden_pre.numel() // hidden_pre.shape[-1])
 
         auxk_acts = calculate_topk_aux_acts(
             k_aux=k_aux,
@@ -591,6 +595,7 @@ def calculate_topk_aux_acts(
     k_aux: int,
     hidden_pre: torch.Tensor,
     dead_neuron_mask: torch.Tensor,
+    *, winner_indices=None,
 ) -> torch.Tensor:
     """
     Helper method to calculate activations for the auxiliary loss.
@@ -608,6 +613,8 @@ def calculate_topk_aux_acts(
     auxk_latents = torch.where(dead_neuron_mask[None], hidden_pre, -torch.inf)
     # Top-k dead latents
     auxk_topk = auxk_latents.topk(k_aux, sorted=False)
+    if winner_indices is not None:
+        winner_indices(auxk_topk.indices)
     # Set the activations to zero for all but the top k_aux dead latents
     auxk_acts = torch.zeros_like(hidden_pre)
     auxk_acts.scatter_(-1, auxk_topk.indices, auxk_topk.values)

@@ -135,6 +135,10 @@ def train_runtime_window(
         else trainer.act_freq_scores_by_hook
     )
     masks = {h: (ages[h] > trainer.cfg.dead_feature_window).bool() for h in units}
+    history = getattr(trainer, "dead_feature_history", None)
+    if history is not None:
+        for hook, mask in masks.items():
+            history.capture(hook, mask, trainer.n_training_steps + 1)
     counts = {h: torch.zeros_like(frequencies[h]) for h in units}
     local_tokens = dict.fromkeys(units, 0)
     global_tokens = dict.fromkeys(units, 0)
@@ -216,6 +220,8 @@ def train_runtime_window(
                     with trainer.autocast_if_enabled:
                         output = unit.forward(inputs[h])
                     timing["sae_forward_time_s"] += perf_counter() - t
+                if history is not None:
+                    history.capture_aux(h, n)
                 with torch.no_grad():
                     if n:
                         firing = feature_counts_from_output(output)

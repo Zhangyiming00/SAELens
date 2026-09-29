@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""One-step deterministic phase-aware simulator for offline multi-hook SAE training.
+"""Legacy one-step phase simulator, before the native Megatron runtime.
+
+For current TP x DP, hook placement, wavefront and distributed optimizer use
+scripts/profile/simulate_megatron_execution_time.py. This legacy DAG must not be used to
+select current Megatron/elastic layouts; its FSDP and hook ordering differ.
 
 There is no Random Forest, sklearn model, IDW, training stage, or saved model
 bundle in this file.  Every invocation directly reads the profiler CSVs, performs

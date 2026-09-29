@@ -61,7 +61,9 @@ def _trainer_config(device, checkpoint, architecture):
         save_final_checkpoint=False,
         logger=LoggingConfig(log_to_wandb=False),
     )
-    cfg.multi_sae_distributed_architecture = architecture
+    cfg.multi_sae_distributed_architecture = (
+        "legacy_per_hook_wrapper" if architecture == "single" else architecture
+    )
     cfg.multi_sae_optimizer_overlap = "off"
     cfg.multi_sae_stats_sync_mode = "immediate"
     return cfg

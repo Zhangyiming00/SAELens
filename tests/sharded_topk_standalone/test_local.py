@@ -51,6 +51,23 @@ def test_score_order_and_ties():
     assert sharded_topk(x, 1, sparse=False).nonzero().tolist() == [[0, 1]]
 
 
+@pytest.mark.parametrize("dead_ids", [[], [0], [0, 3], [1, 4, 9, 10, 16], list(range(19))])
+@pytest.mark.parametrize("n", [1, 5, 19])
+def test_aux_candidates_preserve_global_ids_and_unique_padding(dead_ids, n):
+    from sae_lens.sharded_topk import _local_candidates
+
+    scores = torch.tensor([[0., -0., 3., -2., float('inf'), -1., 4., 5., 1.,
+                            float('nan'), -float('inf'), 2., 3., 4., 5., -3., 0., 2., 1.]])
+    mask = torch.zeros(19, dtype=torch.bool)
+    mask[dead_ids] = True
+    keys, ids = _local_candidates(scores, n, 37, mask, 'torch')
+    reference = score_keys(scores, 37).masked_fill(~mask, -(1 << 63))
+    torch.testing.assert_close(keys.sort(dim=1).values, reference.topk(n, dim=1).values.sort(dim=1).values)
+    torch.testing.assert_close(keys, reference.gather(1, ids))
+    # Dense scatter must never overwrite a real winner with padded zero.
+    assert ids.unique().numel() == n
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("strided", [False, True])
 def test_sparse_decoder_forward_backward(dtype, strided):

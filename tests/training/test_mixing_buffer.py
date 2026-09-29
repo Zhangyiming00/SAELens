@@ -1,3 +1,4 @@
+import weakref
 from collections.abc import Iterator
 
 import pytest
@@ -5,6 +6,61 @@ import torch
 
 from sae_lens.training.mixing_buffer import mixing_buffer
 from tests.helpers import assert_not_close
+
+
+@pytest.mark.parametrize("dict_batch", [False, True])
+def test_consumed_resume_storage_is_released_after_refill(dict_batch):
+    tensor = torch.arange(8)
+    reference = weakref.ref(tensor)
+    state = {"serving": {"a": tensor} if dict_batch else tensor}
+    del tensor
+
+    def source():
+        value = torch.arange(8, 16)
+        yield {"a": value} if dict_batch else value
+
+    iterator = mixing_buffer(8, 4, source(), mix_fraction=0, state=state)
+    next(iterator)
+    next(iterator)
+    assert state["serving"] is None
+    next(iterator)
+    # torch.no_grad's generator wrapper holds the previous yielded view until
+    # gen.send returns; it must disappear once the new batch has been yielded.
+    assert reference() is None
+
+
+@pytest.mark.parametrize("dict_batch", [False, True])
+def test_consumed_input_and_empty_tail_do_not_pin_storage(dict_batch):
+    references = []
+    def source():
+        value = torch.arange(8)
+        references.append(weakref.ref(value))
+        yield {"a": value} if dict_batch else value
+        del value
+        value = torch.arange(8, 16)
+        yield {"a": value} if dict_batch else value
+
+    state = {}
+    iterator = mixing_buffer(8, 4, source(), mix_fraction=0, state=state)
+    for _ in range(4):
+        next(iterator)
+    assert state["storage"] is None
+    assert state["serving"] is None
+    assert references[0]() is None
+    with pytest.raises(StopIteration):
+        next(iterator)
+    assert state["exhausted"]
+
+
+@pytest.mark.parametrize("drop_last", [False, True])
+def test_exhausted_state_releases_last_serving_view(drop_last):
+    state = {}
+    for _ in mixing_buffer(8, 4, iter([torch.arange(7)]), state=state, drop_last=drop_last):
+        pass
+    assert state["exhausted"]
+    assert state["storage"] is None
+    assert state["serving"] is None
+    assert list(mixing_buffer(8, 4, iter(()), state=state, drop_last=drop_last)) == []
 
 
 @pytest.mark.parametrize("dict_batch", [False, True])
