@@ -461,6 +461,8 @@ def parse_args() -> argparse.Namespace:
         action="store_false", default=True,
         help="Disable TopK rescale_acts_by_decoder_norm (default: enabled).",
     )
+    parser.add_argument("--vllm-text-only", action="store_true",
+                        help="Disable image/video inputs for multimodal vLLM models.")
     parser.add_argument("--dtype", default="float32")
     parser.add_argument("--autocast", action="store_true")
     parser.add_argument("--autocast-lm", action="store_true")
@@ -780,7 +782,9 @@ def _prepare_streaming_startup(*, cleanup: bool, world_size: int) -> None:
         )
 
     if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", device_id=torch.device("cuda", local_rank))
 
     if dist.is_initialized() and world_size > 1:
         dist.barrier()
@@ -813,8 +817,16 @@ def _resolve_store_batch_size_prompts(
 
 
 def _resolve_hidden_size(model_name: str) -> int:
+    # Local vLLM models can be newer than the installed Transformers registry.
+    config_path = Path(model_name) / "config.json"
+    if config_path.is_file():
+        config = json.loads(config_path.read_text())
+        text_config = config.get("text_config") or config
+        if "hidden_size" in text_config:
+            return int(text_config["hidden_size"])
     local_files_only = Path(model_name).exists()
     hf_cfg = AutoConfig.from_pretrained(model_name, local_files_only=local_files_only)
+    hf_cfg = getattr(hf_cfg, "text_config", None) or hf_cfg
     if not hasattr(hf_cfg, "hidden_size"):
         raise ValueError(f"Could not infer hidden_size from model config: {model_name}")
     return int(hf_cfg.hidden_size)
@@ -1346,6 +1358,8 @@ def main() -> None:
             "tensor_parallel_size": vllm_tp_size,
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": 0.5,
+            **({"limit_mm_per_prompt": {"image": 0, "video": 0}}
+               if args.vllm_text_only else {}),
         },
         vllm_max_num_batched_tokens=args.max_num_batched_tokens,
         hook_name=args.hook_name,

@@ -8,14 +8,15 @@ GLOBAL dead count; TP peers must use the same count, k, and configuration.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
 from sae_lens.sharded_topk import (
-    _group_rank, _group_size, score_keys, sharded_auxk,
+    PendingShardedTopK, _group_rank, _group_size, launch_sharded_topk, score_keys, sharded_auxk,
 )
 
 _MAX_KEY = (1 << 63) - 1
@@ -155,18 +156,129 @@ def _complement_mask(values: torch.Tensor, global_columns: torch.Tensor,
     return keep
 
 
+@dataclass
+class PendingAuxKSelection:
+    """Detached comparison work; differentiable values stay on the consumer stream.
+
+    This deliberately does not build an auxiliary decoder/autograd branch on
+    the selection stream. Both decoder gradients continue to use the original
+    compute stream and native accumulation buffers.
+    """
+    scores: torch.Tensor
+    eligible: torch.Tensor
+    columns: torch.Tensor
+    plan: AuxKDensePlan
+    layout: str
+    topk: PendingShardedTopK | None = None
+    keep: torch.Tensor | None = None
+    ready: torch.cuda.Event | None = None
+
+    def wait(self, *, winner_count=None):
+        if self.ready is not None:
+            current = torch.cuda.current_stream(self.scores.device)
+            current.wait_event(self.ready)
+            self.columns.record_stream(current)
+            if self.keep is not None:
+                self.keep.record_stream(current)
+        plan = self.plan
+        if self.topk is not None:
+            # wait() transfers keys/indices/threshold lifetimes as well as
+            # waiting on the event. Gathering live values happens here.
+            acts = replace(self.topk, winner_count=winner_count).wait()
+            if self.layout == "ragged":
+                return replace(acts, selection="topk"), self.columns, plan
+            if plan.decoder == "compact_dense":
+                return _DeadColumnValues.apply(acts, self.columns), self.columns, plan
+            return acts, None, plan
+        if self.layout == "ragged":
+            from sae_lens.ragged_sae import from_dead_columns
+            acts = from_dead_columns(self.scores, self.columns, self.keep, selection=plan.selection)
+            if winner_count is not None:
+                winner_count(acts.nnz)
+            return acts, self.columns, plan
+        if self.layout == "sparse":
+            # Sparse compatibility has no complement route.
+            acts = sharded_auxk(self.scores, plan.k, self.eligible, plan.num_dead,
+                                sparse=True, known_columns=self.columns, winner_count=winner_count)
+            return acts, None, plan
+        values = _DeadColumnValues.apply(self.scores, self.columns)
+        if self.keep is not None:
+            values = torch.where(self.keep.reshape(values.shape), values, 0.0)
+        if winner_count is not None:
+            winner_count(values.numel() if self.keep is None else self.keep.sum())
+        if plan.decoder == "compact_dense":
+            return values, self.columns, plan
+        return self.scores.new_zeros(self.scores.shape).index_copy(-1, self.columns, values), None, plan
+
+
+def launch_auxk_selection(scores, k, eligible, num_eligible, group=None, *,
+                          layout="dense", decoder="auto", complement="auto",
+                          selection_policy="auto", protocol="auto", key_backend="torch",
+                          tie_policy="stable_id", known_columns=None, stream=None):
+    """Launch local candidates and global selection without consuming winners.
+
+    TP peers use the existing single ordered TP stream/communicator. The caller
+    can issue the main decoder while these detached comparisons execute. Only
+    the eventual auxiliary decoder needs to wait for the selected values.
+    """
+    if layout not in ("dense", "sparse", "ragged"):
+        raise ValueError("Unknown AuxK selection layout")
+    if eligible.dtype != torch.bool or eligible.shape != (scores.shape[-1],) or eligible.device != scores.device:
+        raise ValueError("AuxK requires a LOCAL boolean eligible mask")
+    if tie_policy == "torch_tp1":
+        if _group_size(group) != 1:
+            raise ValueError("torch_tp1 requires singleton TP")
+        if k < num_eligible:
+            selection_policy = "legacy"
+    if layout == "sparse":
+        complement, decoder = "off", "local_dense"
+    plan = plan_auxk_dense(num_dead=num_eligible, k=k, shard_width=scores.shape[-1],
+                          tp_size=_group_size(group), element_size=scores.element_size(),
+                          decoder=decoder, complement=complement, selection_policy=selection_policy,
+                          protocol=protocol)
+    columns = eligible.nonzero(as_tuple=True)[0] if known_columns is None else known_columns
+    pending = PendingAuxKSelection(scores, eligible, columns, plan, layout)
+    if stream is not None:
+        if not scores.is_cuda:
+            raise ValueError("An asynchronous AuxK selection requires CUDA scores")
+        stream.wait_stream(torch.cuda.current_stream(scores.device))
+        for tensor in (scores, eligible, columns):
+            tensor.record_stream(stream)
+    with torch.cuda.stream(stream) if stream is not None else nullcontext():
+        with torch.no_grad():
+            if plan.selection == "topk":
+                pending.topk = launch_sharded_topk(
+                    scores, k, group, eligible=eligible, relu=False,
+                    sparse=layout == "sparse", packed=layout == "ragged",
+                    protocol=protocol, key_backend=key_backend,
+                    compact_radix=selection_policy == "auto", tie_policy=tie_policy,
+                    known_columns=columns,
+                )
+            elif plan.selection.startswith("complement"):
+                values = scores.reshape(-1, scores.shape[-1]).index_select(1, columns)
+                ids = columns + _group_rank(group) * scores.shape[-1]
+                pending.keep = _complement_mask(values, ids, plan.exclude_k, group)
+        if stream is not None:
+            pending.ready = torch.cuda.Event()
+            pending.ready.record(stream)
+            if pending.topk is not None:
+                pending.topk.ready = pending.ready
+    return pending
+
+
 def prepare_auxk_dense(scores: torch.Tensor, k: int, eligible: torch.Tensor,
                        num_eligible: int, group: dist.ProcessGroup | None = None, *,
                        decoder: str = "auto", complement: str = "auto",
                        selection_policy: str = "auto", protocol: str = "auto",
                        key_backend: str = "torch", tie_policy: str = "stable_id",
-                       winner_count=None) -> tuple[torch.Tensor, torch.Tensor | None, AuxKDensePlan]:
+                       winner_count=None, known_columns=None) -> tuple[torch.Tensor, torch.Tensor | None, AuxKDensePlan]:
     """Return local values, optional ORIGINAL local feature columns, and plan.
 
     columns=None: values already have local shard width (native decoder).
     columns!=None: values are [*,m_local] (ordinary compact dense GEMM).
     nonzero inspects ONLY the one-dimensional dead mask. It may synchronize
-    CUDA to learn m_local; no stale mask/weight cache is maintained.
+    CUDA to learn m_local. Runtime callers can supply columns prepared from
+    the immutable window mask; weights/values are never cached across updates.
     """
     if scores.ndim < 2 or scores.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError("Expected FP32/BF16/FP16 local [...,S] scores")
@@ -186,16 +298,16 @@ def prepare_auxk_dense(scores: torch.Tensor, k: int, eligible: torch.Tensor,
     if plan.selection == "topk":
         acts = sharded_auxk(scores, k, eligible, num_eligible, group, sparse=False,
                             policy=selection_policy, protocol=protocol, key_backend=key_backend, tie_policy=tie_policy,
-                            winner_count=winner_count)
+                            winner_count=winner_count, known_columns=known_columns)
         if plan.decoder == "local_dense":
             return acts, None, plan
-        columns = eligible.nonzero(as_tuple=True)[0]
+        columns = eligible.nonzero(as_tuple=True)[0] if known_columns is None else known_columns
         return _DeadColumnValues.apply(acts, columns), columns, plan
     if plan.selection == "select_all" and plan.decoder == "local_dense":
         if winner_count is not None:
             winner_count(eligible.sum() * math.prod(scores.shape[:-1]))
         return torch.where(eligible, scores, 0.0), None, plan
-    columns = eligible.nonzero(as_tuple=True)[0]
+    columns = eligible.nonzero(as_tuple=True)[0] if known_columns is None else known_columns
     packed = _DeadColumnValues.apply(scores, columns)
     if plan.selection.startswith("complement"):
         flat = packed.reshape(math.prod(scores.shape[:-1]), columns.numel())

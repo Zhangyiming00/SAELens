@@ -215,7 +215,8 @@ def launch_ragged_topk(scores, k, group=None, **kwargs):
 
 
 def ragged_auxk(scores, k, eligible, num_eligible, group=None, *, policy='auto',
-                protocol='auto', key_backend='torch', complement='auto', tie_policy='stable_id'):
+                protocol='auto', key_backend='torch', complement='auto', tie_policy='stable_id',
+                known_columns=None):
     from sae_lens.auxk_compact import plan_auxk_dense, _DeadColumnValues, _complement_mask
     from sae_lens.sharded_topk import _group_size, _group_rank
     if eligible.dtype != torch.bool or eligible.shape != (scores.shape[-1],) or eligible.device != scores.device:
@@ -226,7 +227,7 @@ def ragged_auxk(scores, k, eligible, num_eligible, group=None, *, policy='auto',
         if k < num_eligible:
             return launch_ragged_topk(scores, k, group, eligible=eligible, relu=False,
                                      protocol=protocol, key_backend=key_backend,
-                                     tie_policy=tie_policy).wait()
+                                     tie_policy=tie_policy, known_columns=known_columns).wait()
     plan = plan_auxk_dense(num_dead=num_eligible, k=k, shard_width=scores.shape[-1],
                           tp_size=_group_size(group), element_size=scores.element_size(),
                           decoder='auto', complement=complement, selection_policy=policy,
@@ -234,9 +235,9 @@ def ragged_auxk(scores, k, eligible, num_eligible, group=None, *, policy='auto',
     if plan.selection == 'topk':
         result = launch_ragged_topk(scores, k, group, eligible=eligible, relu=False,
                                    protocol=protocol, key_backend=key_backend,
-                                   compact_radix=(policy == 'auto')).wait()
+                                   compact_radix=(policy == 'auto'), known_columns=known_columns).wait()
         return replace(result, selection='topk')
-    columns = eligible.nonzero(as_tuple=True)[0]
+    columns = eligible.nonzero(as_tuple=True)[0] if known_columns is None else known_columns
     if plan.selection == 'select_all':
         return from_dead_columns(scores, columns)
     # Comparison values are detached; autograd values are later gathered only

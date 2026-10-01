@@ -989,9 +989,10 @@ class LanguageModelSAETrainingRunner:
 
                     self._world_rendezvous = TemporaryDirectory(prefix="sae-world-")
                     dist.init_process_group(backend=backend, rank=0, world_size=1,
-                                            init_method=f"file://{self._world_rendezvous.name}/store")
+                                            init_method=f"file://{self._world_rendezvous.name}/store",
+                                            device_id=torch.device("cuda", torch.cuda.current_device()) if backend == "nccl" else None)
                 else:
-                    dist.init_process_group(backend=backend)
+                    dist.init_process_group(backend=backend, device_id=torch.device("cuda", torch.cuda.current_device()) if backend == "nccl" else None)
                 self._owns_default_process_group = True
             from sae_lens.distributed_v2 import initialize_sae_routing
 
@@ -1386,7 +1387,8 @@ class LanguageModelSAETrainingRunner:
             device = torch.device(self.cfg.device)
             if device.type == "cuda":
                 torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
-            dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
+            dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo",
+                                    device_id=torch.device("cuda", torch.cuda.current_device()) if device.type == "cuda" else None)
         if dist.get_world_size() == 1:
             return dist.group.WORLD
         raise RuntimeError("Initialize an SAE runtime before constructing models in a multi-rank world")
@@ -2077,7 +2079,7 @@ class LanguageModelSAETrainingRunner:
         self.device = torch.device(f"cuda:{local_rank}")
 
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
+            dist.init_process_group(backend="nccl", device_id=self.device)
 
         elastic_layout = None
         elastic_runtime_type = None

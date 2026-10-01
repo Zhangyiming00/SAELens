@@ -30,15 +30,18 @@ from tests.training.test_hook_optimizer_overlap import (
 )
 
 
-@pytest.mark.parametrize(("mode", "wave", "dp", "producer", "fences"), [
-    ("off", True, 2, True, False),
-    ("always", False, 1, False, True),
-    ("auto", False, 2, True, False),
-    ("auto", True, 1, False, False),
-    ("auto", True, 2, False, True),
-    ("auto", True, 1, True, True),
+@pytest.mark.parametrize(("mode", "wave", "dp", "producer", "ordered", "fences"), [
+    ("off", True, 2, True, False, False),
+    ("always", False, 1, False, False, True),
+    ("auto", False, 2, True, False, False),
+    ("auto", True, 1, False, False, False),
+    ("auto", True, 2, False, False, True),
+    ("auto", True, 1, True, False, True),
+    ("auto", True, 2, False, True, False),
+    ("auto", True, 2, True, True, True),
+    ("always", True, 2, False, True, True),
 ])
-def test_runtime_wavefront_uses_existing_phase_fence(mode, wave, dp, producer, fences):
+def test_runtime_wavefront_uses_existing_phase_fence(mode, wave, dp, producer, ordered, fences):
     trainer = MultiSAETrainer.__new__(MultiSAETrainer)
     trainer._tp_phase_fence_mode = mode
     trainer._tp_phase_event = MagicMock()
@@ -50,6 +53,7 @@ def test_runtime_wavefront_uses_existing_phase_fence(mode, wave, dp, producer, f
     trainer.hook_names = ["a", "b"]
     trainer.multi_sae_distributed_architecture = "legacy_per_hook_wrapper"
     trainer._runtime_tp_wavefront = wave
+    trainer._runtime_tp_wavefront_ordered_handoff = ordered
     trainer.cfg = SimpleNamespace(device="cuda:0", multi_sae_tp_phase_fence_runtime_hazard=producer)
     with patch("torch.cuda.current_stream", return_value=object()):
         trainer._tp_phase_fence_if_needed()

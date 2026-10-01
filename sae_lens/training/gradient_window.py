@@ -135,11 +135,24 @@ def train_runtime_window(
         else trainer.act_freq_scores_by_hook
     )
     masks = {h: (ages[h] > trainer.cfg.dead_feature_window).bool() for h in units}
+    # Read mask-only metadata before this window queues any forward work. The
+    # same mask/count/columns apply to every GA microbatch, never to next update.
+    aux_hooks = [h for h, u in units.items()
+                 if getattr(u.model.cfg, "auxk", None) != 0
+                 and callable(getattr(u.model, "prepare_auxk_metadata", None))]
+    dead_counts = {}
+    aux_columns = {}
+    if aux_hooks:
+        with cuda_nvtx_range("sae:window:auxk_metadata"):
+            dead_counts = dict(zip(aux_hooks, torch.stack([masks[h].sum() for h in aux_hooks]).tolist(), strict=True))
+            aux_columns = {h: units[h].model.prepare_auxk_metadata(masks[h], dead_counts[h])
+                           for h in aux_hooks}
     history = getattr(trainer, "dead_feature_history", None)
     if history is not None:
         for hook, mask in masks.items():
             history.capture(hook, mask, trainer.n_training_steps + 1)
     counts = {h: torch.zeros_like(frequencies[h]) for h in units}
+    deferred_tp_counts = set()
     local_tokens = dict.fromkeys(units, 0)
     global_tokens = dict.fromkeys(units, 0)
     loss_sums = {h: {} for h in units}
@@ -190,6 +203,9 @@ def train_runtime_window(
                 coefficients=trainer.get_coefficients() if single else {},
                 n_training_steps=trainer.n_training_steps,
                 is_logging_step=trainer._is_logging_step() if single else False,
+                defer_tp_firing_counts=True,
+                dead_neuron_count=dead_counts.get(h),
+                auxk_local_columns=aux_columns.get(h),
             )
             for h, acts in batch.items()
         }
@@ -223,9 +239,16 @@ def train_runtime_window(
                 if history is not None:
                     history.capture_aux(h, n)
                 with torch.no_grad():
+                    local_firing = getattr(output, "local_feature_firing_counts", None)
+                    if local_firing is not None:
+                        deferred_tp_counts.add(h)
                     if n:
-                        firing = feature_counts_from_output(output)
-                        counts[h] += firing.to_dense() if firing.is_sparse else firing
+                        if local_firing is not None:
+                            width = local_firing.numel()
+                            counts[h].narrow(0, unit.model.tp_rank * width, width).add_(local_firing)
+                        else:
+                            firing = feature_counts_from_output(output)
+                            counts[h] += firing.to_dense() if firing.is_sparse else firing
                     for key, value in {"loss": output.loss, **output.losses}.items():
                         loss_sums[h][key] = (
                             loss_sums[h].get(key, 0.0) + value.detach() * n
@@ -320,6 +343,30 @@ def train_runtime_window(
                 normalization_in_unscale=fused_amp_mean,
             )
     timing["sae_post_backward_time_s"] += perf_counter() - t
+    # Loss/backward never consumes firing counts. Resolve only the accumulated
+    # window delta here, before updating dead masks. Full outputs also promise
+    # the final microbatch's counts; pack that small summary into the same call.
+    t = perf_counter()
+    with torch.no_grad(), cuda_nvtx_range("sae:window:tp_firing_counts"):
+        for h, unit in units.items():
+            if h not in deferred_tp_counts:
+                continue
+            output = outputs[h]
+            summary = counts[h]
+            if isinstance(output, TrainStepOutput):
+                local = output.local_feature_firing_counts
+                assert local is not None
+                final = torch.zeros_like(summary)
+                final.narrow(0, unit.model.tp_rank * local.numel(), local.numel()).copy_(local)
+                summary = torch.stack((summary, final))
+            tp_group = unit.parallel_context.require_local().tp_group
+            if tp_group.size() > 1:
+                dist.all_reduce(summary, group=tp_group)
+            if isinstance(output, TrainStepOutput):
+                counts[h] = summary[0]
+                output.feature_firing_counts = summary[1]
+                output.local_feature_firing_counts = None
+    timing["sae_stats_sync_time_s"] += perf_counter() - t
     for h, unit in units.items():
         n = global_tokens[h]
         if n == 0:

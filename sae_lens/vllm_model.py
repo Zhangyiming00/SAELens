@@ -359,6 +359,14 @@ ARCH_CONFIGS: dict[str, dict[str, tuple[str, Callable, bool, Callable | None]]] 
     ]
 }
 
+# Qwen3.5 mixes Gated DeltaNet and full-attention layers. Only the residual
+# output contract is shared with Llama; its attention hooks are not equivalent.
+ARCH_CONFIGS["Qwen3_5ForConditionalGeneration"] = {
+    "hook_resid_post": (
+        "language_model.model.layers.{layer}", _resid_post_extractor, False, None
+    ),
+}
+
 # These decoders honor _sae_stop_at_layer in the local vLLM layer loop.
 # Qwen3Model inherits the implementation from Qwen2Model.
 _EARLY_STOP_ARCHS = frozenset({
@@ -412,6 +420,12 @@ def _parse_hook_name(hook_name: str) -> tuple[str, int | None]:
 def _get_arch_name(model: nn.Module) -> str:
     """Return the class name of the top-level model module."""
     return type(model).__name__
+
+
+def _get_decoder(model: nn.Module) -> nn.Module:
+    if _get_arch_name(model) == "Qwen3_5ForConditionalGeneration":
+        return model.language_model.model
+    return model.model
 
 
 # (substage label, submodule path relative to the decoder layer). A clean
@@ -731,7 +745,8 @@ def _resolve_capture_stop_layer(
     requested hook on supported decoders. Embedding-only capture keeps one block
     so the ordinary vLLM norm/logits/sampling path can complete unchanged.
     """
-    layers = model.model.layers
+    decoder = _get_decoder(model)
+    layers = decoder.layers
     depth = len(layers)
     requested_layers = [
         layer for name in hook_names
@@ -746,8 +761,8 @@ def _resolve_capture_stop_layer(
         if _get_arch_name(model) not in _EARLY_STOP_ARCHS:
             return None
         # Multi-stage vLLM needs a separate cross-stage capture protocol.
-        if getattr(model.model, "start_layer", 0) != 0 or getattr(
-            model.model, "end_layer", depth
+        if getattr(decoder, "start_layer", 0) != 0 or getattr(
+            decoder, "end_layer", depth
         ) != depth:
             return None
         return required
@@ -779,7 +794,7 @@ def _register_hooks(
     model._sae_captures: dict[str, list[torch.Tensor]] = {}  # type: ignore[attr-defined]
     model._sae_handles: list = []  # type: ignore[attr-defined]
     if stop_at_layer is not None:
-        model.model._sae_stop_at_layer = stop_at_layer  # type: ignore[attr-defined]
+        _get_decoder(model)._sae_stop_at_layer = stop_at_layer
 
     for (hook_name, _path, extractor, is_pre, _gather_fn), module in zip(hook_specs, modules):
 
@@ -836,8 +851,9 @@ def _collect_and_cleanup(model: nn.Module) -> dict[str, torch.Tensor]:
     for handle in model._sae_handles:  # type: ignore[attr-defined]
         handle.remove()
     del model._sae_captures, model._sae_handles  # type: ignore[attr-defined]
-    if hasattr(model.model, "_sae_stop_at_layer"):
-        del model.model._sae_stop_at_layer  # type: ignore[attr-defined]
+    decoder = _get_decoder(model)
+    if hasattr(decoder, "_sae_stop_at_layer"):
+        del decoder._sae_stop_at_layer
     return captures
 
 
@@ -909,8 +925,9 @@ def _collect_and_pin(model: nn.Module) -> bytes:
     for handle in model._sae_handles:  # type: ignore[attr-defined]
         handle.remove()
     del model._sae_captures, model._sae_handles  # type: ignore[attr-defined]
-    if hasattr(model.model, "_sae_stop_at_layer"):
-        del model.model._sae_stop_at_layer  # type: ignore[attr-defined]
+    decoder = _get_decoder(model)
+    if hasattr(decoder, "_sae_stop_at_layer"):
+        del decoder._sae_stop_at_layer
     _CUDA_IPC_PINNED = captures  # prevent GC until _release_pinned is called
     buf = io.BytesIO()
     ForkingPickler(buf, 2).dump(captures)
@@ -937,8 +954,9 @@ def _collect_and_pin_selective(
     for handle in model._sae_handles:  # type: ignore[attr-defined]
         handle.remove()
     del model._sae_captures, model._sae_handles  # type: ignore[attr-defined]
-    if hasattr(model.model, "_sae_stop_at_layer"):
-        del model.model._sae_stop_at_layer  # type: ignore[attr-defined]
+    decoder = _get_decoder(model)
+    if hasattr(decoder, "_sae_stop_at_layer"):
+        del decoder._sae_stop_at_layer
 
     global _CUDA_IPC_PINNED
     _CUDA_IPC_PINNED = captures
@@ -976,6 +994,7 @@ class HookedVLLMModel:
     - Gemma2ForCausalLM
     - Qwen2ForCausalLM
     - Qwen3ForCausalLM
+    - Qwen3_5ForConditionalGeneration (hook_resid_post only; full forward)
     """
 
     def __init__(

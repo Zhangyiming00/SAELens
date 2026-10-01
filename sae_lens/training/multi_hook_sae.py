@@ -49,11 +49,14 @@ def forward_tp_wavefront(
 
 
 class PendingWavefrontOutputs:
-    """Finish hooks in caller order, at most ``max_live_hooks`` main graphs at once.
+    """Consume hooks in fixed order with bounded, rolling encoder lookahead.
 
     ``pop`` returns ownership of the output to the trainer; this object NEVER
     retains it. Each finished hook can backward/update before the next AuxK is
-    constructed. A zero window means all main forwards (lazy finish only).
+    constructed. For a positive bound, decode/reduce the current hook before
+    admitting a future selection; refill only on the next pop, after the caller
+    has backwarded the previous hook. Future hooks keep encoder states only.
+    A zero window preserves all main forwards up front (legacy lazy control).
     All ranks must consume exactly the same ordered hooks. This runtime-only
     scheduler is not used to bypass Torch DDP's pre/post-forward lifecycle.
     """
@@ -73,6 +76,8 @@ class PendingWavefrontOutputs:
         self.context = forward_context
         self.autocast = autocast_context
         self.window = max_live_hooks or len(self.hooks)
+        self.rolling = max_live_hooks > 0
+        self.launched = 0
         self.cursor = 0
         self.states = {}
 
@@ -97,10 +102,34 @@ class PendingWavefrontOutputs:
         self.states[current] = state
         # Local aliases disappear when this method returns; no yielded state is retained.
 
+    def _encode_next(self):
+        hook = self.hooks[self.launched]
+        with self.autocast(), self.context(hook), cuda_nvtx_range(f"sae:{hook}:wavefront_encode"):
+            self.states[hook] = self.saes[hook].tp_wavefront_encode_launch(self.inputs[hook])
+        self.launched += 1
+
+    def _advance(self, hook):
+        if hook not in self.states:
+            self._encode_next()
+        state = self.states[hook]
+        with self.autocast(), self.context(hook), cuda_nvtx_range(f"sae:{hook}:wavefront_decode"):
+            self.saes[hook].tp_wavefront_decode_launch(state)
+        aux_launch = getattr(self.saes[hook], "tp_wavefront_aux_launch", None)
+        if aux_launch is not None:
+            with self.autocast(), self.context(hook), cuda_nvtx_range(f"sae:{hook}:wavefront_aux"):
+                aux_launch(state)
+        # Keep current reduction ahead of newly admitted Selects on the shared
+        # TP stream. The next encoder can overlap the current reductions; its
+        # decode/AuxK cannot delay this hook's finish/backward on the compute stream.
+        while self.launched < len(self.hooks) and len(self.states) < self.window:
+            self._encode_next()
+
     def pop(self, hook):
         if not self or hook != self.hooks[self.cursor]:
             raise RuntimeError("Wavefront outputs must be consumed once in fixed hook order")
-        if not self.states:
+        if self.rolling:
+            self._advance(hook)
+        elif not self.states:
             self._launch_window()
         state = self.states.pop(hook)
         with self.autocast(), self.context(hook), cuda_nvtx_range(f"sae:{hook}:wavefront_finish"):

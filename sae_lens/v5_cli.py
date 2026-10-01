@@ -283,7 +283,7 @@ def add_execution_arguments(parser):
         dest="sae_tp_overlap",
         choices=("lazy", "bounded", "eager", "off"),
         default=None,
-        help="Cross-hook TP communication/computation overlap; default lazy. Independent of optimizer overlap.",
+        help="TP overlap with early sharded AuxK selection (also for one hook); default bounded uses rolling encoder lookahead. Lazy/eager submit all main forwards first. Independent of optimizer overlap.",
     )
     public.add_argument(
         "--tp-overlap-max-live-hooks",
@@ -291,7 +291,7 @@ def add_execution_arguments(parser):
         type=int,
         metavar="N",
         default=2,
-        help="Live hook limit for bounded TP overlap; ignored by lazy/eager/off.",
+        help="Live main-graph limit for rolling bounded TP overlap (default 2); full retained outputs are additional storage. Ignored by lazy/eager/off.",
     )
     parser.add_argument(
         "--sae-tp-overlap",
@@ -365,7 +365,7 @@ def resolve_execution_arguments(args, argv):
     ):
         raise ValueError("Do not mix legacy wavefront controls with --tp-overlap")
     if not old_overlap:
-        args.sae_tp_overlap = args.sae_tp_overlap or "lazy"
+        args.sae_tp_overlap = args.sae_tp_overlap or "bounded"
         args.multi_sae_distributed_architecture = (
             "legacy_per_hook_wrapper"
             if args.sae_tp_overlap == "off"

@@ -380,7 +380,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     multi_sae_param_gather_schedule: Literal[
         "eager", "one_hook_lag", "after_backward"
     ] = "eager"
-    # Runtime only: preserve the eager control, or finish/backward hooks lazily.
+    # Runtime only: bounded rolls encoder lookahead and prioritizes current
+    # reduction/AuxK/backward; lazy/eager keep all main forwards up front.
     multi_sae_tp_wavefront_schedule: Literal["eager", "lazy", "bounded"] = "bounded"
     multi_sae_tp_wavefront_max_live_hooks: int = 2
     # auto: summaries in fit, full outputs for direct train-step callers.

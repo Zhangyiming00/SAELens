@@ -24,7 +24,12 @@ def configure_tp_wavefront(trainer, units):
     reason = None
     if mode != "unified_multi_hook":
         reason = "TP overlap is off"
-    elif len(units) < 2:
+    elif len(units) < 2 and not all(
+        callable(getattr(u.model, "tp_wavefront_aux_selection_supported", None))
+        and u.model.tp_wavefront_aux_selection_supported()
+        and u.model.cfg.auxk != 0
+        for u in units.values()
+    ):
         reason = "one local hook"
     elif context.tp_group.size() == 1:
         reason = "TP=1"
@@ -70,6 +75,14 @@ def configure_tp_wavefront(trainer, units):
     trainer._runtime_tp_wavefront_schedule = schedule
     trainer._runtime_tp_wavefront_max_live_hooks = window
     trainer._runtime_tp_wavefront = enabled
+    # SAETrainUnit agrees this capability over the entire TPxDP domain. For
+    # TP>1, DP>1 it requires native DDP, NCCL>=2.26 and implicit launch ordering
+    # enabled before initialization. Pending results already carry CUDA events;
+    # fixed host issue order then needs no extra CPU fence for these DP groups.
+    trainer._runtime_tp_wavefront_ordered_handoff = (
+        enabled and context.dp_group.size() > 1
+        and all(u.early_grad_sync for u in units.values())
+    )
     trainer._runtime_tp_wavefront_reason = reason
     trainer._runtime_tp_overlap = enabled
     trainer._runtime_tp_overlap_schedule = schedule if enabled else 'off'

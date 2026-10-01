@@ -22,7 +22,7 @@ from sae_lens.training.multi_sae_trainer import MultiSAETrainer
 from tests.saes.test_megatron_sae_trainers import _trainer_config
 
 
-def build(runtime, path, overlap, ga=3, amp=False, sharded=False, tiny=False, fast_path=True, ga1_norm=True, architecture="legacy_per_hook_wrapper"):
+def build(runtime, path, overlap, ga=3, amp=False, sharded=False, tiny=False, fast_path=True, ga1_norm=True, architecture="legacy_per_hook_wrapper", model_options=None, schedule="bounded"):
     ctx = runtime.require_local()
     device = f"cuda:{dist.get_rank()}"
     cfg = _trainer_config(device, path, architecture)
@@ -36,6 +36,7 @@ def build(runtime, path, overlap, ga=3, amp=False, sharded=False, tiny=False, fa
     )
     cfg.multi_sae_param_gather_schedule = os.environ.get("SAE_GATHER_SCHEDULE", "eager")
     cfg.multi_sae_optimizer_overlap = overlap
+    cfg.multi_sae_tp_wavefront_schedule = schedule
     models, wrapped = {}, {}
     for h in ctx.domain.hooks:
         torch.manual_seed(731 + int(h[1:]))
@@ -46,6 +47,7 @@ def build(runtime, path, overlap, ga=3, amp=False, sharded=False, tiny=False, fa
                 k=1 if tiny else 4,
                 device=device,
                 use_sparse_activations=False,
+                **(model_options or {}),
             ),
             runtime=runtime,
         )

@@ -22,6 +22,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from profile_static_memory_factors import CACHE, HOOKS, cases as memory_cases, dump, sha
 
 
+def hook_sources(count, *, repeat=False):
+    """Independent SAE owners; repeated cached inputs are explicitly opt-in."""
+    if type(count) is not int or count < 1 or (count > len(HOOKS) and not repeat):
+        raise ValueError("Invalid hook count; >3 requires --repeat-cached-hooks")
+    return {HOOKS[i] if i < len(HOOKS) else f"replica_{i}.{HOOKS[i % len(HOOKS)]}":
+            HOOKS[i % len(HOOKS)] for i in range(count)}
+
+
 def read_local_dead_mask(directory, tp, rank, d_sae):
     """Read the actual owner mask; counts are derived, never used as a proxy."""
     import torch
@@ -167,7 +175,8 @@ def worker(rank, args, c):
     torch.backends.cudnn.allow_tf32 = False
     dist.init_process_group("nccl", rank=rank, world_size=c["tp"] * c["dp"] * c["pp"],
                             init_method=f"file://{directory}/world", timeout=timedelta(seconds=180))
-    runtime = SAERuntime.from_layout(tp_size=c["tp"], dp_size=c["dp"], placement_size=c["pp"], hooks=tuple(HOOKS[:c["h"]]))
+    sources = hook_sources(c["h"], repeat=args.repeat_cached_hooks)
+    runtime = SAERuntime.from_layout(tp_size=c["tp"], dp_size=c["dp"], placement_size=c["pp"], hooks=tuple(sources))
     monitor = StaticFailureMonitor(runtime, set(runtime._owned_groups))
     runtime.failure_monitor = monitor
     backward_waits = []
@@ -218,19 +227,25 @@ def worker(rank, args, c):
                 torch.manual_seed(42)
                 model = MegatronTopKSAE(model_cfg, runtime=runtime)
             models[hook] = model
+            if not c.get("aux_selection_overlap", True):
+                # Benchmark ablation only: retain all common fixes, but launch
+                # AuxK selection in its original auxiliary decode path.
+                model.tp_wavefront_aux_select_launch = lambda state: None
             wrapped[hook] = wrap_runtime_sae(model, runtime, distributed_optimizer=c["zero"],
                 single_replica_fast_path=True, gradient_accumulation_fusion=True)
         trainer = MultiSAETrainer(hook_names=hooks, sae_by_hook=wrapped, base_sae_by_hook=models,
             data_provider=iter(()), save_checkpoint_fn=None, cfg=cfg, dp_group=ctx.dp_group,
             token_count_weighted_dp=True, sae_dp_mode="ddp", runtime=runtime)
         assert trainer.global_update_batch_size == c["batch"]
-        assert trainer._runtime_tp_wavefront == (c["wave"] != "off" and c["tp"] > 1 and len(hooks) > 1)
+        intra_aux = all(getattr(m, "tp_wavefront_aux_selection_supported", lambda: False)()
+                        and m.cfg.auxk != 0 for m in models.values())
+        assert trainer._runtime_tp_wavefront == (c["wave"] != "off" and c["tp"] > 1 and (len(hooks) > 1 or intra_aux))
         order = torch.load(CACHE / "global_row_order.pt", weights_only=True)[:c["batch"]]
         assert len(order) == c["batch"]
         order = order[ctx.dp_rank * local_total:(ctx.dp_rank + 1) * local_total]
         batches = [{} for _ in range(c["ga"])]
         for hook in hooks:
-            cached = torch.load(CACHE / f"{hook}.pt", map_location="cpu", weights_only=True, mmap=True)
+            cached = torch.load(CACHE / f"{sources[hook]}.pt", map_location="cpu", weights_only=True, mmap=True)
             for i, batch in enumerate(batches):
                 values = cached.index_select(0, order[i * micro:(i + 1) * micro]).float()
                 if values.shape[1] != c["d_in"]:
@@ -341,7 +356,7 @@ def worker(rank, args, c):
         del audit
         dump(directory / f"rank{rank}.json", dict(rank=rank, pid=os.getpid(), config=c,
             actual_dead_by_tp=dead_by_tp, dead_observation="extra_untimed_update",
-            local_hooks=hooks, microbatch=micro, trace=args.trace, steps=steps,
+            local_hooks=hooks, hook_sources=sources, microbatch=micro, trace=args.trace, steps=steps,
             effective_wavefront=trainer._runtime_tp_wavefront,
             effective_overlap=trainer._runtime_optimizer_overlap,
             gather=trainer._runtime_param_gather_schedule,
@@ -368,6 +383,8 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--cases", nargs="+")
     p.add_argument("--config-file", type=Path, help="JSON mapping of additional case names to complete configurations")
+    p.add_argument("--repeat-cached-hooks", action="store_true",
+                   help="Allow >3 independent SAEs by cycling the three cached layer inputs (shape experiment)")
     p.add_argument("--dead-mask-dir", type=Path,
                    help="Explicit bool [d_sae/TP] files tp{TP}_rank{rank}.pt; overrides case mask_dir and dead count. The untimed audit saves D and actual AuxK E/B.")
     p.add_argument("--input-width-policy", choices=("exact", "slice_repeat"), default="exact")
@@ -436,6 +453,8 @@ def main():
                    "--input-width-policy", args.input_width_policy]
         if args.config_file:
             command += ["--config-file", str(args.config_file)]
+        if args.repeat_cached_hooks:
+            command += ["--repeat-cached-hooks"]
         if args.dead_mask_dir:
             command += ["--dead-mask-dir", str(args.dead_mask_dir)]
         if args.trace:

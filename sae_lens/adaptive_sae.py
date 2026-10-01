@@ -371,7 +371,7 @@ def decode_adaptive(acts, vectors, cfg, *, auxiliary=False, known_columns=None):
     return out.reshape(*acts.leading_shape, vectors.shape[1]), info
 
 
-def try_direct_aux(scores, eligible, num_dead, k_aux, weight, norm, cfg):
+def try_direct_aux(scores, eligible, num_dead, k_aux, weight, norm, cfg, *, known_columns=None):
     """Exact select-all dense shortcut BEFORE building B*m ragged metadata.
 
     Returns None if any chosen stage is sparse or not compact. No communication
@@ -382,7 +382,7 @@ def try_direct_aux(scores, eligible, num_dead, k_aux, weight, norm, cfg):
     # Explicit sparse remains strict even in the select-all case.
     if 'sparse' in requests(cfg, True):
         return None
-    columns = eligible.nonzero(as_tuple=True)[0]
+    columns = eligible.nonzero(as_tuple=True)[0] if known_columns is None else known_columns
     rows, m = math.prod(scores.shape[:-1]), columns.numel()
     if (rows*m + weight.shape[0]*m)*max(4, weight.element_size()) > (getattr(cfg, 'v5_workspace_mib', DEFAULT_COMPUTE_WORKSPACE_MIB) << 20):
         return None

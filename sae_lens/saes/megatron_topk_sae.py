@@ -24,7 +24,9 @@ from sae_lens import adaptive_sae as execution
 from sae_lens.ragged_sae import (
     SelectedEntries, local_latent_tensor, represent_latents, selected_latents_view,
 )
-from sae_lens.auxk_compact import compact_aux_decode, prepare_auxk_dense
+from sae_lens.auxk_compact import (
+    PendingAuxKSelection, compact_aux_decode, launch_auxk_selection, prepare_auxk_dense,
+)
 from sae_lens.constants import SAE_CFG_FILENAME, SAE_WEIGHTS_FILENAME
 from sae_lens.megatron_tp import (
     _shard_init_topk_cpu,
@@ -34,6 +36,7 @@ from sae_lens.megatron_tp import (
     require_megatron_core,
 )
 from sae_lens.sae_runtime import SAERuntime
+from sae_lens.profiling import cuda_nvtx_range
 from sae_lens.saes.sae import TrainingSAE, TrainStepInput, TrainStepOutput
 from sae_lens.saes.topk_sae import (
     SparseHookPoint,
@@ -57,6 +60,8 @@ from sae_lens.sharded_topk import (
 class MegatronTPWavefrontState(TopKTPWavefrontState):
     decoder_norm: torch.Tensor | None = None
     decoder_vectors: torch.Tensor | None = None
+    aux_reconstruction: tuple[Any, float] | None = None
+    aux_selection: PendingAuxKSelection | None = None
 
 
 class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
@@ -288,7 +293,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                     "Consume the explicit local encode() output, or select legacy."
                 )
 
-    def _build_train_step_output(self, step_input, feature_acts, hidden_pre, sae_out):
+    def _build_train_step_output(self, step_input, feature_acts, hidden_pre, sae_out, *, aux_losses=None):
         if (self._decoupled_execution or self.sharded_latents) and step_input.sae_in.shape[0] == 0:
             # Empty replicas must still produce connected zero parameter gradients.
             zero = sae_out.sum() * 0.0 + hidden_pre.sum() * 0.0
@@ -299,14 +304,19 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             )
         else:
             result = super()._build_train_step_output(
-                step_input, feature_acts, hidden_pre, sae_out
+                step_input, feature_acts, hidden_pre, sae_out, aux_losses=aux_losses
             )
         if self._decoupled_execution:
             kind = execution.branch_representation(self.cfg)
             local = local_latent_tensor(feature_acts, kind, self.tp_rank, self.cfg.d_sae // self.tp_size)
-            result.feature_firing_counts = sharded_firing_counts(local, self._tp_group)
         elif self.sharded_latents:
-            result.feature_firing_counts = sharded_firing_counts(feature_acts, self._tp_group)
+            local = feature_acts
+        else:
+            return result
+        if getattr(step_input, "defer_tp_firing_counts", False):
+            result.local_feature_firing_counts = sharded_firing_counts(local, None)
+        else:
+            result.feature_firing_counts = sharded_firing_counts(local, self._tp_group)
         return result
 
     def get_activation_fn(self) -> TopK:
@@ -439,7 +449,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         offset = self.tp_rank * width
         self._record_aux_winner_count(((indices >= offset) & (indices < offset + width)).sum())
 
-    def _execution_full_aux(self, hidden_pre, mask, num_dead, requested, winner_count=None):
+    def _execution_full_aux(self, hidden_pre, mask, num_dead, requested, winner_count=None, known_columns=None):
         """Reuse full Main logits; gather only when Main kept local logits."""
         width = self.cfg.d_sae // self.tp_size
         if hidden_pre.shape[-1] != self.cfg.d_sae:
@@ -447,7 +457,8 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         stages = execution.stage_requests(self.cfg, True)
         k = min(requested, num_dead)
         columns = (
-            mask.narrow(0, self.tp_rank * width, width).nonzero(as_tuple=True)[0]
+            (mask.narrow(0, self.tp_rank * width, width).nonzero(as_tuple=True)[0]
+             if known_columns is None else known_columns)
             if stages != ("local_dense",) * 3
             else None
         )
@@ -561,13 +572,14 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         )
         return out
 
-    def _execution_aux(self, hidden_pre, mask, num_dead, requested, winner_count=None):
+    def _execution_aux(self, hidden_pre, mask, num_dead, requested, winner_count=None, known_columns=None,
+                       pending_selection=None):
         from sae_lens.adaptive_sae import try_direct_aux
         from sae_lens.ragged_sae import ragged_auxk
 
         kind = execution.branch_representation(self.cfg, True)
         if kind == "full":
-            return self._execution_full_aux(hidden_pre, mask, num_dead, requested, winner_count)
+            return self._execution_full_aux(hidden_pre, mask, num_dead, requested, winner_count, known_columns)
         stages = execution.stage_requests(self.cfg, True)
         width = self.cfg.d_sae // self.tp_size
         if hidden_pre.shape[-1] == self.cfg.d_sae and self.tp_size > 1:
@@ -586,6 +598,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 self.decoder.weight,
                 norm,
                 self.cfg,
+                known_columns=known_columns,
             )
             if direct is not None:
                 out, diagnostic = direct
@@ -595,7 +608,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 self._last_auxk_execution = diagnostic
                 return out
         columns = (
-            local_mask.nonzero(as_tuple=True)[0]
+            (local_mask.nonzero(as_tuple=True)[0] if known_columns is None else known_columns)
             if stages != ("local_dense",) * 3
             else None
         )
@@ -604,7 +617,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             ("compact_dense",) * 3,
         )
         if packed:
-            local = ragged_auxk(
+            local = pending_selection.wait()[0] if pending_selection is not None else ragged_auxk(
                 hidden_pre,
                 k,
                 local_mask,
@@ -615,12 +628,13 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 key_backend=self.cfg.topk_key_backend,
                 complement=self.cfg.auxk_complement,
                 tie_policy=self.cfg.topk_tie_policy,
+                known_columns=known_columns,
             )
             selection = local.selection
             if winner_count is not None:
                 winner_count(local.nnz)
         else:
-            local, _, plan = prepare_auxk_dense(
+            local, _, plan = pending_selection.wait(winner_count=winner_count) if pending_selection is not None else prepare_auxk_dense(
                 hidden_pre,
                 k,
                 local_mask,
@@ -633,6 +647,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 key_backend=self.cfg.topk_key_backend,
                 tie_policy=self.cfg.topk_tie_policy,
                 winner_count=winner_count,
+                known_columns=known_columns,
             )
             selection = plan.selection
         acts = represent_latents(local, kind, self._tp_group)
@@ -742,18 +757,20 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             )
         return result.reshape(*local.shape[:-1], self.cfg.d_in)
 
-    def _decode_features(self, feature_acts: torch.Tensor) -> torch.Tensor:
+    def _decode_features(self, feature_acts: torch.Tensor, *, wavefront=False) -> torch.Tensor:
         if self._decoupled_execution:
             partial = self._decode_execution_partial(feature_acts)
-            if self.tp_size > 1:
+            if self.tp_size > 1 and not wavefront:
                 partial = require_megatron_core().reduce_from_tensor_model_parallel_region(partial, group=self._tp_group)
             return partial
         if self.sharded_latents:
-            return self._decode_local(feature_acts)
+            return self._decode_local(feature_acts, wavefront=wavefront)
         if feature_acts.is_sparse:
             feature_acts = feature_acts.to_dense()
         width = self.cfg.d_sae // self.tp_size
         local = feature_acts.narrow(-1, self.tp_rank * width, width)
+        if wavefront:
+            return self._native_dense_partial(local)
         if self.cfg.rescale_acts_by_decoder_norm:
             local = local * (1 / self._decoder_norm())
         result, _ = self.decoder(local.reshape(-1, width))
@@ -766,13 +783,33 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         out = self.run_time_activation_norm_fn_out(out)
         return self.reshape_fn_out(out, self.d_head)
 
-    def calculate_aux_loss(
-        self,
-        step_input: TrainStepInput,
-        feature_acts: torch.Tensor,
-        hidden_pre: torch.Tensor,
-        sae_out: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
+    def prepare_auxk_metadata(self, mask, num_dead):
+        """Prepare mask-only metadata once per immutable gradient window."""
+        if not num_dead or not (self._decoupled_execution or self.sharded_latents):
+            return None
+        width = self.cfg.d_sae // self.tp_size
+        return mask.narrow(0, self.tp_rank * width, width).nonzero(as_tuple=True)[0]
+
+    def calculate_aux_loss(self, step_input, feature_acts, hidden_pre, sae_out):
+        prepared = self._prepare_aux_reconstruction(step_input, hidden_pre)
+        return self._consume_aux_reconstruction(step_input, sae_out, prepared)
+
+    def _consume_aux_reconstruction(self, step_input, sae_out, prepared):
+        recons, scale = prepared
+        if recons is None:
+            loss = sae_out.new_tensor(0.0)
+        else:
+            if not isinstance(recons, torch.Tensor):
+                recons = recons.wait()
+            recons = self.reshape_fn_out(recons, self.d_head)
+            residual = (step_input.sae_in - sae_out).detach()
+            loss = (self.cfg.aux_loss_coefficient * scale
+                    * (recons - residual).pow(2).sum(dim=-1).mean())
+        return {"auxiliary_reconstruction_loss": loss}
+
+    def _prepare_aux_reconstruction(self, step_input, hidden_pre, *, wavefront=False,
+                                    pending_selection=None):
+        """Select/decode using current parameters, without the main residual."""
         winner_count = None
         if getattr(self, "_record_aux_winners", False):
             self._aux_winner_entries = 0
@@ -781,124 +818,167 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             self._last_auxk_execution = {
                 "selection": "disabled", "decoder": "skipped", "k": 0,
             }
-            return {"auxiliary_reconstruction_loss": sae_out.new_tensor(0.0)}
+            return None, 0.0
         mask = step_input.dead_neuron_mask
-        if mask is None or (num_dead := int(mask.sum())) == 0:
+        num_dead = getattr(step_input, "dead_neuron_count", None)
+        if num_dead is None:
+            num_dead = 0 if mask is None else int(mask.sum())
+        known_columns = getattr(step_input, "auxk_local_columns", None)
+        if num_dead == 0:
             self._last_auxk_execution = {"selection": "skipped", "decoder": "skipped", "num_dead": 0}
-            loss = sae_out.new_tensor(0.0)
-        else:
-            if self.cfg.normalize_activations in (
-                "constant_norm_rescale",
-                "layer_norm",
-            ):
-                raise ValueError(
-                    "TopK auxiliary loss does not support activation normalization"
-                )
-            configured_auxk = getattr(self.cfg, "auxk", None)
-            k_aux = self.cfg.d_in // 2 if configured_auxk is None else int(configured_auxk)
-            scale = min(num_dead / k_aux, 1.0)
-            if self._decoupled_execution:
-                recons = self._execution_aux(hidden_pre, mask, num_dead, k_aux, winner_count)
-                if self.tp_size > 1:
-                    recons = require_megatron_core().reduce_from_tensor_model_parallel_region(recons, group=self._tp_group)
-            elif self.sharded_latents:
-                width = self.cfg.d_sae // self.tp_size
-                if mask.shape != (self.cfg.d_sae,):
-                    raise ValueError("Dead mask must be the existing global [d_sae] summary")
-                local_mask = mask.narrow(0, self.tp_rank * width, width)
-                if self.cfg.topk_backend == "sharded_ragged":
-                    from sae_lens.adaptive_sae import active, try_direct_aux
-                    from sae_lens.ragged_sae import ragged_auxk
-                    enabled = active(self.cfg, True)
-                    direct = None
-                    if enabled:
-                        norm = self._decoder_norm() if self.cfg.rescale_acts_by_decoder_norm else None
-                        direct = try_direct_aux(hidden_pre, local_mask, num_dead, k_aux,
-                                                self.decoder.weight, norm, self.cfg)
-                    if direct is not None:
-                        recons, self._last_auxk_execution = direct
-                        if winner_count is not None:
-                            winner_count(self._last_auxk_execution["entries"])
-                    else:
-                        aux = ragged_auxk(hidden_pre, min(k_aux, num_dead), local_mask, num_dead, self._tp_group,
-                                          policy=getattr(self.cfg, "auxk_selection", "auto"),
-                                          protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
-                                          complement=getattr(self.cfg, "auxk_complement", "auto"),
-                                          tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"))
-                        if winner_count is not None:
-                            winner_count(aux.nnz)
-                        # Eligible IDs are shared across this batch, not values.
-                        columns = local_mask.nonzero(as_tuple=True)[0] if enabled else None
-                        recons = self._decode_ragged_partial(aux, auxiliary=True, known_columns=columns)
-                    self._last_auxk_execution.update(num_dead=num_dead, k=min(k_aux, num_dead))
-                    if self.tp_size > 1:
-                        recons = require_megatron_core().reduce_from_tensor_model_parallel_region(recons, group=self._tp_group)
-                elif self.cfg.topk_backend == "sharded_dense":
-                    aux, columns, plan = prepare_auxk_dense(
-                        hidden_pre, min(k_aux, num_dead), local_mask, num_dead, self._tp_group,
-                        decoder=getattr(self.cfg, "auxk_decoder_backend", "auto"),
-                        complement=getattr(self.cfg, "auxk_complement", "auto"),
-                        selection_policy=getattr(self.cfg, "auxk_selection", "auto"),
-                        protocol=self.cfg.topk_candidate_protocol,
-                        key_backend=self.cfg.topk_key_backend,
-                        tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"),
-                        winner_count=winner_count,
-                    )
-                    # Diagnostics retain scalars only; never tensors/autograd state.
-                    self._last_auxk_execution = {
-                        "selection": plan.selection, "decoder": plan.decoder,
-                        "num_dead": num_dead, "k": plan.k, "exclude_k": plan.exclude_k,
-                        "compact_width": None if columns is None else columns.numel(),
-                        "comparison_key_backend": (
-                            "torch" if plan.selection.startswith("complement") else
-                            "none" if plan.selection == "select_all" else self.cfg.topk_key_backend
-                        ),
-                    }
-                    if columns is not None:
-                        if (self.decoder.gradient_accumulation_fusion and
-                            not getattr(self.decoder.weight, "zero_out_wgrad", False)):
-                            raise RuntimeError(
-                                "Compact AuxK needs zero_out_wgrad for fused main + ordinary auxiliary "
-                                "gradients. Configure auxk_decoder_backend before wrapping native DDP "
-                                "and call configure_gradient_accumulation_fusion again after changing it."
-                            )
-                        norm = self._decoder_norm() if self.cfg.rescale_acts_by_decoder_norm else None
-                        recons = compact_aux_decode(aux, columns, self.decoder.weight, norm)
-                        if self.tp_size > 1:
-                            recons = require_megatron_core().reduce_from_tensor_model_parallel_region(
-                                recons, group=self._tp_group
-                            )
-                    else:
-                        recons = self._decode_features(aux)
-                else:
-                    aux = sharded_auxk(
-                        hidden_pre, min(k_aux, num_dead), local_mask, num_dead, self._tp_group,
-                        sparse=True, policy=getattr(self.cfg, "auxk_selection", "auto"),
-                        protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
-                        tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"),
-                        winner_count=winner_count,
-                    )
-                    recons = self._decode_features(aux)
-            else:
-                aux = calculate_topk_aux_acts(
-                    min(k_aux, num_dead), hidden_pre, mask,
-                    winner_indices=self._record_aux_winner_indices if winner_count is not None else None,
-                )
-                recons = self._decode_features(aux)
-            recons = self.reshape_fn_out(recons, self.d_head)
-            residual = (step_input.sae_in - sae_out).detach()
-            loss = (
-                self.cfg.aux_loss_coefficient
-                * scale
-                * (recons - residual).pow(2).sum(dim=-1).mean()
+            return None, 0.0
+        if self.cfg.normalize_activations in (
+            "constant_norm_rescale",
+            "layer_norm",
+        ):
+            raise ValueError(
+                "TopK auxiliary loss does not support activation normalization"
             )
-        return {"auxiliary_reconstruction_loss": loss}
+        configured_auxk = getattr(self.cfg, "auxk", None)
+        k_aux = self.cfg.d_in // 2 if configured_auxk is None else int(configured_auxk)
+        scale = min(num_dead / k_aux, 1.0)
+        if self._decoupled_execution:
+            recons = self._execution_aux(hidden_pre, mask, num_dead, k_aux, winner_count, known_columns,
+                                         pending_selection=pending_selection)
+            if self.tp_size > 1 and not wavefront:
+                recons = require_megatron_core().reduce_from_tensor_model_parallel_region(recons, group=self._tp_group)
+        elif self.sharded_latents:
+            width = self.cfg.d_sae // self.tp_size
+            if mask.shape != (self.cfg.d_sae,):
+                raise ValueError("Dead mask must be the existing global [d_sae] summary")
+            local_mask = mask.narrow(0, self.tp_rank * width, width)
+            if self.cfg.topk_backend == "sharded_ragged":
+                from sae_lens.adaptive_sae import active, try_direct_aux
+                from sae_lens.ragged_sae import ragged_auxk
+                enabled = active(self.cfg, True)
+                direct = None
+                if enabled:
+                    norm = self._decoder_norm() if self.cfg.rescale_acts_by_decoder_norm else None
+                    direct = try_direct_aux(hidden_pre, local_mask, num_dead, k_aux,
+                                            self.decoder.weight, norm, self.cfg, known_columns=known_columns)
+                if direct is not None:
+                    recons, self._last_auxk_execution = direct
+                    if winner_count is not None:
+                        winner_count(self._last_auxk_execution["entries"])
+                else:
+                    aux = pending_selection.wait()[0] if pending_selection is not None else ragged_auxk(hidden_pre, min(k_aux, num_dead), local_mask, num_dead, self._tp_group,
+                                      policy=getattr(self.cfg, "auxk_selection", "auto"),
+                                      protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
+                                      complement=getattr(self.cfg, "auxk_complement", "auto"),
+                                      tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"),
+                                      known_columns=known_columns)
+                    if winner_count is not None:
+                        winner_count(aux.nnz)
+                    # Eligible IDs are shared across this batch, not values.
+                    columns = (local_mask.nonzero(as_tuple=True)[0] if known_columns is None else known_columns) if enabled else None
+                    recons = self._decode_ragged_partial(aux, auxiliary=True, known_columns=columns)
+                self._last_auxk_execution.update(num_dead=num_dead, k=min(k_aux, num_dead))
+                if self.tp_size > 1 and not wavefront:
+                    recons = require_megatron_core().reduce_from_tensor_model_parallel_region(recons, group=self._tp_group)
+            elif self.cfg.topk_backend == "sharded_dense":
+                aux, columns, plan = pending_selection.wait(winner_count=winner_count) if pending_selection is not None else prepare_auxk_dense(
+                    hidden_pre, min(k_aux, num_dead), local_mask, num_dead, self._tp_group,
+                    decoder=getattr(self.cfg, "auxk_decoder_backend", "auto"),
+                    complement=getattr(self.cfg, "auxk_complement", "auto"),
+                    selection_policy=getattr(self.cfg, "auxk_selection", "auto"),
+                    protocol=self.cfg.topk_candidate_protocol,
+                    key_backend=self.cfg.topk_key_backend,
+                    tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"),
+                    winner_count=winner_count,
+                    known_columns=known_columns,
+                )
+                # Diagnostics retain scalars only; never tensors/autograd state.
+                self._last_auxk_execution = {
+                    "selection": plan.selection, "decoder": plan.decoder,
+                    "num_dead": num_dead, "k": plan.k, "exclude_k": plan.exclude_k,
+                    "compact_width": None if columns is None else columns.numel(),
+                    "comparison_key_backend": (
+                        "torch" if plan.selection.startswith("complement") else
+                        "none" if plan.selection == "select_all" else self.cfg.topk_key_backend
+                    ),
+                }
+                if columns is not None:
+                    if (self.decoder.gradient_accumulation_fusion and
+                        not getattr(self.decoder.weight, "zero_out_wgrad", False)):
+                        raise RuntimeError(
+                            "Compact AuxK needs zero_out_wgrad for fused main + ordinary auxiliary "
+                            "gradients. Configure auxk_decoder_backend before wrapping native DDP "
+                            "and call configure_gradient_accumulation_fusion again after changing it."
+                        )
+                    norm = self._decoder_norm() if self.cfg.rescale_acts_by_decoder_norm else None
+                    recons = compact_aux_decode(aux, columns, self.decoder.weight, norm)
+                    if self.tp_size > 1 and not wavefront:
+                        recons = require_megatron_core().reduce_from_tensor_model_parallel_region(
+                            recons, group=self._tp_group
+                        )
+                else:
+                    recons = self._decode_features(aux, wavefront=wavefront)
+            else:
+                aux = pending_selection.wait(winner_count=winner_count)[0] if pending_selection is not None else sharded_auxk(
+                    hidden_pre, min(k_aux, num_dead), local_mask, num_dead, self._tp_group,
+                    sparse=True, policy=getattr(self.cfg, "auxk_selection", "auto"),
+                    protocol=self.cfg.topk_candidate_protocol, key_backend=self.cfg.topk_key_backend,
+                    tie_policy=getattr(self.cfg, "topk_tie_policy", "stable_id"),
+                    winner_count=winner_count,
+                    known_columns=known_columns,
+                )
+                recons = self._decode_features(aux, wavefront=wavefront)
+        else:
+            aux = calculate_topk_aux_acts(
+                min(k_aux, num_dead), hidden_pre, mask,
+                winner_indices=self._record_aux_winner_indices if winner_count is not None else None,
+            )
+            recons = self._decode_features(aux, wavefront=wavefront)
+        if wavefront:
+            recons = megatron_tp_launch(recons, self._tp_group, gather=False)
+        return recons, scale
 
     def sync_tensor_parallel_gradients(self) -> None:
         """Megatron's bias-edge reduction completes TP gradients in backward."""
 
     def tp_wavefront_supported(self) -> bool:
         return self.tp_size > 1 and self.encoder.weight.is_cuda
+
+    def tp_wavefront_aux_selection_supported(self) -> bool:
+        """Aux selection can use the local encoder logits before main decode."""
+        return (execution.branch_representation(self.cfg, True) != "full"
+                if self._decoupled_execution else self.sharded_latents)
+
+    def tp_wavefront_aux_select_launch(self, state: MegatronTPWavefrontState) -> None:
+        if not self.tp_wavefront_aux_selection_supported() or self.cfg.auxk == 0:
+            return
+        step_input = state.step_input
+        mask = step_input.dead_neuron_mask
+        num_dead = step_input.dead_neuron_count
+        if num_dead is None:
+            num_dead = 0 if mask is None else int(mask.sum())
+        requested = self.cfg.d_in // 2 if self.cfg.auxk is None else self.cfg.auxk
+        if not num_dead or (num_dead <= requested and self.cfg.auxk_selection == "auto"):
+            # Select-all has no comparison work to overlap. Keep its direct
+            # compact decoder path and avoid an otherwise redundant event.
+            return
+        if state.aux_selection is not None:
+            raise RuntimeError("AuxK selection must be submitted once")
+        width = self.cfg.d_sae // self.tp_size
+        if self._decoupled_execution:
+            stages = execution.stage_requests(self.cfg, True)
+            packed = execution.branch_representation(self.cfg, True) == "sharded_ragged" or stages not in (
+                ("local_dense",) * 3, ("compact_dense",) * 3,
+            )
+            layout, decoder = ("ragged", "auto") if packed else ("dense", "local_dense")
+        else:
+            layout = {"sharded_dense": "dense", "sharded_sparse": "sparse", "sharded_ragged": "ragged"}[self.cfg.topk_backend]
+            decoder = self.cfg.auxk_decoder_backend if layout == "dense" else "auto"
+        with cuda_nvtx_range("sae_auxk:selection_launch"):
+            state.aux_selection = launch_auxk_selection(
+                state.hidden_pre_local, min(requested, num_dead),
+                mask.narrow(0, self.tp_rank * width, width), num_dead, self._tp_group,
+                layout=layout, decoder=decoder, complement=self.cfg.auxk_complement,
+                selection_policy=self.cfg.auxk_selection, protocol=self.cfg.topk_candidate_protocol,
+                key_backend=self.cfg.topk_key_backend, tie_policy=self.cfg.topk_tie_policy,
+                known_columns=step_input.auxk_local_columns,
+                stream=_wavefront_stream(state.hidden_pre_local.device),
+            )
 
     def tp_wavefront_encode_launch(
         self, step_input: TrainStepInput
@@ -934,6 +1014,10 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         )
 
     def tp_wavefront_decode_launch(self, state: MegatronTPWavefrontState) -> None:
+        # The main selection's ready event precedes Aux selection on the same
+        # TP stream. Main decode can therefore run while Aux selects; its TP
+        # reduction is issued afterwards in identical host order on every rank.
+        self.tp_wavefront_aux_select_launch(state)
         if self._decoupled_execution:
             self._check_sharded_post_hooks()
             if execution.branch_representation(self.cfg) == "full":
@@ -990,17 +1074,32 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         state.decode_bias = self.b_dec
         state.reduce = megatron_tp_launch(recons, self._tp_group, gather=False)
 
+    def tp_wavefront_aux_launch(self, state: MegatronTPWavefrontState) -> None:
+        if state.hidden_pre is None:
+            raise RuntimeError("AuxK requires encoded logits")
+        if state.aux_reconstruction is None:
+            with self._share_decoder_norm(state.decoder_norm, state.decoder_vectors):
+                state.aux_reconstruction = self._prepare_aux_reconstruction(
+                    state.step_input, state.hidden_pre, wavefront=True,
+                    pending_selection=state.aux_selection,
+                )
+                state.aux_selection = None
+                state.decoder_vectors = self._decoder_vectors_scope[0]
+
     def tp_wavefront_finish(self, state: MegatronTPWavefrontState) -> TrainStepOutput:
         if state.reduce is None or state.hidden_pre is None or state.feature_acts is None:
             raise RuntimeError("Incomplete Megatron TP wavefront state")
+        # Only residual/loss consumes the main reconstruction. Aux selection,
+        # local decode and its pending TP reduction can be issued beforehand.
+        self.tp_wavefront_aux_launch(state)
         out = self.hook_sae_recons(state.reduce.wait() + self.b_dec)
         out = self.run_time_activation_norm_fn_out(out)
         out = self.reshape_fn_out(out, self.d_head)
-        # Auxiliary reconstruction keeps the ordinary native decoder path,
-        # including the encode bias-edge reduction and input-gradient fallback.
+        aux_losses = self._consume_aux_reconstruction(state.step_input, out, state.aux_reconstruction)
         with self._share_decoder_norm(state.decoder_norm, state.decoder_vectors):
             return self._build_train_step_output(
-                state.step_input, state.feature_acts, state.hidden_pre, out
+                state.step_input, state.feature_acts, state.hidden_pre, out,
+                aux_losses=aux_losses,
             )
 
     def _tp_param_shard_dims(self) -> dict[str, int | None]:

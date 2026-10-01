@@ -1060,12 +1060,18 @@ class MultiSAETrainer:
         """Fence a completed TP phase before traffic on a different NCCL group.
 
         ``auto`` is intentionally narrow: it is active only for the new local
-        cross-hook TP forward when either (a) this SAE also has a distinct,
-        multi-rank DDP communicator or (b) producer and SAE roles share this rank.
+        cross-hook TP forward when either (a) this SAE has a distinct multi-rank
+        DDP communicator without an agreed native launch-order contract or (b)
+        producer and SAE roles share this rank.
         ``always`` is a debug/safety override and ``off`` preserves the fully
         asynchronous behavior.
-        The fence is placed *after* the whole cross-hook TP wavefront, never
-        between hooks, so it does not destroy H_i/H_(i+1) forward overlap.
+        Eager execution calls this once after building all outputs. Incremental
+        execution calls it at each finish -> backward hand-off; under auto's
+        hazards this IS a per-hook host wait. It is not a whole-device drain.
+        Native runtime TP/DP can use the contract agreed in configure_tp_wavefront:
+        all ranks issue the same schedule, implicit NCCL launch ordering is on,
+        and pending tensors establish consumer CUDA-event dependencies. That
+        contract does not cover a colocated producer or legacy DDP wrappers.
         """
 
         mode = self._tp_phase_fence_mode
@@ -1091,15 +1097,17 @@ class MultiSAETrainer:
                 and self.dp_group is not None
                 and self.dp_group is not self._tp_group()
             )
+            if (getattr(self, "_runtime_tp_wavefront", False)
+                    and getattr(self, "_runtime_tp_wavefront_ordered_handoff", False)):
+                distinct_dp_group = False
             if not cross_hook_tp_forward or not (
                 producer_sae_overlap or distinct_dp_group
             ):
                 return
         current = torch.cuda.current_stream(torch.device(self.cfg.device))
-        self._tp_phase_event.record(current)
-        # Host-visible by design.  This is a phase fence, not a per-collective
-        # synchronization; it prevents rank-dependent TP/DP enqueue interleaving.
-        self._tp_phase_event.synchronize()
+        with cuda_nvtx_range("sae:tp_phase_fence"):
+            self._tp_phase_event.record(current)
+            self._tp_phase_event.synchronize()
 
     def _train_step_ddp_optimizer_overlap_v2(
         self,

@@ -213,6 +213,9 @@ class TrainStepOutput:
     # Optional replicated [d_sae] summary. Never a token-by-feature tensor.
     # Sharded backends populate this once on all TP ranks, outside logging paths.
     feature_firing_counts: torch.Tensor | None = None
+    # Runtime-owned intermediate: local shard counts, resolved at window end.
+    # Never expose these as a replicated feature summary to logging callers.
+    local_feature_firing_counts: torch.Tensor | None = None
 
 
 @dataclass
@@ -224,6 +227,10 @@ class TrainStepInput:
     dead_neuron_mask: torch.Tensor | None
     n_training_steps: int
     is_logging_step: bool
+    defer_tp_firing_counts: bool = False
+    # Valid only for this input's immutable gradient-window mask.
+    dead_neuron_count: int | None = None
+    auxk_local_columns: torch.Tensor | None = None
 
 
 class TrainCoefficientConfig(NamedTuple):
@@ -994,16 +1001,19 @@ class TrainingSAE(SAE[T_TRAINING_SAE_CONFIG], ABC):
         feature_acts: torch.Tensor,
         hidden_pre: torch.Tensor,
         sae_out: torch.Tensor,
+        *,
+        aux_losses: torch.Tensor | dict[str, torch.Tensor] | None = None,
     ) -> TrainStepOutput:
         """Build losses/output from already-computed training-forward tensors."""
         per_item_mse_loss = self.mse_loss_fn(sae_out, step_input.sae_in)
         mse_loss = per_item_mse_loss.sum(dim=-1).mean()
-        aux_losses = self.calculate_aux_loss(
-            step_input=step_input,
-            feature_acts=feature_acts,
-            hidden_pre=hidden_pre,
-            sae_out=sae_out,
-        )
+        if aux_losses is None:
+            aux_losses = self.calculate_aux_loss(
+                step_input=step_input,
+                feature_acts=feature_acts,
+                hidden_pre=hidden_pre,
+                sae_out=sae_out,
+            )
         total_loss = mse_loss
         losses = {"mse_loss": mse_loss}
         if isinstance(aux_losses, dict):

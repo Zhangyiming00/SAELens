@@ -38,6 +38,7 @@ class StaticFailureMonitor:
             )
         )
         self.error = None
+        self._abort_errors = []
         self._communication_guards = []
         self.vllm_comms = []
         vllm_state = sys.modules.get("vllm.distributed.parallel_state")
@@ -123,23 +124,36 @@ class StaticFailureMonitor:
             for group in self.owned_groups:
                 if dist.get_backend(group) == "nccl":
                     backends.append(group._get_backend(torch.device("cuda")))
-            if backends:
-                # Grouping aborts prevents cyclic waits among overlapping NCCL
-                # communicators. Keep Python's group registry for normal close().
-                backends[0]._group_start()
-                try:
-                    for comm in self.vllm_comms:
-                        result = comm.nccl.lib.ncclCommAbort(comm.comm)
-                        comm.comm = ctypes.c_void_p()
-                        comm.available = False
-                        comm.nccl.NCCL_CHECK(result)
-                    for backend in backends:
-                        backend.abort()
-                    for comm in self.vllm_comms:
-                        comm.disabled = True
-                finally:
-                    backends[0]._group_end()
+            self._abort_communicators(backends)
             return
+
+    def _abort_communicators(self, backends):
+        # ProcessGroupNCCL.abort dispatches abortComms to a C++ async thread and
+        # then waits for it. A Python-thread ncclGroupStart does not group those
+        # calls. Waiting for one backend before starting the others can deadlock
+        # with outstanding work across TP/DP communicators. Start every owned
+        # abort before joining any; keep the group registry for runtime.close().
+        def abort_vllm(comm):
+            result = comm.nccl.lib.ncclCommAbort(comm.comm)
+            comm.comm = ctypes.c_void_p()
+            comm.available = False
+            comm.disabled = True
+            comm.nccl.NCCL_CHECK(result)
+
+        def run(abort):
+            try:
+                abort()
+            except BaseException as exc:
+                self._abort_errors.append(exc)
+
+        aborts = [backend.abort for backend in backends]
+        aborts.extend(lambda comm=comm: abort_vllm(comm) for comm in self.vllm_comms)
+        workers = [threading.Thread(target=run, args=(abort,), daemon=True,
+                                    name=f"sae-abort-{i}") for i, abort in enumerate(aborts)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
 
     def _wait(self, keys):
         while True:
@@ -183,6 +197,10 @@ class StaticFailureMonitor:
         started = time.perf_counter() if observer is not None else 0.0
         polls = 0
         sleep_s = 0.0
+        # Rank arrival skew is usually much shorter than 5 ms. Start with a
+        # short yielding wait, then back off to the existing ceiling for slow
+        # peers. Every iteration still checks failure and EVERY rank's sequence.
+        poll_delay_s = 0.0001
         completed = False
         try:
             self.check()
@@ -198,7 +216,8 @@ class StaticFailureMonitor:
                 if observer is not None:
                     polls += 1
                     before_sleep = time.perf_counter()
-                self._stop.wait(0.005)
+                self._stop.wait(poll_delay_s)
+                poll_delay_s = min(poll_delay_s * 2, 0.005)
                 if observer is not None:
                     sleep_s += time.perf_counter() - before_sleep
         finally:
@@ -230,6 +249,8 @@ class StaticFailureMonitor:
             raise RuntimeError(
                 "Static failure monitor did not finish communicator aborts"
             )
+        if self._abort_errors:
+            raise RuntimeError("Static failure communicator abort failed") from self._abort_errors[0]
         for device_comm, name, method in self._communication_guards:
             setattr(device_comm, name, method)
         self._communication_guards.clear()

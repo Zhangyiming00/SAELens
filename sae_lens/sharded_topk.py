@@ -69,6 +69,7 @@ def _local_candidates(
     key_backend: str,
     *,
     workspace_bytes: int = 256 * 1024 * 1024,
+    known_columns: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Bound comparison-key scratch independently of token batch size.
 
@@ -84,7 +85,7 @@ def _local_candidates(
         # AuxK ranks can own few (or no) eligible features. Scan their actual
         # columns, while retaining the existing uniform candidate payload and
         # original global feature-ID tie order. Main TopK is unchanged.
-        eligible_columns = eligible.nonzero(as_tuple=True)[0]
+        eligible_columns = eligible.nonzero(as_tuple=True)[0] if known_columns is None else known_columns
         if eligible_columns.numel() < width:
             columns = eligible_columns
     scan_width = width if columns is None else columns.numel()
@@ -93,7 +94,10 @@ def _local_candidates(
         out_keys[:, take:].fill_(_MIN_KEY)
         # Padding must address unique INELIGIBLE columns: dense scatter would
         # otherwise overwrite a selected feature (often ID 0) with padded zero.
-        padding = (~eligible).nonzero(as_tuple=True)[0][:n - take]
+        # With prepared mask metadata, use a fixed-size GPU result instead of
+        # another dynamic nonzero/host synchronization in the selection stream.
+        padding = ((~eligible).nonzero(as_tuple=True)[0][:n - take] if known_columns is None
+                   else eligible.to(torch.int32).topk(n - take, largest=False).indices)
         out_indices[:, take:].copy_(padding.expand(rows, -1))
     if not take:
         return out_keys, out_indices
@@ -246,6 +250,8 @@ class PendingShardedTopK:
             stream = torch.cuda.current_stream(self.scores.device)
             stream.wait_event(self.ready)
             self.threshold.record_stream(stream)
+            self.keys.record_stream(stream)
+            self.indices.record_stream(stream)
         # Only the local scores participate in autograd. No communication edge
         # has a backward collective and no dense [rows, global_features] exists.
         keep = (self.keys >= self.threshold[:, None]) & (self.keys != _MIN_KEY)
@@ -285,6 +291,7 @@ def launch_sharded_topk(
     packed: bool = False,
     tie_policy: str = "stable_id",
     winner_count=None,
+    known_columns: torch.Tensor | None = None,
 ) -> PendingShardedTopK:
     """Submit exact selection for a *uniform-width, feature-sharded* tensor.
 
@@ -343,7 +350,8 @@ def launch_sharded_topk(
         return PendingShardedTopK(scores, indices, local_keys, threshold, leading,
                                   relu, sparse, 'torch_tp1', None, packed, winner_count)
     local_keys, indices = _local_candidates(
-        scores.reshape(rows, width), nlocal, rank * width, eligible, key_backend
+        scores.reshape(rows, width), nlocal, rank * width, eligible, key_backend,
+        known_columns=known_columns,
     )
 
     def select() -> torch.Tensor:
@@ -392,7 +400,7 @@ def sharded_topk(
 
 def sharded_auxk(scores, k, eligible, num_eligible, group=None, *, sparse=False,
                  policy="auto", protocol="auto", key_backend="torch", tie_policy="stable_id",
-                 winner_count=None):
+                 winner_count=None, known_columns=None):
     """Exact AuxK selection; never gather full latent or change the loss budget.
 
     ``num_eligible`` is the ALREADY known global dead count (same on TP ranks),
@@ -413,7 +421,7 @@ def sharded_auxk(scores, k, eligible, num_eligible, group=None, *, sparse=False,
             return torch.where(eligible, scores, 0.0)
         # Sparse compatibility: selected zeros must remain entries (AuxK has no
         # ReLU). nonzero examines only the 1-D mask, never the [B,S] scores.
-        ids = eligible.nonzero(as_tuple=True)[0]
+        ids = eligible.nonzero(as_tuple=True)[0] if known_columns is None else known_columns
         rows = math.prod(scores.shape[:-1])
         indices = ids.expand(rows, -1)
         values = _LocalSelectedValues.apply(scores.reshape(rows, scores.shape[-1]), indices)
@@ -422,6 +430,7 @@ def sharded_auxk(scores, k, eligible, num_eligible, group=None, *, sparse=False,
         scores, k, group, eligible=eligible, relu=False, sparse=sparse,
         protocol=protocol, key_backend=key_backend, compact_radix=policy == "auto", tie_policy=tie_policy,
         winner_count=winner_count,
+        known_columns=known_columns,
     )
 
 
@@ -451,6 +460,8 @@ def sharded_firing_counts(
 
 def feature_counts_from_output(output) -> torch.Tensor:
     """Consume precomputed global summaries without an extra TP collective."""
+    if getattr(output, "local_feature_firing_counts", None) is not None:
+        raise RuntimeError("Runtime TP firing counts must be resolved at the window boundary")
     summary = getattr(output, "feature_firing_counts", None)
     if summary is not None:
         return summary

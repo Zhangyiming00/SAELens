@@ -915,6 +915,14 @@ class ActivationsStore:
             if len(hook_layers) > 0
             else extract_stop_at_layer_from_tlens_hook_name(self.hook_name)
         )
+        # vLLM owns architecture-specific early-stop support. Auto keeps a
+        # full forward for unsupported decoders (e.g. Qwen3.5/3.6) while still
+        # capturing the requested intermediate hooks. TransformerLens keeps
+        # its existing integer boundary.
+        from sae_lens.vllm_model import HookedVLLMModel
+
+        if isinstance(self.model, HookedVLLMModel):
+            stop_at_layer = "auto"
         with torch.autocast(
             device_type=model_device.type,
             dtype=torch.bfloat16,

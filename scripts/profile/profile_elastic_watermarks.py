@@ -50,15 +50,22 @@ def predict(args):
         selected = dict(d_sae=args.d_sae, microbatch=args.microbatch, ga=args.ga, estimates=estimates)
     local_capacity = max(math.ceil(args.microbatch/2), 2*args.chunk_tokens)
     extra_rows = 3*2*local_capacity + 2*args.microbatch + 3*args.chunk_tokens
-    kv = (math.ceil(args.prompts*args.context/16)+1)*16*32*8*256*2
+    from sae_lens.autoconfig.allocated_peak_model import state_payload
+    payloads = {str(dp): {k: v/2**30 for k, v in state_payload(dict(
+        tp=1, dp=dp, pp=1, h=3, d_in=4096, d_sae=args.d_sae,
+        batch=args.microbatch*args.ga, ga=args.ga, wave="off", live=1, zero=True)).items()}
+        for dp in (2, 3)}
     return dict(created_unix=time.time(), selected=selected,
+                state_payload_gib_by_dp=payloads,
                 prediction_status="calibrated" if selected is not None else "not_requested",
                 source_provider_extra_budget_gib=extra_rows*3*4096*4/2**30,
-                vllm_kv_gib=kv/2**30,
+                vllm_kv_gib=None,
                 shm_host_gib=args.chunks*args.chunk_tokens*3*4096*4/2**30,
                 notes=["Optional native predictions require --native-profile and --native-configs with calibrated dp2/dp3 families",
                        "The run uses its real dead-feature schedule; supplied predictions describe only the configured dead state",
                        "Provider extra is a conservative storage budget, not calibrated SHM peak memory",
+                       "State payloads exclude workspaces, transient allocations and allocator reservation; they are not peak predictions",
+                       "KV/cache memory is architecture-specific and must be measured by vLLM",
                        "Native estimates exclude vLLM and transport; online rates and peaks are measured"])
 
 
@@ -196,6 +203,13 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output",type=Path,required=True)
     p.add_argument("--worker",action="store_true")
+    p.add_argument("--dry-run",action="store_true",help="Write reviewable commands without launching workers")
+    p.add_argument("--model-name",default="/root/models/Llama-3.1-8B")
+    p.add_argument("--dataset-path",default="/root/datasets/wikitext2_tokenized_llama31_ctx2048")
+    p.add_argument("--hook-names",default="blocks.16.hook_resid_post,blocks.21.hook_resid_post,blocks.26.hook_resid_post")
+    p.add_argument("--vllm-text-only",action="store_true")
+    p.add_argument("--rate-window-seconds",type=float,default=4)
+    p.add_argument("--cooldown-seconds",type=float,default=12)
     p.add_argument("--d-sae",type=int,default=16384)
     p.add_argument("--microbatch",type=int,default=6144)
     p.add_argument("--ga",type=int,default=2)
@@ -213,6 +227,13 @@ def main():
     p.add_argument("--native-configs", help="JSON mapping dp2/dp3 to complete calibrated configurations")
     args=p.parse_args();args.output=args.output.resolve()
     if args.worker:return worker(args.output)
+    if len(args.hook_names.split(",")) != 3:
+        p.error("This experiment and its storage budgets require exactly three hooks")
+    if args.microbatch < 1 or args.microbatch % 6:
+        p.error("microbatch must be positive and divisible by both DP2 and DP3")
+    from run_sae_runner_gpu import _resolve_hidden_size
+    if _resolve_hidden_size(args.model_name) != 4096:
+        p.error("This experiment's storage budgets require d_in=4096")
     if not 0 < args.low_watermark < args.high_watermark < 1:
         p.error("Require 0 < low-watermark < high-watermark < 1")
     if args.dead_window < 0 or min(args.chunks,args.chunk_tokens,args.updates,args.ga) < 1:
@@ -226,8 +247,8 @@ def main():
     runner_args=["--elastic-streaming","--no-cleanup","--elastic-permanent-vllm-dp-size","1",
         "--elastic-permanent-sae-dp-size","2","-vtp","1","-vdp","2","-stp","1","-sdp","2","-spp","1",
         "--elastic-streaming-control-path",str(control),"--streaming-dp-batch-mode","exact",
-        "--hook-names","blocks.16.hook_resid_post,blocks.21.hook_resid_post,blocks.26.hook_resid_post",
-        "--model-name","/root/models/Llama-3.1-8B","--dataset-path","/root/datasets/wikitext2_tokenized_llama31_ctx2048",
+        "--hook-names",args.hook_names,
+        "--model-name",args.model_name,"--dataset-path",args.dataset_path,
         "--context-size",str(args.context),"--max-model-len",str(args.context+1),
         "--store-batch-size-prompts",str(args.prompts),"--n-batches-in-buffer",str(max(2,math.ceil(args.microbatch/args.context))),
         "--d-sae",str(args.d_sae),"--k","128","--dtype","float32",
@@ -243,18 +264,24 @@ def main():
         "--step-window-profile-window-count","0","--n-checkpoints","0","--no-save-final-checkpoint",
         "--output-path",str(args.output/"training"),"--checkpoint-path",str(args.output/"checkpoints")]
     # Worker instrumentation files live outside the training output directory.
+    if args.vllm_text_only:
+        runner_args.append("--vllm-text-only")
+    runner_args.extend(["--max-num-batched-tokens",str(max(4096,args.prompts*args.context))])
     dump(args.output/"runner_args.json",runner_args)
-    env=dict(os.environ,OMP_NUM_THREADS="1",MKL_NUM_THREADS="1",OPENBLAS_NUM_THREADS="1",
+    env=dict(os.environ,OMP_NUM_THREADS="1",MKL_NUM_THREADS="1",OPENBLAS_NUM_THREADS="1",MAX_JOBS="4",
              HF_HUB_OFFLINE="1",HF_DATASETS_OFFLINE="1",WANDB_MODE="disabled",TOKENIZERS_PARALLELISM="false",
              NCCL_LAUNCH_ORDER_IMPLICIT="1",VLLM_ENABLE_V1_MULTIPROCESSING="0",PYTORCH_ALLOC_CONF="expandable_segments:True")
     cmd=[sys.executable,"-m","torch.distributed.run","--standalone","--nproc_per_node=4",str(Path(__file__).resolve()),"--worker","--output",str(args.output)]
     auto=[sys.executable,str(REPO/"scripts/elastic_streaming_control.py"),str(control),"auto",
           "--low-watermark",str(args.low_watermark),"--high-watermark",str(args.high_watermark),"--poll-interval","0.5",
-          "--rate-window-seconds","4","--stable-samples","3","--min-rate-ratio","1.05",
-          "--min-rate-gap","1000","--cooldown-seconds","12","--max-switches",str(args.switches),
+          "--rate-window-seconds",str(args.rate_window_seconds),"--stable-samples","3","--min-rate-ratio","1.05",
+          "--min-rate-gap","1000","--cooldown-seconds",str(args.cooldown_seconds),"--max-switches",str(args.switches),
           "--log-path",str(args.output/"controller.jsonl")]
     dump(args.output/"command.json",dict(argv=cmd,auto=auto,options=vars(args)|{"output":str(args.output)},
         source_sha256={str(f.relative_to(REPO)):hashlib.sha256(f.read_bytes()).hexdigest() for f in (REPO/"sae_lens").rglob("*.py") if "autoconfig" not in f.parts}))
+    if args.dry_run:
+        print("Prepared commands (no workers launched):",args.output)
+        return
     started=time.monotonic()
     with (args.output/"run.log").open("w") as log,(args.output/"auto.log").open("w") as auto_log:
         proc=subprocess.Popen(cmd,cwd=REPO,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
@@ -268,6 +295,16 @@ def main():
             try:ctl.wait(timeout=5)
             except subprocess.TimeoutExpired:terminate(ctl)
     result=dict(returncode=rc,controller_returncode=ctl.returncode,elapsed_s=time.monotonic()-started)
+    # A clean exit does not prove that the real rates permit an elastic cycle.
+    source_log=args.output/"observations_rank2.jsonl"
+    builds=[]
+    if source_log.exists():
+        for line in source_log.read_text().splitlines():
+            record=json.loads(line)
+            if record.get("event")=="build":builds.append(record["dp"])
+    result["observed_sae_dp_sequence"]=builds
+    result["observed_complete_cycle"]=any(builds[i:i+3]==[2,3,2] for i in range(len(builds)-2))
+    result["online_training_status"]="completed" if rc==0 else "failed_or_timed_out"
     if control.exists():
         result["control"]=json.loads(control.read_text())
         name=result["control"].get("buffer_name","")
