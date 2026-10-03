@@ -384,6 +384,7 @@ class TopKTrainingSAEConfig(TrainingSAEConfig):
 
     # V5 opt-in execution policy. Old V4 dispatch remains active with inherit.
     auxk: int | None = None  # Megatron: None uses d_in//2; 0 disables AuxK.
+    auxk_async_selection: bool = True  # Native wavefront: overlap selection with main decode.
     topk_tie_policy: str = "stable_id"  # stable_id | torch_tp1 (explicit native tie experiment)
     v5_main_compute: str = "inherit"
     v5_aux_compute: str = "inherit"

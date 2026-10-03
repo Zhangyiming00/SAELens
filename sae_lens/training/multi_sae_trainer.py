@@ -1746,6 +1746,8 @@ class MultiSAETrainer:
             self._pending_step_count_by_hook[hook_name] = 0
 
     def save_final(self, output_path: str) -> None:
+        if not self.cfg.save_final_sae:
+            return
         base_output = Path(output_path)
         base_output.mkdir(exist_ok=True, parents=True)
         manifest = self._manifest()

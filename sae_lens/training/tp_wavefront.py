@@ -31,8 +31,6 @@ def configure_tp_wavefront(trainer, units):
         for u in units.values()
     ):
         reason = "one local hook"
-    elif context.tp_group.size() == 1:
-        reason = "TP=1"
     elif not all(
         callable(getattr(u.model, "tp_wavefront_supported", None))
         and u.model.tp_wavefront_supported()

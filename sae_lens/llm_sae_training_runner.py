@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
@@ -1300,6 +1301,7 @@ class LanguageModelSAETrainingRunner:
         from_pretrained_path: str | None = None,
         resume_checkpoint_path: str | None = None,
         hook_metadata_overrides: dict[str, Any] | None = None,
+        initialize: bool = True,
     ) -> TrainingSAE[Any]:
         """Construct TopK training with Megatron modules at every TP size.
 
@@ -1333,10 +1335,10 @@ class LanguageModelSAETrainingRunner:
                     "conversion are integrated."
                 )
             tp_group = self._resolve_megatron_tp_group(tp_group)
-        with temporary_seed(seed):
+        with temporary_seed(seed) if initialize else nullcontext():
             if is_megatron:
                 assert isinstance(sae_cfg, TopKTrainingSAEConfig)
-                sae = MegatronTopKSAE(sae_cfg, tp_group=tp_group, runtime=runtime)
+                sae = MegatronTopKSAE(sae_cfg, tp_group=tp_group, runtime=runtime, initialize=initialize)
             elif from_pretrained_path is not None:
                 sae = TrainingSAE.load_from_disk(from_pretrained_path, device)
             else:
@@ -1440,11 +1442,12 @@ class LanguageModelSAETrainingRunner:
             self.base_sae_by_hook[hook_name] = sae
             self.sae_by_hook[hook_name] = self._wrap_runtime_sae(sae)
 
-    def _wrap_runtime_sae(self, sae):
+    def _wrap_runtime_sae(self, sae, *, weights_synced=False):
         from sae_lens.training.megatron_ddp import wrap_runtime_sae
 
         return wrap_runtime_sae(
             sae, self.sae_runtime, bucket_cap_mb=self.cfg.ddp_bucket_cap_mb,
+            weights_synced=weights_synced,
             distributed_optimizer=self.cfg.ddp_zero_optimizer,
             single_replica_fast_path=self.cfg.sae_single_replica_fast_path,
             gradient_accumulation_fusion=self.cfg.sae_gradient_accumulation_fusion,
@@ -1898,6 +1901,8 @@ class LanguageModelSAETrainingRunner:
         output_path: str,
         log_feature_sparsity: torch.Tensor | None = None,
     ):
+        if not self.cfg.save_final_sae:
+            return
         tp_group = getattr(sae, "_tp_group", None)
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
         dp_group = get_dp_group()
@@ -2079,7 +2084,13 @@ class LanguageModelSAETrainingRunner:
         self.device = torch.device(f"cuda:{local_rank}")
 
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl", device_id=self.device)
+            # Binding device_id enables NCCL communicator splitting, which
+            # conflicts with this path's mixed NCCL/Gloo subgroup creation.
+            # set_device above still establishes each rank's CUDA device.
+            dist.init_process_group(backend="nccl")
+
+        if cfg.streaming_exact_prefetch_batches and (self.sae_tp_size != 1 or self.sae_pp_size != 1):
+            raise ValueError("exact source prefetch currently requires SAE TP1/PP1")
 
         elastic_layout = None
         elastic_runtime_type = None
@@ -2473,6 +2484,7 @@ class LanguageModelSAETrainingRunner:
         self,
         cfg: LanguageModelSAERunnerConfig[T_TRAINING_SAE_CONFIG],
         ds: Any,
+        *, initialize: bool = True,
     ) -> None:
         self.sae_by_hook: dict[str, Any] = {}
         self.base_sae_by_hook: dict[str, TrainingSAE[Any]] = {}
@@ -2505,6 +2517,7 @@ class LanguageModelSAETrainingRunner:
 
             sae = self._create_training_sae(
                 seed=seed,
+                initialize=initialize,
                 tp_group=tp_group,
                 device=str(self.device),
                 resume_checkpoint_path=hook_resume,
@@ -2513,12 +2526,12 @@ class LanguageModelSAETrainingRunner:
 
             self.base_sae_by_hook[hook_name] = sae
 
-    def _streaming_wrap_consumer_multi(self, ds: Any) -> None:
+    def _streaming_wrap_consumer_multi(self, ds: Any, *, weights_synced=False) -> None:
         raw_sae_by_hook = dict(self.base_sae_by_hook)
         self.sae_by_hook = {}
         self.multi_hook_sae = None
         if self.sae_runtime is not None:
-            self.sae_by_hook = {h: self._wrap_runtime_sae(sae) for h, sae in raw_sae_by_hook.items()}
+            self.sae_by_hook = {h: self._wrap_runtime_sae(sae, weights_synced=weights_synced) for h, sae in raw_sae_by_hook.items()}
             return
         tp_group = ds.get_sae_tp_group() if self.sae_tp_size > 1 else None
         for sae in raw_sae_by_hook.values():
@@ -3300,14 +3313,15 @@ class LanguageModelSAETrainingRunner:
         except Exception:
             logger.exception("failed to publish elastic streaming failure state")
 
-    def _elastic_drop_sae(self) -> None:
+    def _elastic_drop_sae(self, *, release_cache=True) -> None:
         self.sae_by_hook = {}
         self.base_sae_by_hook = {}
         self.multi_hook_sae = None
         self.sae = None
         self._base_sae = None
         gc.collect()
-        torch.cuda.empty_cache()
+        if release_cache:
+            torch.cuda.empty_cache()
 
     def _build_elastic_streaming_provider(
         self,
@@ -3322,13 +3336,9 @@ class LanguageModelSAETrainingRunner:
         from sae_lens.training.exact_dp_batch_provider import (
             ExactDataParallelBatchProvider,
         )
-        from sae_lens.training.logical_streaming_mixer import (
-            LogicalStreamingMixingProvider,
-        )
-        from sae_lens.training.streaming_activation_provider import (
-            StreamingActivationProvider,
-        )
         from sae_lens.util import str_to_dtype
+
+        from sae_lens.training.prefetched_activation_provider import build_prefetched_logical_source
 
         dp_idx = ds.get_sae_dp_idx()
         dp_group = ds.get_sae_dp_group()
@@ -3339,7 +3349,7 @@ class LanguageModelSAETrainingRunner:
         )[ds.get_sae_tp_rank()]
         source_dp_idx = dist.get_group_rank(dp_group, source_global_rank)
         if dp_idx == source_dp_idx and logical_provider is None:
-            raw_provider = StreamingActivationProvider(
+            raw_kwargs = dict(
                 buffer=self._streaming_buffer,
                 train_batch_size_tokens=self.cfg.streaming_chunk_size_tokens,
                 prefetch_chunks=self.cfg.streaming_prefetch_chunks,
@@ -3384,8 +3394,7 @@ class LanguageModelSAETrainingRunner:
                 self.cfg.streaming_mix_chunks
                 * self.cfg.streaming_chunk_size_tokens,
             )
-            logical_provider = LogicalStreamingMixingProvider(
-                source=raw_provider,
+            logical_kwargs = dict(
                 global_batch_size=self._global_train_batch_size_tokens,
                 stream_count=self._streaming_mixing_streams,
                 buffer_size_per_stream=per_stream_capacity,
@@ -3396,6 +3405,12 @@ class LanguageModelSAETrainingRunner:
                 ),
                 shuffle=self.cfg.streaming_shuffle,
                 seed=self.cfg.seed,
+            )
+
+            logical_provider = build_prefetched_logical_source(
+                raw_kwargs=raw_kwargs, logical_kwargs=logical_kwargs,
+                capacity=self.cfg.streaming_exact_prefetch_batches,
+                tp_size=ds.get_sae_tp_size(), pp_size=ds.get_sae_pp_size(),
             )
 
         controller = self._elastic_controller
@@ -3471,6 +3486,20 @@ class LanguageModelSAETrainingRunner:
         layout = runtime.layout
         layout.validate_sae_dp(target_sae_dp)
 
+        # Measure the stopped SAE path only. Expansion preparation and the
+        # departing rank's later vLLM startup are deliberately outside this span.
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        cutover_started = time.perf_counter()
+        last_stage = cutover_started
+        stages = {}
+
+        def stage(name):
+            nonlocal last_stage
+            now = time.perf_counter()
+            stages[name] = now - last_stage
+            last_stage = now
+
         old_global_tokens = 0
         old_step = 0
         saved_state = None
@@ -3484,16 +3513,19 @@ class LanguageModelSAETrainingRunner:
                 saved_state = capture_runtime_state(
                     old_trainer, source_global_rank=old_source_global_rank
                 )
-            retire_runtime_trainer(old_trainer)
-            self._elastic_drop_sae()
+            stage("capture_host_s")
+            retire_runtime_trainer(old_trainer, collect=False)
+            self._elastic_drop_sae(release_cache=False)
+            stage("retire_host_s")
 
         target_context = runtime.context(target_sae_dp)
         self.sae_runtime = runtime.training_runtime(target_sae_dp)
         if target_context.is_consumer() and not joining_prepared:
             self._elastic_attach_streaming_buffer()
-            self._streaming_create_consumer_multi_base(self.cfg, target_context)
+            self._streaming_create_consumer_multi_base(self.cfg, target_context, initialize=False)
 
         runtime.transition_barrier()
+        stage("prepare_host_s")
 
         new_trainer: MultiSAETrainer | None = None
         new_provider: Any | None = None
@@ -3511,7 +3543,8 @@ class LanguageModelSAETrainingRunner:
                 group=target_context.get_sae_dp_group(),
                 source_global_rank=source_global_rank,
             )
-            self._streaming_wrap_consumer_multi(target_context)
+            stage("weights_host_s")
+            self._streaming_wrap_consumer_multi(target_context, weights_synced=True)
             new_provider, logical_provider = self._build_elastic_streaming_provider(
                 target_context,
                 logical_provider=logical_provider,
@@ -3522,6 +3555,7 @@ class LanguageModelSAETrainingRunner:
             new_trainer = self._build_elastic_multi_trainer(
                 new_provider, target_context
             )
+            stage("trainer_host_s")
             restored_scalars = restore_runtime_state(
                 saved_state, new_trainer,
                 source_global_rank=source_global_rank,
@@ -3532,6 +3566,7 @@ class LanguageModelSAETrainingRunner:
                 step=(new_trainer.n_training_steps if provider_step is None else provider_step),
                 epoch=epoch,
             )
+            stage("restore_host_s")
         else:
             # Register the replacement producer before publishing the smaller
             # SAE topology. Consumers can then block for it without observing
@@ -3540,13 +3575,22 @@ class LanguageModelSAETrainingRunner:
             if runtime.is_elastic_vllm_tp_root():
                 self._streaming_buffer.register_producer()
             self._elastic_producer_session_registered = True
-            self._elastic_drop_sae()
 
         runtime.transition_barrier()
         coordinator_rank = layout.permanent_sae_ranks[0]
         if dist.get_rank() == coordinator_rank:
             controller.commit(epoch=epoch, active_sae_dp=target_sae_dp)
         runtime.transition_barrier()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        stage("commit_host_s")
+        self._elastic_last_switch_metrics = {
+            "sae_pause_s": time.perf_counter() - cutover_started,
+            "stages": stages,
+            "state_storage": "device",
+        }
+        logger.info("[elastic rank%d] cutover %s", dist.get_rank(),
+                    json.dumps(self._elastic_last_switch_metrics))
         self._elastic_epoch = epoch
         self._elastic_active_sae_dp = target_sae_dp
         return new_trainer, new_provider, logical_provider
@@ -3608,7 +3652,7 @@ class LanguageModelSAETrainingRunner:
                     self.sae_runtime = runtime.training_runtime(request[1])
                     self._elastic_attach_streaming_buffer()
                     self._streaming_create_consumer_multi_base(
-                        self.cfg, target_context
+                        self.cfg, target_context, initialize=False
                     )
                     # Permanent SAE ranks keep training while the expensive
                     # vLLM teardown and fresh SAE construction happen here.
@@ -3649,6 +3693,9 @@ class LanguageModelSAETrainingRunner:
                     else:
                         if self.cfg.output_path is not None:
                             trainer.save_final(self.cfg.output_path)
+                        close = getattr(logical_provider, "close", None)
+                        if callable(close):
+                            close()
                         if self._streaming_buffer is not None:
                             self._streaming_buffer.close()
                         first_hook = self._pp_hook_names[0]
@@ -3666,11 +3713,18 @@ class LanguageModelSAETrainingRunner:
                 if trainer is None:
                     if self._streaming_buffer is not None:
                         self._streaming_buffer.close()
+                    # The new SAE group is already committed and can train.
+                    # Return cached blocks to vLLM only on this departing rank.
+                    torch.cuda.empty_cache()
                     self._elastic_start_vllm()
                     role = "vllm"
         except BaseException as exc:
             self._elastic_report_failure(exc)
             raise
+        finally:
+            close = getattr(logical_provider, "close", None)
+            if callable(close):
+                close()
 
     def _run_streaming_consumer_loop(self) -> TrainingSAE[Any]:
         import sae_lens.distributed_streaming as ds
@@ -3754,12 +3808,8 @@ class LanguageModelSAETrainingRunner:
             from sae_lens.training.exact_dp_batch_provider import (
                 ExactDataParallelBatchProvider,
             )
-            from sae_lens.training.logical_streaming_mixer import (
-                LogicalStreamingMixingProvider,
-            )
-            from sae_lens.training.streaming_activation_provider import (
-                StreamingActivationProvider,
-            )
+
+            from sae_lens.training.prefetched_activation_provider import build_prefetched_logical_source
 
             # DP0 owns fixed logical rolling-mix states. Other replicas only
             # consume exact token slices, so physical DP does not own mixing state.
@@ -3775,7 +3825,7 @@ class LanguageModelSAETrainingRunner:
                 logical_kwargs["shuffle"] = False
                 logical_kwargs["mix_chunks"] = 0
                 logical_kwargs["mix_fraction"] = 0.0
-                raw_provider = StreamingActivationProvider(**logical_kwargs)
+                raw_kwargs = logical_kwargs
                 logical_counts = balanced_token_counts(
                     self._global_train_batch_size_tokens,
                     self._streaming_mixing_streams,
@@ -3785,8 +3835,7 @@ class LanguageModelSAETrainingRunner:
                     self.cfg.streaming_mix_chunks
                     * self.cfg.streaming_chunk_size_tokens,
                 )
-                logical_provider = LogicalStreamingMixingProvider(
-                    source=raw_provider,
+                mix_kwargs = dict(
                     global_batch_size=self._global_train_batch_size_tokens,
                     stream_count=self._streaming_mixing_streams,
                     buffer_size_per_stream=per_stream_capacity,
@@ -3797,6 +3846,11 @@ class LanguageModelSAETrainingRunner:
                     ),
                     shuffle=self.cfg.streaming_shuffle,
                     seed=self.cfg.seed,
+                )
+                logical_provider = build_prefetched_logical_source(
+                    raw_kwargs=raw_kwargs, logical_kwargs=mix_kwargs,
+                    capacity=self.cfg.streaming_exact_prefetch_batches,
+                    tp_size=sae_tp_size, pp_size=self.sae_pp_size,
                 )
             if self.sae_dp_size > 1:
                 dp_group = ds.get_sae_dp_group()
@@ -4129,6 +4183,8 @@ class LanguageModelSAETrainingRunner:
         log_feature_sparsity: torch.Tensor | None,
     ) -> None:
         """Called by ALL SAE TP ranks — save_inference_model is collective when sae_tp > 1."""
+        if not self.cfg.save_final_sae:
+            return
         import sae_lens.distributed_streaming as ds
         base = Path(output_path)
         base.mkdir(exist_ok=True, parents=True)

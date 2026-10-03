@@ -92,12 +92,14 @@ class StreamingActivationProvider:
         # Deprecated compatibility aliases. New code should pass pp_root_*.
         dp_replica_group: dist.ProcessGroup | None = None,
         dp_replica_root_global_rank: int | None = None,
+        pin_memory_transfer: bool = False,
     ) -> None:
         self._buffer = buffer
         self._batch_size = train_batch_size_tokens
         self._prefetch_chunks = prefetch_chunks
         self._device = device
         self._dtype = dtype
+        self._pin_memory_transfer = pin_memory_transfer
         self._sae_tp_group = sae_tp_group
         self._sae_tp_rank = sae_tp_rank
         self._tp_root_global = sae_tp_root_global_rank
@@ -379,7 +381,7 @@ class StreamingActivationProvider:
             new_data = torch.empty(0, self._d_model, dtype=self._dtype, device=self._device)
         else:
             new_data = torch.cat(acts_list, dim=0)
-            new_data = new_data.to(device=self._device, dtype=self._dtype)
+            new_data = self._transfer_to_device(new_data)
             new_data = self._prepare_new_data(new_data, valid_rows_by_chunk)
         self._tp_broadcast_new_data(new_data)
 
@@ -441,8 +443,14 @@ class StreamingActivationProvider:
         if not acts_list:
             return torch.empty(0, self._d_model, dtype=self._dtype, device=self._device)
         new_data = torch.cat(acts_list, dim=0)
-        new_data = new_data.to(device=self._device, dtype=self._dtype)
+        new_data = self._transfer_to_device(new_data)
         return self._prepare_new_data(new_data, valid_rows_by_chunk)
+
+    def _transfer_to_device(self, data: torch.Tensor) -> torch.Tensor:
+        if self._pin_memory_transfer and torch.device(self._device).type == "cuda":
+            # PyTorch's pinned allocator tracks the in-flight copy before reuse.
+            return data.pin_memory().to(self._device, dtype=self._dtype, non_blocking=True)
+        return data.to(device=self._device, dtype=self._dtype)
 
     def _tp_broadcast_new_data(self, new_data: torch.Tensor) -> None:
         if self._sae_tp_group is None:

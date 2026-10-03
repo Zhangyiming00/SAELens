@@ -80,9 +80,15 @@ def megatron_tp_launch(
     *calling CUDA stream*, so the event includes actual collective completion.
     No custom collective backward or NCCL Work handling is needed here.
     """
-    if not local.is_cuda or group.size() <= 1:
-        raise ValueError("Megatron TP wavefront requires CUDA and TP > 1")
+    if not local.is_cuda:
+        raise ValueError("Megatron TP wavefront requires CUDA")
     current = torch.cuda.current_stream(local.device)
+    if group.size() == 1:
+        # The singleton mapping is identity. Recording on the producer stream
+        # avoids making main reconstruction wait for unrelated AuxK selection.
+        ready = torch.cuda.Event()
+        ready.record(current)
+        return MegatronTPPending(local, ready)
     stream = _wavefront_stream(local.device)
     with torch.cuda.device(local.device), torch.cuda.stream(stream):
         stream.wait_stream(current)

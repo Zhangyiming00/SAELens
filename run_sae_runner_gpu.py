@@ -148,6 +148,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--streaming-prefetch-chunks", type=int, default=2,
         help="Max chunks to acquire per consumer refill in streaming_mode.",
     )
+    parser.add_argument("--streaming-exact-prefetch-batches", type=int, default=0,
+        help="Background logical batch queue for exact SHM streaming (SAE TP1/PP1); 0 disables.",
+    )
     parser.add_argument("--streaming-mix-chunks", type=int, default=4,
         help=(
             "Consumer-local rolling mixing window in shared-memory chunks. "
@@ -395,6 +398,8 @@ def parse_args() -> argparse.Namespace:
             "--checkpoint-storage=memory. The supervisor supplies this."
         ),
     )
+    parser.add_argument("--performance-only", action="store_true",
+                        help="Retain metrics but disable all checkpoint and final weight outputs.")
     parser.add_argument("--n-checkpoints", type=int, default=0)
     parser.add_argument(
         "--save-final-checkpoint", dest="save_final_checkpoint", action="store_true", default=False,
@@ -674,6 +679,14 @@ def parse_args() -> argparse.Namespace:
 
     if args.ddp_zero_optimizer and args.sae_dp_mode != "ddp":
         parser.error("--ddp-zero-optimizer requires --sae-dp-mode ddp")
+
+    if args.performance_only:
+        if args.resume_from_checkpoint or args.quiesce_checkpoint_path or args.control_state_path:
+            parser.error("--performance-only does not support checkpoint resume or the checkpoint-based topology supervisor")
+        args.n_checkpoints = 0
+        args.checkpoint_path = None
+        args.quiesce_checkpoint_path = None
+        args.no_save_final = True
 
     if args.no_save_final:
         args.save_final_checkpoint = False
@@ -1283,7 +1296,7 @@ def main() -> None:
             "buffer batch size"
         )
 
-    output_path = None if args.no_save_final_sae else args.output_path
+    output_path = args.output_path  # Metrics remain enabled without weight export.
     vllm_memory_probe_layer = args.vllm_memory_probe_layer
     model_kwargs: dict[str, object] = {}
     if args.save_vllm_memory_every_n_steps > 0:
@@ -1389,6 +1402,7 @@ def main() -> None:
         checkpoint_path=args.checkpoint_path,
         quiesce_checkpoint_path=args.quiesce_checkpoint_path,
         save_final_checkpoint=args.save_final_checkpoint,
+        save_final_sae=not args.no_save_final_sae,
         output_path=output_path,
         save_mse_every_n_steps=args.save_mse_every_n_steps,
         save_dead_every_n_steps=args.save_dead_every_n_steps,
@@ -1445,6 +1459,7 @@ def main() -> None:
         streaming_chunk_size_tokens=args.streaming_chunk_size_tokens,
         streaming_num_chunks=args.streaming_num_chunks,
         streaming_prefetch_chunks=args.streaming_prefetch_chunks,
+        streaming_exact_prefetch_batches=args.streaming_exact_prefetch_batches,
         streaming_mix_chunks=args.streaming_mix_chunks,
         streaming_mix_fraction=args.streaming_mix_fraction,
         streaming_mixing_streams=args.streaming_mixing_streams,
@@ -1603,6 +1618,21 @@ def main() -> None:
     if args.resume_from_checkpoint is not None:
         print(f"  resume_from_checkpoint={args.resume_from_checkpoint}")
 
+    if args.performance_only:
+        assert cfg.n_checkpoints == 0 and cfg.checkpoint_path is None
+        assert cfg.quiesce_checkpoint_path is None
+        assert not cfg.save_final_checkpoint and not cfg.save_final_sae
+        if cfg.output_path is not None and _is_writer_rank():
+            metrics_dir = Path(cfg.output_path)
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            (metrics_dir / "performance_policy.json").write_text(json.dumps({
+                "n_checkpoints": cfg.n_checkpoints,
+                "checkpoint_path": cfg.checkpoint_path,
+                "quiesce_checkpoint_path": cfg.quiesce_checkpoint_path,
+                "save_final_checkpoint": cfg.save_final_checkpoint,
+                "save_final_sae": cfg.save_final_sae,
+                "output_path": cfg.output_path,
+            }, indent=2) + "\n")
     runner = LanguageModelSAETrainingRunner(
         cfg=cfg,
         resume_from_checkpoint=args.resume_from_checkpoint,

@@ -1,9 +1,10 @@
 """Cutover-only state migration for independent native Megatron SAE units.
 
 The old DP group reconstructs Adam moments on its permanent source rank before
-any member leaves. CPU staging lets us retire the old DDP buffers, parameters
-and AccumulateGrad hooks before allocating their replacements. No checkpoint
-files, default-world collectives or migration work enter the training step.
+any member leaves. GPU snapshots let us retire the old DDP buffers, parameters
+and AccumulateGrad hooks before allocating their replacements. Bulk model and
+Adam tensors never pass through host memory; Python metadata/RNG stay on host.
+No checkpoint files, default-world collectives or migration work enter the training step.
 TP and hook placement stay fixed; only DP ownership changes.
 """
 
@@ -48,8 +49,8 @@ def _sharded(optimizer):
     return bool(getattr(optimizer, "_sae_distributed_optimizer", False))
 
 
-def _cpu(value):
-    return value.detach().cpu().clone() if torch.is_tensor(value) else copy.deepcopy(value)
+def _snapshot(value):
+    return value.detach().clone() if torch.is_tensor(value) else copy.deepcopy(value)
 
 
 def _capture_adam(unit, source_rank):
@@ -62,7 +63,7 @@ def _capture_adam(unit, source_rank):
     if not _sharded(optimizer):
         if source:
             result = {
-                name: {key: _cpu(v) for key, v in inner.state.get(p, {}).items()}
+                name: {key: _snapshot(v) for key, v in inner.state.get(p, {}).items()}
                 for name, p in unit.model.named_parameters()
             }
         return result
@@ -78,8 +79,6 @@ def _capture_adam(unit, source_rank):
     records = [None] * group.size()
     dist.all_gather_object(records, local, group=group)
     members = dist.get_process_group_ranks(group)
-    # Bound temporary GPU storage even for very large dictionary matrices.
-    chunk_elements = 4 * 1024 * 1024
     for name, parameter in unit.model.named_parameters():
         pieces = [(rank, record[name]) for rank, record in zip(members, records)
                   if name in record]
@@ -99,21 +98,25 @@ def _capture_adam(unit, source_rank):
         if any(piece[3] != dtypes for _, piece in pieces):
             raise RuntimeError(f"Inconsistent Adam moment keys for {name}")
         if source:
-            result[name] = {key: torch.empty(parameter.shape, dtype=dtype)
+            result[name] = {key: torch.empty(parameter.shape, dtype=dtype, device=parameter.device)
                             for key, dtype in dtypes.items()}
-            result[name]["step"] = torch.tensor(float(steps.pop()))
+            result[name]["step"] = torch.tensor(float(steps.pop()), device=parameter.device)
+        # Only the permanent source needs the canonical moments. Transfer each
+        # contiguous native shard directly into its destination GPU slice.
+        # Broadcasting 4M-element chunks to every old replica incurred hundreds
+        # of unnecessary collectives and temporary allocations for a large SAE.
         for owner, (start, end, _, _) in pieces:
-            for key, dtype in dtypes.items():
-                for offset in range(start, end, chunk_elements):
-                    count = min(end - offset, chunk_elements)
-                    if dist.get_rank() == owner:
+            for key in dtypes:
+                if source:
+                    target = result[name][key].view(-1)[start:end]
+                    if owner == source_rank:
                         shard = optimizer.sae_shards[name][1]
-                        tensor = inner.state[shard][key].view(-1)[offset-start:offset-start+count]
+                        target.copy_(inner.state[shard][key].view(-1))
                     else:
-                        tensor = torch.empty(count, device=parameter.device, dtype=dtype)
-                    dist.broadcast(tensor, src=owner, group=group)
-                    if source:
-                        result[name][key].view(-1)[offset:offset+count].copy_(tensor.cpu())
+                        dist.recv(target, src=owner, group=group)
+                elif dist.get_rank() == owner:
+                    shard = optimizer.sae_shards[name][1]
+                    dist.send(inner.state[shard][key].view(-1), dst=source_rank, group=group)
     return result
 
 
@@ -132,9 +135,9 @@ def capture_runtime_state(trainer, *, source_global_rank: int):
     for hook, unit in trainer.units.items():
         moments = _capture_adam(unit, source_global_rank)
         if source:
-            models[hook] = {n: _cpu(p) for n, p in unit.model.state_dict().items()}
+            models[hook] = {n: _snapshot(p) for n, p in unit.model.state_dict().items()}
             optimizers[hook] = moments
-            options[hook] = [{k: _cpu(v) for k, v in g.items() if k != "params"}
+            options[hook] = [{k: _snapshot(v) for k, v in g.items() if k != "params"}
                              for g in _inner(unit.optimizer).param_groups]
     if not source:
         return None
@@ -142,7 +145,7 @@ def capture_runtime_state(trainer, *, source_global_rank: int):
     scalars.update(
         lr_scheduler=copy.deepcopy(trainer.lr_scheduler.state_dict()),
         grad_scaler=copy.deepcopy(trainer.grad_scaler.state_dict()),
-        activation_scalers={h: _cpu(s.scaling_factor)
+        activation_scalers={h: _snapshot(s.scaling_factor)
                             for h, s in trainer.activation_scaler_by_hook.items()},
         update_counts={h: u.update_count for h, u in trainer.units.items()},
         token_count_remainder=getattr(trainer, "_token_count_remainder", 0),
@@ -153,11 +156,11 @@ def capture_runtime_state(trainer, *, source_global_rank: int):
         torch_rng_state=torch.get_rng_state(),
         cuda_rng_state=torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
     )
-    tensors = {n: {h: _cpu(t) for h, t in getattr(trainer, n).items()} for n in _TENSORS}
+    tensors = {n: {h: _snapshot(t) for h, t in getattr(trainer, n).items()} for n in _TENSORS}
     return ElasticRuntimeState(models, optimizers, options, scalars, tensors)
 
 
-def retire_runtime_trainer(trainer):
+def retire_runtime_trainer(trainer, *, collect=True):
     """Invalidate a stopped trainer and release its entire old native graph.
 
     Megatron 0.16 does not retain removable backward-hook handles. Rewrapping
@@ -168,7 +171,8 @@ def retire_runtime_trainer(trainer):
     trainer._stop_device_sampler()
     trainer.__dict__.clear()
     trainer._elastic_retired = True
-    gc.collect()
+    if collect:
+        gc.collect()
 
 
 def broadcast_runtime_models(state, models, *, group, source_global_rank):
@@ -190,15 +194,62 @@ def broadcast_runtime_models(state, models, *, group, source_global_rank):
                 model.load_state_dict(extra_state, strict=False)
 
 
+@dataclass
+class _TensorMetadata:
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+    host: bool
+
+
+def _broadcast_metadata(value, *, group, source_global_rank, device):
+    """Pickle only structure; transport tensor leaves through the device group.
+
+    Scheduler/scaler options may contain CUDA tensors. Passing them directly to
+    broadcast_object_list would silently stage those tensors through the CPU.
+    Only originally-host tensors (small RNG states) are returned to the host.
+    """
+    tensors = []
+
+    def pack(item):
+        if torch.is_tensor(item):
+            tensors.append(item)
+            return _TensorMetadata(item.dtype, tuple(item.shape), item.device.type == "cpu")
+        if isinstance(item, dict):
+            return {k: pack(v) for k, v in item.items()}
+        if isinstance(item, (list, tuple)):
+            return type(item)(pack(v) for v in item)
+        return item
+
+    source = dist.get_rank() == source_global_rank
+    payload = [pack(value) if source else None]
+    dist.broadcast_object_list(payload, src=source_global_rank, group=group, device=device)
+    tensor_iter = iter(tensors)
+
+    def unpack(item):
+        if isinstance(item, _TensorMetadata):
+            tensor = (next(tensor_iter).to(device=device).contiguous() if source else
+                      torch.empty(item.shape, dtype=item.dtype, device=device))
+            dist.broadcast(tensor, src=source_global_rank, group=group)
+            return tensor.cpu() if item.host else tensor
+        if isinstance(item, dict):
+            return {k: unpack(v) for k, v in item.items()}
+        if isinstance(item, (list, tuple)):
+            return type(item)(unpack(v) for v in item)
+        return item
+
+    return unpack(payload[0])
+
+
 def restore_runtime_state(state, trainer, *, source_global_rank):
     """Broadcast canonical state and install only each new optimizer's shard."""
     context = trainer.runtime.require_local()
     group = context.dp_group
     source = dist.get_rank() == source_global_rank
     device = next(next(iter(trainer.units.values())).model.parameters()).device
-    payload = [(state.scalars, state.group_options) if source else None]
-    dist.broadcast_object_list(payload, src=source_global_rank, group=group, device=device)
-    scalars, options = payload[0]
+    scalars, options = _broadcast_metadata(
+        (state.scalars, state.group_options) if source else None,
+        group=group, source_global_rank=source_global_rank, device=device,
+    )
     for n in _SCALARS:
         setattr(trainer, n, scalars[n])
     trainer.lr_scheduler.load_state_dict(scalars["lr_scheduler"])

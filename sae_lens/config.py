@@ -329,6 +329,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     checkpoint_path: str | None = "checkpoints"
     quiesce_checkpoint_path: str | None = None
     save_final_checkpoint: bool = False
+    save_final_sae: bool = True
     output_path: str | None = "output"
     save_mse_every_n_steps: int = 0
     save_dead_every_n_steps: int = 0
@@ -421,6 +422,8 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     streaming_chunk_size_tokens: int = 4096
     streaming_num_chunks: int = 32
     streaming_prefetch_chunks: int = 2
+    # Opt-in background logical batches; exact mode with SAE TP1/PP1 only.
+    streaming_exact_prefetch_batches: int = 0
     streaming_mix_chunks: int = 8
     streaming_mix_fraction: float = 0.5
     # 0 resolves to the initial SAE-DP size. Set explicitly before a future
@@ -536,6 +539,12 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
                 "streaming_dp_batch_mode must be 'equal_cohort' or 'exact'"
             )
         if self.streaming_mode:
+            if self.streaming_exact_prefetch_batches < 0:
+                raise ValueError("streaming_exact_prefetch_batches must be nonnegative")
+            if self.streaming_exact_prefetch_batches and (
+                self.streaming_dp_batch_mode != "exact" or self.streaming_use_gpu_direct
+            ):
+                raise ValueError("exact prefetch requires exact SHM streaming")
             if self.streaming_prefetch_chunks < 1:
                 raise ValueError("streaming_prefetch_chunks must be >= 1.")
             if self.streaming_num_chunks <= self.streaming_prefetch_chunks:
@@ -851,6 +860,7 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             checkpoint_path=self.checkpoint_path,
             quiesce_checkpoint_path=self.quiesce_checkpoint_path,
             save_final_checkpoint=self.save_final_checkpoint,
+            save_final_sae=self.save_final_sae,
             output_path=self.output_path,
             save_mse_every_n_steps=self.save_mse_every_n_steps,
             save_dead_every_n_steps=self.save_dead_every_n_steps,
@@ -1191,6 +1201,7 @@ class SAETrainerConfig:
     feature_sampling_window: int
     logger: LoggingConfig
     streaming_mode: bool = False
+    save_final_sae: bool = True
     save_dead_every_n_steps: int = 0
     routing_dp_batch_mode: Literal["equal", "exact"] = "equal"
     append_history_logs: bool = False

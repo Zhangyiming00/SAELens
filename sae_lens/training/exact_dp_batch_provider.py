@@ -270,6 +270,11 @@ class ExactDataParallelBatchProvider(Iterator[Batch]):
             if callable(request):
                 request()
 
+    def close(self) -> None:
+        close = getattr(self._source, "close", None)
+        if callable(close):
+            close()
+
     def consume_last_data_timing(self) -> dict[str, float]:
         if self._dp_idx == self._source_dp_idx and self._source is not None:
             consume = getattr(self._source, "consume_last_data_timing", None)

@@ -86,7 +86,9 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         *,
         tp_group: dist.ProcessGroup | None = None,
         runtime: SAERuntime | None = None,
+        initialize: bool = True,
     ):
+        self._initialize_weights = initialize
         require_megatron_core()
         self._decoupled_execution = execution.enabled(cfg)
         from sae_lens.adaptive_sae import validate_config
@@ -186,7 +188,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         config = ModelParallelConfig(
             tensor_model_parallel_size=self.tp_size,
             params_dtype=self.dtype,
-            use_cpu_initialization=True,
+            use_cpu_initialization=self._initialize_weights or self.device.type != "cuda",
             perform_initialization=False,
             # Enable only after native DDP has allocated main_grad. Standalone
             # SAEs and the DP1 direct-gradient fast path have no such buffer.
@@ -220,6 +222,18 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         # the native SAE initialization (including tied initial encoder values).
         set_tensor_model_parallel_attributes(self.encoder.weight, True, 0, 1)
         set_tensor_model_parallel_attributes(self.decoder.weight, True, 1, 1)
+        if not self._initialize_weights:
+            # Cutover restores every parameter before DDP/forward. Allocate new
+            # Parameter objects (no stale reducer hooks), without CPU staging,
+            # random numbers, decoder normalization or discarded host matrices.
+            self.encoder.to(self.device)
+            self.decoder.to(self.device)
+            self.b_dec = nn.Parameter(torch.empty(
+                self.cfg.d_in, dtype=self.dtype, device=self.device
+            ))
+            self.b_dec.tensor_model_parallel = False
+            self.b_dec.allreduce = True
+            return
         w_dec, w_enc, b_enc, b_dec = _shard_init_topk_cpu(
             self.cfg, self.tp_size, self.tp_rank
         )
@@ -937,7 +951,55 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         """Megatron's bias-edge reduction completes TP gradients in backward."""
 
     def tp_wavefront_supported(self) -> bool:
-        return self.tp_size > 1 and self.encoder.weight.is_cuda
+        return self.encoder.weight.is_cuda and (
+            self.tp_size > 1
+            or (self.cfg.auxk != 0 and self.tp_wavefront_aux_selection_supported())
+        )
+
+    def tp_wavefront_aux_selection_supported(self) -> bool:
+        """Aux selection can use the local encoder logits before main decode."""
+        return (execution.branch_representation(self.cfg, True) != "full"
+                if self._decoupled_execution else self.sharded_latents)
+
+    def tp_wavefront_aux_select_launch(self, state: MegatronTPWavefrontState) -> None:
+        self._last_auxk_async_selection = False
+        if not self.cfg.auxk_async_selection:
+            return  # The auxiliary decoder uses the existing synchronous selection path.
+        if not self.tp_wavefront_aux_selection_supported() or self.cfg.auxk == 0:
+            return
+        step_input = state.step_input
+        mask = step_input.dead_neuron_mask
+        num_dead = step_input.dead_neuron_count
+        if num_dead is None:
+            num_dead = 0 if mask is None else int(mask.sum())
+        requested = self.cfg.d_in // 2 if self.cfg.auxk is None else self.cfg.auxk
+        if not num_dead or (num_dead <= requested and self.cfg.auxk_selection == "auto"):
+            # Select-all has no comparison work to overlap. Keep its direct
+            # compact decoder path and avoid an otherwise redundant event.
+            return
+        if state.aux_selection is not None:
+            raise RuntimeError("AuxK selection must be submitted once")
+        width = self.cfg.d_sae // self.tp_size
+        if self._decoupled_execution:
+            stages = execution.stage_requests(self.cfg, True)
+            packed = execution.branch_representation(self.cfg, True) == "sharded_ragged" or stages not in (
+                ("local_dense",) * 3, ("compact_dense",) * 3,
+            )
+            layout, decoder = ("ragged", "auto") if packed else ("dense", "local_dense")
+        else:
+            layout = {"sharded_dense": "dense", "sharded_sparse": "sparse", "sharded_ragged": "ragged"}[self.cfg.topk_backend]
+            decoder = self.cfg.auxk_decoder_backend if layout == "dense" else "auto"
+        with cuda_nvtx_range("sae_auxk:selection_launch"):
+            state.aux_selection = launch_auxk_selection(
+                state.hidden_pre_local, min(requested, num_dead),
+                mask.narrow(0, self.tp_rank * width, width), num_dead, self._tp_group,
+                layout=layout, decoder=decoder, complement=self.cfg.auxk_complement,
+                selection_policy=self.cfg.auxk_selection, protocol=self.cfg.topk_candidate_protocol,
+                key_backend=self.cfg.topk_key_backend, tie_policy=self.cfg.topk_tie_policy,
+                known_columns=step_input.auxk_local_columns,
+                stream=_wavefront_stream(state.hidden_pre_local.device),
+            )
+        self._last_auxk_async_selection = state.aux_selection is not None
 
     def tp_wavefront_aux_selection_supported(self) -> bool:
         """Aux selection can use the local encoder logits before main decode."""
@@ -984,7 +1046,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         self, step_input: TrainStepInput
     ) -> MegatronTPWavefrontState:
         if not self.tp_wavefront_supported():
-            raise RuntimeError("TP wavefront requires a CUDA SAE with TP > 1")
+            raise RuntimeError("Wavefront requires CUDA and TP communication or local AuxK selection")
         sae_in = self.process_sae_in(step_input.sae_in)
         local, _ = self.encoder(sae_in.reshape(-1, self.cfg.d_in))
         local = self.hook_sae_acts_pre(local.reshape(*sae_in.shape[:-1], self.cfg.d_sae // self.tp_size))

@@ -70,7 +70,7 @@ class SAERuntime:
         domains: tuple[SAETrainingDomain, ...],
         *,
         backend: str = "nccl",
-        timeout: timedelta = timedelta(seconds=180),
+        timeout: timedelta = timedelta(seconds=900),
     ):
         if not dist.is_initialized():
             raise RuntimeError("Initialize the routing world before SAERuntime")

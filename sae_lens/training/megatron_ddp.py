@@ -35,6 +35,7 @@ def wrap_runtime_sae(
     model, runtime, *, bucket_cap_mb=None, distributed_optimizer=False,
     single_replica_fast_path=True,
     gradient_accumulation_fusion=True,
+    weights_synced=False,
 ):
     runtime.validate_model(model)
     context = runtime.require_local()
@@ -96,5 +97,8 @@ def wrap_runtime_sae(
     config.gradient_accumulation_fusion = model.configure_gradient_accumulation_fusion(
         gradient_accumulation_fusion
     )
-    ddp.broadcast_params()
+    # Elastic already seeded every replica from the permanent source before
+    # constructing the native buffers. Avoid a second full weight broadcast.
+    if not weights_synced:
+        ddp.broadcast_params()
     return ddp
