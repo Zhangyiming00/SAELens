@@ -70,6 +70,7 @@ def _local_candidates(
     *,
     workspace_bytes: int = 256 * 1024 * 1024,
     known_columns: torch.Tensor | None = None,
+    feature_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Bound comparison-key scratch independently of token batch size.
 
@@ -116,7 +117,7 @@ def _local_candidates(
     # internal workspace are separate from this comparison-key tile budget.
     scratch_per_element = (32 if columns is not None else 8) if key_kernel else 64
     tile = max(1, workspace_bytes // (scan_width * scratch_per_element))
-    global_ids = columns + offset if columns is not None else None
+    global_ids = (feature_ids if columns is None else feature_ids[columns]) if feature_ids is not None else (columns + offset if columns is not None else None)
     for start in range(0, rows, tile):
         block = scores[start : start + tile]
         if columns is not None:
@@ -126,7 +127,7 @@ def _local_candidates(
             if key_kernel is None
             else key_kernel(block, offset if columns is None else 0)
         )
-        if columns is not None:
+        if global_ids is not None:
             keys = (keys & ~0xFFFFFFFF) | (0xFFFFFFFF - global_ids[None, :])
         if take == scan_width and columns is not None:
             # All LOCAL eligible features are candidates; global TopK still
@@ -146,6 +147,7 @@ def _local_candidates(
 def _radix_threshold(
     local_keys: torch.Tensor, k: int, group: dist.ProcessGroup | None, *,
     global_features: int | None = None,
+    common_candidate_width: int | None = None,
 ) -> torch.Tensor:
     """Find the kth largest unique signed int64 key using bounded histograms.
 
@@ -157,7 +159,7 @@ def _radix_threshold(
     remaining = torch.full((rows,), k, dtype=torch.int64, device=local_keys.device)
     threshold = torch.zeros_like(remaining)
     # Use smaller digits for tiny shards/candidate sets. No rank-dependent loop.
-    digit_bits = min(8, max(1, int(math.log2(max(2, local_keys.shape[1])))))
+    digit_bits = min(8, max(1, int(math.log2(max(2, local_keys.shape[1] if common_candidate_width is None else common_candidate_width)))))
     if global_features is None:
         digits = [(shift, min(digit_bits, 64 - shift))
                   for shift in list(range(0, 64, digit_bits))[::-1]]
@@ -292,8 +294,9 @@ def launch_sharded_topk(
     tie_policy: str = "stable_id",
     winner_count=None,
     known_columns: torch.Tensor | None = None,
+    feature_shard=None,
 ) -> PendingShardedTopK:
-    """Submit exact selection for a *uniform-width, feature-sharded* tensor.
+    """Submit exact selection for equal or explicitly described unequal shards.
 
     Every TP rank must pass the same leading shape and k, and its own local
     eligibility mask. Callers must obtain k from a global eligible count first.
@@ -312,14 +315,19 @@ def launch_sharded_topk(
     width = scores.shape[-1]
     if scores.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError("Sharded exact TopK supports float16/bfloat16/float32 scores")
-    if p * width > (1 << 32):
+    widths = (width,) * p if feature_shard is None else feature_shard.widths
+    if len(widths) != p or widths[rank] != width:
+        raise ValueError("Feature layout does not match TP group/local score shape")
+    total = sum(widths)
+    if total > (1 << 32):
         raise ValueError("Global feature indices must fit in uint32")
-    if not 0 < k <= p * width:
-        raise ValueError(f"k must be in [1, {p * width}], got {k}")
+    if not 0 < k <= total:
+        raise ValueError(f"k must be in [1, {total}], got {k}")
     if protocol not in ("auto", "candidates", "radix"):
         raise ValueError("protocol must be auto, candidates, or radix")
     nlocal = min(k, width)
-    candidate_safe = p * nlocal * 8 <= width * scores.element_size()
+    candidate_widths = tuple(min(k, w) for w in widths)
+    candidate_safe = sum(candidate_widths) * 8 <= min(widths) * scores.element_size()
     if protocol == "candidates" and not candidate_safe and p > 1:
         raise ValueError(
             "Candidate workspace exceeds one shard; use auto/radix, not full gather"
@@ -350,8 +358,12 @@ def launch_sharded_topk(
         return PendingShardedTopK(scores, indices, local_keys, threshold, leading,
                                   relu, sparse, 'torch_tp1', None, packed, winner_count)
     local_keys, indices = _local_candidates(
-        scores.reshape(rows, width), nlocal, rank * width, eligible, key_backend,
+        scores.reshape(rows, width), nlocal,
+        rank * width if feature_shard is None else (feature_shard.contiguous_start or 0),
+        eligible, key_backend,
         known_columns=known_columns,
+        feature_ids=None if feature_shard is None or feature_shard.contiguous_start is not None
+        else feature_shard.ids(scores.device),
     )
 
     def select() -> torch.Tensor:
@@ -363,8 +375,19 @@ def launch_sharded_topk(
         if chosen == "radix":
             return _radix_threshold(
                 local_keys, k, group,
-                global_features=p * width if compact_radix else None,
+                global_features=total if compact_radix else None,
+                common_candidate_width=min(candidate_widths),
             )
+        if len(set(candidate_widths)) != 1:
+            # Exact-sized exchange, including k > the smallest shard. All ranks
+            # choose this branch from common metadata; never pad model widths.
+            parts = []
+            members = dist.get_process_group_ranks(group)
+            for i, count in enumerate(candidate_widths):
+                part = local_keys.contiguous() if i == rank else local_keys.new_empty(rows, count)
+                dist.broadcast(part, src=members[i], group=group)
+                parts.append(part)
+            return torch.cat(parts, dim=1).topk(k, dim=1, sorted=False).values.amin(1)
         recv = torch.empty((p * rows, nlocal), dtype=torch.int64, device=scores.device)
         dist.all_gather_into_tensor(recv, local_keys.contiguous(), group=group)
         candidates = (
@@ -400,7 +423,7 @@ def sharded_topk(
 
 def sharded_auxk(scores, k, eligible, num_eligible, group=None, *, sparse=False,
                  policy="auto", protocol="auto", key_backend="torch", tie_policy="stable_id",
-                 winner_count=None, known_columns=None):
+                 winner_count=None, known_columns=None, feature_shard=None):
     """Exact AuxK selection; never gather full latent or change the loss budget.
 
     ``num_eligible`` is the ALREADY known global dead count (same on TP ranks),
@@ -430,18 +453,19 @@ def sharded_auxk(scores, k, eligible, num_eligible, group=None, *, sparse=False,
         scores, k, group, eligible=eligible, relu=False, sparse=sparse,
         protocol=protocol, key_backend=key_backend, compact_radix=policy == "auto", tie_policy=tie_policy,
         winner_count=winner_count,
-        known_columns=known_columns,
+        known_columns=known_columns, feature_shard=feature_shard,
     )
 
 
 @torch.no_grad()
 def sharded_firing_counts(
-    acts: torch.Tensor, group: dist.ProcessGroup | None
+    acts: torch.Tensor, group: dist.ProcessGroup | None, *, feature_shard=None
 ) -> torch.Tensor:
     """Replicate only the [global_features] summary, never token-by-feature data."""
     from sae_lens.ragged_sae import RaggedLatents, packed_feature_counts
     if isinstance(acts, RaggedLatents):
-        return packed_feature_counts(acts, group)
+        local = packed_feature_counts(acts, None)
+        return feature_shard.counts(local, group) if feature_shard is not None else packed_feature_counts(acts, group)
     width = acts.shape[-1]
     local = torch.zeros(width, dtype=torch.float32, device=acts.device)
     if acts.is_sparse:
@@ -449,6 +473,8 @@ def sharded_firing_counts(
         local.scatter_add_(0, coo.indices()[-1], (coo.values() != 0).float())
     else:
         local.copy_((acts != 0).reshape(-1, width).float().sum(0))
+    if feature_shard is not None:
+        return feature_shard.counts(local, group)
     p, rank = _group_size(group), _group_rank(group)
     if p == 1:
         return local
@@ -498,6 +524,7 @@ def full_topk(
     key_backend="torch",
     tie_policy="stable_id",
     winner_count=None,
+    feature_shard=None,
 ):
     """Select on already gathered scores, without a second TP collective.
 
@@ -533,13 +560,19 @@ def full_topk(
     )
     if packed or winner_count is not None:
         offset = rank * shard_width
-        keep = (indices >= offset) & (indices < offset + shard_width)
+        if feature_shard is None:
+            keep = (indices >= offset) & (indices < offset + shard_width)
+        else:
+            inverse = torch.full((width,), -1, device=scores.device, dtype=torch.long)
+            inverse[feature_shard.ids(scores.device)] = torch.arange(shard_width, device=scores.device)
+            keep = inverse[indices] >= 0
         if winner_count is not None:
             winner_count(keep.sum())
     if packed:
         positions = keep.reshape(-1).nonzero(as_tuple=True)[0]
         rows = positions // k
-        columns = indices.reshape(-1).index_select(0, positions) - offset
+        selected = indices.reshape(-1).index_select(0, positions)
+        columns = selected - offset if feature_shard is None else inverse[selected]
         counts = torch.bincount(rows, minlength=flat.shape[0])
         offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
         dense._sae_selected_entries = SelectedEntries(

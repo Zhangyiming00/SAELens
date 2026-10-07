@@ -1,7 +1,7 @@
 """Megatron dependency, collectives, and SAELens-compatible initialization.
 
-Training parameters are owned by MegatronTopKSAE linear modules. No custom
-linear or collective autograd implementation lives here.
+Training parameters and linear autograd remain owned by MegatronTopKSAE native
+linear modules. Explicit unequal/full gathers use the feature-map adapter.
 """
 
 import math
@@ -35,9 +35,12 @@ def require_megatron_core() -> ModuleType:
 
 
 def megatron_tp_allgather(
-    local: torch.Tensor, group: dist.ProcessGroup
+    local: torch.Tensor, group: dist.ProcessGroup, *, feature_shard=None
 ) -> torch.Tensor:
     """Gather latent shards; backward selects this rank's gradient shard."""
+    if feature_shard is not None and (not feature_shard.canonical or len(set(feature_shard.widths)) != 1):
+        from sae_lens.tp_layout import gather_features_autograd
+        return gather_features_autograd(local, feature_shard, group)
     if group.size() == 1:
         return local
     tp = require_megatron_core()
@@ -71,7 +74,7 @@ class MegatronTPPending:
 
 
 def megatron_tp_launch(
-    local: torch.Tensor, group: dist.ProcessGroup, *, gather: bool
+    local: torch.Tensor, group: dist.ProcessGroup, *, gather: bool, feature_shard=None
 ) -> MegatronTPPending:
     """Enqueue a native mapping on the TP stream without stalling compute.
 
@@ -86,6 +89,8 @@ def megatron_tp_launch(
     if group.size() == 1:
         # The singleton mapping is identity. Recording on the producer stream
         # avoids making main reconstruction wait for unrelated AuxK selection.
+        if gather and feature_shard is not None and not feature_shard.canonical:
+            local = megatron_tp_allgather(local, group, feature_shard=feature_shard)
         ready = torch.cuda.Event()
         ready.record(current)
         return MegatronTPPending(local, ready)
@@ -95,7 +100,7 @@ def megatron_tp_launch(
         local.record_stream(stream)
         with cuda_nvtx_range("sae_tp_wavefront:all_gather" if gather else "sae_tp_wavefront:all_reduce"):
             result = (
-                megatron_tp_allgather(local, group)
+                megatron_tp_allgather(local, group, feature_shard=feature_shard)
                 if gather
                 else require_megatron_core().reduce_from_tensor_model_parallel_region(
                     local, group=group
@@ -146,17 +151,15 @@ def _shard_init_topk_cpu(
 
     Returns ``(W_dec_shard, W_enc_shard, b_enc_shard, b_dec_full)`` on CPU.
     """
-    assert cfg.d_sae % tp_size == 0, (
-        f"d_sae={cfg.d_sae} must be divisible by tp_size={tp_size}"
-    )
-    shard_size = cfg.d_sae // tp_size
+    from sae_lens.tp_layout import shard_bounds
+    start, shard_size = shard_bounds(cfg.d_sae, tp_size, tp_rank)
     dtype = str_to_dtype(cfg.dtype)
     # kaiming_uniform_ defaults: a=0, mode='fan_in', nonlinearity='leaky_relu'
     # → gain = sqrt(2), bound = gain * sqrt(3 / fan_in) = sqrt(6 / d_in)
     bound = math.sqrt(6.0 / cfg.d_in)
 
-    pre_numel = tp_rank * shard_size * cfg.d_in
-    post_numel = (tp_size - tp_rank - 1) * shard_size * cfg.d_in
+    pre_numel = start * cfg.d_in
+    post_numel = (cfg.d_sae - start - shard_size) * cfg.d_in
 
     _advance_cpu_rng(pre_numel, dtype, bound)
     w_dec_shard = torch.empty(shard_size, cfg.d_in, dtype=dtype, device="cpu")

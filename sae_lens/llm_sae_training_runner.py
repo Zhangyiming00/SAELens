@@ -2264,6 +2264,12 @@ class LanguageModelSAETrainingRunner:
                     create=False,
                 )
 
+            if self._streaming_buffer._dtype != str_to_dtype(cfg.dtype):
+                raise ValueError(
+                    "Existing streaming buffer dtype differs from configured "
+                    "activation dtype; use the original dtype when resuming"
+                )
+
         self.sae_active = ds.is_consumer()
         self.vllm_active = ds.is_producer()
         self.uses_split_roles = True

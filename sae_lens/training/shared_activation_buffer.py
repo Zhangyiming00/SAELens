@@ -505,6 +505,32 @@ class SharedActivationBuffer:
             tensor = torch.from_numpy(raw)
         return tensor, valid_tokens
 
+    def copy_chunk_into(self, chunk_idx: int, destination: torch.Tensor) -> int:
+        """Copy a leased slot directly into caller-owned CPU storage.
+
+        Unlike read_chunk(), this allocates no intermediate array. The copy is
+        synchronous: the caller may release the slot immediately afterwards.
+        Requiring identical dtypes prevents a transport optimization from
+        silently quantizing FP32 activations.
+        """
+        if int(self._state[chunk_idx]) != ChunkState.CONSUMING:
+            raise RuntimeError("copy_chunk_into requires a CONSUMING slot")
+        rows = int(self._meta[chunk_idx, 0])
+        if (
+            destination.device.type != "cpu"
+            or destination.dtype != self._dtype
+            or destination.shape != (rows, self._d_model)
+        ):
+            raise ValueError("destination must match the slot's CPU shape and dtype")
+        raw = self._data[chunk_idx, :rows]
+        source = (
+            torch.from_numpy(raw.view(np.int16)).view(torch.bfloat16)
+            if self._dtype_code == 0
+            else torch.from_numpy(raw)
+        )
+        destination.copy_(source)
+        return rows
+
     def release_chunk(self, chunk_idx: int) -> None:
         """Release a CONSUMING slot. Decrements refcount; transitions to FREE on zero.
 

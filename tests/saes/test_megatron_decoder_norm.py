@@ -92,3 +92,41 @@ def test_norm_scope_does_not_survive_forward_failure(tp1):
     model(step_input).loss.backward()
     assert torch.isfinite(model.decoder.weight.grad).all()
     assert model._decoder_norm_scope is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA reductions")
+def test_decoder_norm_is_exact_across_unequal_feature_widths(tp1):
+    """Same feature vectors retain their norm when TP changes output width."""
+    cfg = TopKTrainingSAEConfig(
+        d_in=4096, d_sae=1024, k=4, device="cuda", dtype="float32",
+        normalize_activations="none",
+    )
+    full = MegatronTopKSAE(cfg, tp_group=tp1)
+    torch.manual_seed(702)
+    with torch.no_grad():
+        full.decoder.weight.normal_()
+    expected = full._decoder_norm()
+    coefficients = torch.linspace(0.25, 1.25, cfg.d_sae, device="cuda")
+    (expected * coefficients).sum().backward()
+    offset = 0
+    for width in (342, 341, 341):
+        local_cfg = copy.deepcopy(cfg)
+        local_cfg.d_sae = width
+        local = MegatronTopKSAE(local_cfg, tp_group=tp1)
+        with torch.no_grad():
+            local.decoder.weight.copy_(full.decoder.weight[:, offset:offset + width])
+        with local._share_decoder_norm():
+            norm = local._decoder_norm()
+            torch.testing.assert_close(norm, expected[offset:offset + width], atol=0, rtol=0)
+            (norm * coefficients[offset:offset + width]).sum().backward()
+        torch.testing.assert_close(
+            local.decoder.weight.grad, full.decoder.weight.grad[:, offset:offset + width],
+            atol=0, rtol=0,
+        )
+        # A second graph after a parameter update must not see a stale copy.
+        with torch.no_grad():
+            local.decoder.weight.mul_(2)
+        torch.testing.assert_close(
+            local._decoder_norm(), 2 * expected[offset:offset + width], atol=0, rtol=0,
+        )
+        offset += width

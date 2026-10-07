@@ -24,8 +24,8 @@ class MegatronMemoryConfig:
     def __post_init__(self):
         if min(self.d_in, self.d_sae, self.hooks, self.global_batch, self.tp, self.dp, self.ga) < 1:
             raise ValueError("dimensions, topology and GA must be positive")
-        if self.d_sae % self.tp or self.global_batch % (self.dp * self.ga):
-            raise ValueError("d_sae must divide TP, and global batch must divide DP*GA exactly")
+        if self.tp > self.d_sae or self.global_batch % (self.dp * self.ga):
+            raise ValueError("TP must not exceed d_sae; global batch must divide DP*GA exactly")
 
     @property
     def microbatch(self):
@@ -33,20 +33,23 @@ class MegatronMemoryConfig:
 
 
 def estimate_tensor_payloads(cfg: MegatronMemoryConfig) -> dict[str, int]:
-    """Exact payload terms for nonsharded fused Adam and fully cached inputs.
+    """Maximum-rank payload terms for fused Adam and fully cached inputs.
+
+    Unequal feature ownership uses ceil(d_sae/TP); no padded parameters exist.
 
     DP=1 direct gradients are transient; DP>1 native main_grad is persistent.
     DDP bucket padding, small metadata, allocator slack, runtime/context and
     transient tensors are excluded and must be measured separately.
     """
-    params = cfg.hooks * 4 * (2 * cfg.d_in * (cfg.d_sae // cfg.tp) + cfg.d_sae // cfg.tp + cfg.d_in)
+    width = (cfg.d_sae + cfg.tp - 1) // cfg.tp
+    params = cfg.hooks * 4 * (2 * cfg.d_in * width + width + cfg.d_in)
     inputs = cfg.hooks * 4 * (cfg.global_batch // cfg.dp) * cfg.d_in
     grads = params if cfg.dp > 1 else 0
     return dict(parameters=params, adam_moments=2 * params, gradients=grads,
         cached_inputs=inputs, persistent_payload=params * 3 + grads + inputs,
         direct_gradient_capacity=params if cfg.dp == 1 else 0,
         full_feature_tensor=4 * cfg.microbatch * cfg.d_sae,
-        local_feature_tensor=4 * cfg.microbatch * (cfg.d_sae // cfg.tp),
+        local_feature_tensor=4 * cfg.microbatch * width,
         # sae_in aliases cached inputs; hidden_pre, feature_acts and sae_out
         # are the additional detached output payload (with norm rescaling on).
         retained_output_set=cfg.hooks * 4 * cfg.microbatch * (2 * cfg.d_sae + cfg.d_in))

@@ -1,7 +1,8 @@
 """Current native Megatron timing: unprofiled wall time or a separate Nsight run.
 
 Warmup, allocator history and checkpoint/teardown are excluded. Each case gets
-fresh ranks. The fixed cached inputs/AuxK masks match the allocated audit.
+fresh ranks. Fixed masks support controlled AuxK audits; natural mode preserves
+the trainer's firing ages and applies the requested dead_feature_window.
 """
 from __future__ import annotations
 
@@ -33,12 +34,14 @@ def hook_sources(count, *, repeat=False):
 def read_local_dead_mask(directory, tp, rank, d_sae):
     """Read the actual owner mask; counts are derived, never used as a proxy."""
     import torch
+    from sae_lens.tp_layout import balanced_widths
 
     path = Path(directory) / f"tp{tp}_rank{rank}.pt"
     mask = torch.load(path, map_location="cpu", weights_only=True)
+    width = balanced_widths(d_sae, tp)[rank]
     if (not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool
-            or d_sae % tp or mask.shape != (d_sae // tp,)):
-        raise ValueError(f"{path}: expected bool [{d_sae // tp}] local dead mask")
+            or mask.shape != (width,)):
+        raise ValueError(f"{path}: expected bool [{width}] local dead mask")
     return mask, path
 
 
@@ -167,6 +170,7 @@ def worker(rank, args, c):
     from sae_lens.training.megatron_ddp import wrap_runtime_sae
     from sae_lens.training.multi_sae_trainer import MultiSAETrainer
     from sae_lens.training.gradient_window import train_runtime_window
+    from sae_lens.tp_layout import balanced_widths
 
     directory = args.output / args.case
     torch.set_num_threads(1)
@@ -186,6 +190,14 @@ def worker(rank, args, c):
     local_total = c["batch"] // c["dp"]
     micro = local_total // c["ga"]
     assert micro * c["ga"] * c["dp"] == c["batch"]
+    dead_mode = c.get("dead_mode", "fixed")
+    if dead_mode not in ("fixed", "natural"):
+        raise ValueError("dead_mode must be fixed or natural")
+    dead_window = c.get("dead_window", 0)
+    if type(dead_window) is not int or dead_window < 0:
+        raise ValueError("dead_window must be a nonnegative integer")
+    if dead_mode == "natural" and c.get("mask_dir"):
+        raise ValueError("Natural firing ages cannot be combined with an injected dead mask")
     try:
         cfg = SAETrainerConfig(device=f"cuda:{rank}", n_checkpoints=0,
             total_training_samples=(args.warmup + args.steps + 1) * local_total,
@@ -193,7 +205,7 @@ def worker(rank, args, c):
             save_mse_every_n_steps=0, save_timing_every_n_steps=0, save_memory_every_n_steps=0,
             record_memory_empty_cache=False, record_memory_timeline_step=-1, synchronize_timing=False,
             lr=3e-4, lr_end=3e-4, lr_scheduler_name="constant", lr_warm_up_steps=0, lr_decay_steps=0,
-            dead_feature_window=0, feature_sampling_window=1000, autocast=False,
+            dead_feature_window=dead_window, feature_sampling_window=1000, autocast=False,
             quiesce_checkpoint_path=None, multi_sae_backward_order="forward",
             multi_sae_stats_sync_mode="immediate", multi_sae_stats_sync_interval=1,
             adam_beta1=.9, adam_beta2=.999, n_restart_cycles=1,
@@ -212,34 +224,42 @@ def worker(rank, args, c):
         cfg.multi_sae_param_gather_overlap = c.get("gather", "one_hook_lag") != "deferred"
         cfg.multi_sae_param_gather_schedule = c.get("gather", "one_hook_lag") if c.get("gather") != "deferred" else "one_hook_lag"
         cfg.sae_single_replica_fast_path = True
-        cfg.sae_gradient_accumulation_fusion = True
+        cfg.sae_gradient_accumulation_fusion = c.get("gradient_fusion", True)
         cfg.sae_ga1_loss_normalization = True
         cfg.multi_sae_tp_phase_fence = "auto"
         model_options = dict(d_in=c["d_in"], d_sae=c["d_sae"], k=c.get("k", 128), auxk=c.get("auxk"),
             device=f"cuda:{rank}", dtype="float32", normalize_activations="none",
             use_sparse_activations=False, topk_backend=c["backend"], topk_key_backend=c.get("key_backend", "torch"), auxk_decoder_backend=c["aux"],
+            auxk_async_selection=c.get("aux_selection_overlap", True),
             ragged_decoder_engine="openai", v5_main_compute=c["main_compute"], v5_aux_compute=c["aux_compute"])
         model_options.update(c.get("execution", {}))
         model_cfg = TopKTrainingSAEConfig(**model_options)
         models, wrapped = {}, {}
+        observed_dead = {}
         for hook in hooks:
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(42)
                 model = MegatronTopKSAE(model_cfg, runtime=runtime)
             models[hook] = model
-            if not c.get("aux_selection_overlap", True):
-                # Benchmark ablation only: retain all common fixes, but launch
-                # AuxK selection in its original auxiliary decode path.
-                model.tp_wavefront_aux_select_launch = lambda state: None
+            prepare_metadata = model.prepare_auxk_metadata
+            def observe_metadata(mask, count, fn=prepare_metadata, key=hook):
+                columns = fn(mask, count)
+                # The runtime already read the global count. Tensor shape is
+                # host metadata, so this observer adds no GPU synchronization.
+                observed_dead[key] = dict(global_dead=count,
+                    local_dead=0 if columns is None else columns.numel())
+                return columns
+            model.prepare_auxk_metadata = observe_metadata
             wrapped[hook] = wrap_runtime_sae(model, runtime, distributed_optimizer=c["zero"],
-                single_replica_fast_path=True, gradient_accumulation_fusion=True)
+                single_replica_fast_path=True,
+                gradient_accumulation_fusion=c.get("gradient_fusion", True))
         trainer = MultiSAETrainer(hook_names=hooks, sae_by_hook=wrapped, base_sae_by_hook=models,
             data_provider=iter(()), save_checkpoint_fn=None, cfg=cfg, dp_group=ctx.dp_group,
             token_count_weighted_dp=True, sae_dp_mode="ddp", runtime=runtime)
         assert trainer.global_update_batch_size == c["batch"]
         intra_aux = all(getattr(m, "tp_wavefront_aux_selection_supported", lambda: False)()
                         and m.cfg.auxk != 0 for m in models.values())
-        assert trainer._runtime_tp_wavefront == (c["wave"] != "off" and c["tp"] > 1 and (len(hooks) > 1 or intra_aux))
+        assert trainer._runtime_tp_wavefront == (c["wave"] != "off" and (c["tp"] > 1 or intra_aux) and (len(hooks) > 1 or intra_aux))
         order = torch.load(CACHE / "global_row_order.pt", weights_only=True)[:c["batch"]]
         assert len(order) == c["batch"]
         order = order[ctx.dp_rank * local_total:(ctx.dp_rank + 1) * local_total]
@@ -258,14 +278,16 @@ def worker(rank, args, c):
                 del values
             del cached
         mask_path = None
-        if c.get("mask_dir"):
+        if dead_mode == "natural":
+            mask = torch.zeros(c["d_sae"], dtype=torch.bool, device=rank)
+            assert all(not ages.any().item() for ages in trainer.n_forward_passes_since_fired_by_hook.values())
+        elif c.get("mask_dir"):
             local_mask, mask_path = read_local_dead_mask(c["mask_dir"], c["tp"], ctx.tp_rank, c["d_sae"])
-            local_mask = local_mask.to(rank)
-            parts = [torch.empty_like(local_mask) for _ in range(c["tp"])]
-            dist.all_gather(parts, local_mask, group=ctx.tp_group)
+            parts = [read_local_dead_mask(c["mask_dir"], c["tp"], owner, c["d_sae"])[0]
+                     for owner in range(c["tp"])]
             # Trainer ages currently have the replicated global feature axis.
             # Assembly is outside timing; each selector still uses its own slice.
-            mask = torch.cat(parts)
+            mask = torch.cat(parts).to(rank)
         else:
             # Compatibility only: one balanced synthetic distribution. It is
             # not a profile of arbitrary masks with the same global dead count.
@@ -273,17 +295,24 @@ def worker(rank, args, c):
             ids = (torch.arange(c["dead"], device=rank) * c["d_sae"] // c["dead"]
                    if c["dead"] else torch.empty(0, device=rank, dtype=torch.long))
             mask[ids] = True
-        dead_by_tp = mask.reshape(c["tp"], -1).sum(1).cpu().tolist()
-        c = dict(c, dead=sum(dead_by_tp))
+        widths = balanced_widths(c["d_sae"], c["tp"])
+        def count_by_tp(value):
+            return [int(part.sum()) for part in value.split(widths)]
+        dead_by_tp = count_by_tp(mask)
+        c = dict(c, dead_mode=dead_mode, dead_window=dead_window)
+        if dead_mode == "fixed":
+            c["dead"] = sum(dead_by_tp)
         dump(directory / f"dead_mask_rank{rank}.json", dict(
-            source="explicit_local_bool" if mask_path else "legacy_generated_balanced",
+            source=("natural_cold_start" if dead_mode == "natural" else
+                    "explicit_local_bool" if mask_path else "legacy_generated_balanced"),
+            dead_window=dead_window,
             dead_by_tp=dead_by_tp, total_dead=sum(dead_by_tp),
             path=str(mask_path) if mask_path else None,
             file_sha256=sha(mask_path) if mask_path else None,
         ))
         if args.trace:
             instrument(trainer, torch, dist)
-        # Three scalar timers per update in this workload; no CUDA sync or
+        # Candidate-stage scalar timers; no CUDA sync or
         # production training changes. Keep the measured CPU issuance visible.
         import sae_lens.sharded_topk as topk
         candidate_cpu = []
@@ -295,11 +324,14 @@ def worker(rank, args, c):
             return result
         topk._local_candidates = timed_candidates
         steps = []
+        dead_history = []
         total = args.warmup + args.steps
         for step in range(total):
-            for ages in trainer.n_forward_passes_since_fired_by_hook.values():
-                ages.copy_(mask)
+            if dead_mode == "fixed":
+                for ages in trainer.n_forward_passes_since_fired_by_hook.values():
+                    ages.copy_(mask.to(ages.dtype) * (dead_window + 1))
             torch.cuda.synchronize()
+            dist.barrier(group=runtime.control_group)
             if step == args.warmup:
                 torch.cuda.reset_peak_memory_stats()
             if args.trace and step == args.warmup:
@@ -313,14 +345,24 @@ def worker(rank, args, c):
                 a.record()
                 outputs, _ = train_runtime_window(trainer, batches)
                 b.record()
-                b.synchronize()
+                torch.cuda.synchronize()
                 elapsed = (time.perf_counter() - start) * 1000
             losses = {h: float(o.loss) for h, o in outputs.items()}
             assert all(math.isfinite(v) for v in losses.values())
             assert all(u.update_count == step + 1 for u in trainer.units.values())
             assert all(v == c["batch"] for v in trainer._last_global_tokens_by_hook.values())
+            dead_sample = dict(step=step, timed=step >= args.warmup,
+                               dead_by_hook=dict(observed_dead),
+                               aux_execution={h: dict(getattr(m, "_last_auxk_execution", None) or {})
+                                              for h, m in models.items()},
+                               aux_async_launched={h: bool(getattr(m, "_last_auxk_async_selection", False))
+                                                   for h, m in models.items()})
+            dead_history.append(dead_sample)
             if step >= args.warmup:
                 steps.append(dict(step=step, ms=elapsed, cuda_ms=a.elapsed_time(b), losses=losses,
+                                  dead_by_hook=dead_sample["dead_by_hook"],
+                                  aux_execution=dead_sample["aux_execution"],
+                                  aux_async_launched=dead_sample["aux_async_launched"],
                                   backward_waits=list(backward_waits), candidate_cpu_ms=list(candidate_cpu)))
             backward_waits.clear()
             candidate_cpu.clear()
@@ -348,17 +390,27 @@ def worker(rank, args, c):
             runtime=runtime, dp_group=ctx.dp_group,
             pp_rank=runtime.domains.index(ctx.domain),
         )
-        for ages in trainer.n_forward_passes_since_fired_by_hook.values():
-            ages.copy_(mask)
+        if dead_mode == "fixed":
+            for ages in trainer.n_forward_passes_since_fired_by_hook.values():
+                ages.copy_(mask.to(ages.dtype) * (dead_window + 1))
+        audit_dead_by_hook = {
+            h: count_by_tp(ages > dead_window)
+            for h, ages in trainer.n_forward_passes_since_fired_by_hook.items()
+        }
         audit, _ = train_runtime_window(trainer, batches)
         trainer.dead_feature_history.write(trainer.n_training_steps + 1,
             trainer.n_training_samples + local_total, **window_metrics(trainer))
         del audit
         dump(directory / f"rank{rank}.json", dict(rank=rank, pid=os.getpid(), config=c,
-            actual_dead_by_tp=dead_by_tp, dead_observation="extra_untimed_update",
+            actual_dead_by_tp=dead_by_tp if dead_mode == "fixed" else None,
+            actual_dead_by_hook=audit_dead_by_hook, dead_history=dead_history,
+            dead_observation="update_start_per_step_and_extra_untimed_update",
             local_hooks=hooks, hook_sources=sources, microbatch=micro, trace=args.trace, steps=steps,
             effective_wavefront=trainer._runtime_tp_wavefront,
             effective_overlap=trainer._runtime_optimizer_overlap,
+            effective_overlap_reason=trainer._runtime_optimizer_overlap_reason,
+            effective_gradient_fusion={h: bool(getattr(m, "gradient_accumulation_fusion", False))
+                                       for h, m in models.items()},
             gather=trainer._runtime_param_gather_schedule,
             main_execution=measured_main_execution,
             aux_execution=measured_aux_execution,
@@ -391,6 +443,8 @@ def main():
     p.add_argument("--warmup", type=int, default=8)
     p.add_argument("--steps", type=int, default=20)
     p.add_argument("--trace", action="store_true")
+    p.add_argument("--continue-on-error", action="store_true",
+                   help="Keep failed case logs and continue independent cases (e.g. OOM audits)")
     p.add_argument("--case")
     p.add_argument("--worker", action="store_true")
     args = p.parse_args()
@@ -479,7 +533,7 @@ def main():
                 rc = 124
         dump(directory / "result.json", dict(returncode=rc, elapsed_s=time.monotonic()-begin))
         print("END", name, rc, flush=True)
-        if rc:
+        if rc and not args.continue_on_error:
             raise RuntimeError(f"Case failed: {directory / 'run.log'}")
 
 

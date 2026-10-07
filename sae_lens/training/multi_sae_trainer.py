@@ -438,7 +438,8 @@ class MultiSAETrainer:
         )
 
         self.activation_scaler_by_hook = {
-            hook_name: ActivationScaler() for hook_name in self.hook_names
+            hook_name: ActivationScaler(compute_dtype=self.base_sae_by_hook[hook_name].dtype)
+            for hook_name in self.hook_names
         }
         self.act_freq_scores_by_hook = {
             hook_name: torch.zeros(
@@ -3173,17 +3174,17 @@ def _load_hook_optimizer_state_safetensors(
                 value = f.get_tensor(flat_key)
             else:
                 full_size = shape[shard_dim]
-                assert full_size % tp_size == 0, (
-                    f"Optimizer tensor '{flat_key}' size {full_size} on dim {shard_dim} "
-                    f"not divisible by tp_size={tp_size}"
-                )
-                shard_size = full_size // tp_size
-                slices: list[slice] = [slice(None)] * len(shape)
-                slices[shard_dim] = slice(
-                    tp_rank * shard_size,
-                    (tp_rank + 1) * shard_size,
-                )
-                value = sl[tuple(slices)].to(dtype=dtype)
+                from sae_lens.tp_layout import shard_bounds
+                features = getattr(base_sae, "feature_shard", None)
+                start, shard_size = shard_bounds(full_size, tp_size, tp_rank)
+                if features is not None and features.contiguous_start is None:
+                    value = features.select(f.get_tensor(flat_key), shard_dim).to(dtype=dtype)
+                else:
+                    start = start if features is None else features.contiguous_start
+                    shard_size = shard_size if features is None else features.width
+                    slices: list[slice] = [slice(None)] * len(shape)
+                    slices[shard_dim] = slice(start, start + shard_size)
+                    value = sl[tuple(slices)].to(dtype=dtype)
             optimizer_state.setdefault(param_name, {})[state_name] = value
 
     if meta_path.exists():

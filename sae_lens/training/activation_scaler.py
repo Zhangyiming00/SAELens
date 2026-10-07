@@ -9,12 +9,29 @@ from tqdm.auto import tqdm
 from sae_lens.training.types import DataProvider
 
 
+def prepare_sae_input(
+    acts: torch.Tensor, compute_dtype: torch.dtype | None, scale: float | None
+) -> torch.Tensor:
+    """Prepare one batch without modifying its managed activation storage.
+
+    A dtype conversion owns fresh storage, so scaling can reuse that allocation.
+    Same-dtype inputs may be views of pending rows and must remain untouched.
+    """
+    converted = compute_dtype is not None and acts.dtype != compute_dtype
+    if converted:
+        acts = acts.to(compute_dtype)
+    if scale is None or scale == 1.0:
+        return acts
+    return acts.mul_(scale) if converted else acts * scale
+
+
 @dataclass
 class ActivationScaler:
     scaling_factor: float | None = None
+    compute_dtype: torch.dtype | None = None
 
     def scale(self, acts: torch.Tensor) -> torch.Tensor:
-        return acts if self.scaling_factor is None else acts * self.scaling_factor
+        return prepare_sae_input(acts, self.compute_dtype, self.scaling_factor)
 
     def unscale(self, acts: torch.Tensor) -> torch.Tensor:
         return acts if self.scaling_factor is None else acts / self.scaling_factor
@@ -33,6 +50,8 @@ class ActivationScaler:
             leave=False,
         ):
             acts = next(data_provider)
+            if self.compute_dtype is not None:
+                acts = acts.to(self.compute_dtype)
             norms_per_batch.append(acts.norm(dim=-1).mean().item())
         return mean(norms_per_batch)
 

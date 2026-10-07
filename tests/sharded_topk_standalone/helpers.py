@@ -23,7 +23,12 @@ if "sae_lens" not in sys.modules:
     _pkg.__path__ = [str(Path(__file__).resolve().parents[2] / "sae_lens")]
     sys.modules["sae_lens"] = _pkg
 
-from sae_lens.auxk_compact import compact_aux_decode, prepare_auxk_dense
+from sae_lens.auxk_compact import (
+    compact_aux_decode,
+    launch_auxk_selection,
+    prepare_auxk_dense,
+)
+from sae_lens.profiling import cuda_nvtx_range
 from sae_lens.sharded_sparse import scale_sparse_features, sparse_decode
 from sae_lens.sharded_topk import (
     launch_sharded_topk,
@@ -107,6 +112,8 @@ class Input:
     coefficients: dict | None = None
     n_training_steps: int = 0
     is_logging_step: bool = False
+    dead_neuron_count: int | None = None
+    auxk_local_columns: torch.Tensor | None = None
 
 
 @dataclass
@@ -162,6 +169,7 @@ def load_harness_class():
         nn=nn,
         dataclass=dataclass,
         contextmanager=contextmanager,
+        cuda_nvtx_range=cuda_nvtx_range,
         TrainingSAE=Base,
         TopKTrainingSAEConfig=SimpleNamespace,
         TrainStepInput=Input,
@@ -170,6 +178,7 @@ def load_harness_class():
         sharded_topk=sharded_topk,
         sharded_auxk=sharded_auxk,
         prepare_auxk_dense=prepare_auxk_dense,
+        launch_auxk_selection=launch_auxk_selection,
         compact_aux_decode=compact_aux_decode,
         sharded_firing_counts=sharded_firing_counts,
         sparse_decode=sparse_decode,
@@ -185,7 +194,7 @@ def load_harness_class():
         ),
     )
     env["megatron_tp_launch"] = (
-        lambda x, group, gather: SimpleNamespace(wait=lambda: ReduceTP.apply(x, group))
+        lambda x, group, gather, **_kw: SimpleNamespace(wait=lambda: ReduceTP.apply(x, group))
         if not gather
         else (_ for _ in ()).throw(AssertionError("FULL LATENT GATHER"))
     )
@@ -248,7 +257,11 @@ def make_harness(global_weights, group, backend, rescale=True, protocol="auto"):
     enc, benc, dec, bdec = global_weights
     size = dist.get_world_size(group) if group is not None else 1
     rank = dist.get_rank(group) if group is not None else 0
-    width, d = enc.shape[0] // size, enc.shape[1]
+    from sae_lens.tp_layout import FeatureLayout
+    members = tuple(dist.get_process_group_ranks(group)) if group is not None else (0,)
+    model.feature_shard = FeatureLayout.balanced(enc.shape[0], members).local(members[rank])
+    width, d = model.feature_shard.width, enc.shape[1]
+    model.local_width = width
     model.tp_size, model.tp_rank, model._tp_group = size, rank, group
     model._decoupled_execution = False
     model.cfg = SimpleNamespace(
@@ -260,6 +273,11 @@ def make_harness(global_weights, group, backend, rescale=True, protocol="auto"):
         topk_candidate_protocol=protocol,
         sparse_decoder_backend="torch",
         topk_key_backend="torch",
+        topk_tie_policy="stable_id",
+        auxk_decoder_backend="auto",
+        auxk_selection="auto",
+        auxk_complement="auto",
+        auxk_async_selection=True,
         rescale_acts_by_decoder_norm=rescale,
         apply_b_dec_to_input=True,
         aux_loss_coefficient=0.2,
@@ -267,9 +285,9 @@ def make_harness(global_weights, group, backend, rescale=True, protocol="auto"):
     )
     model.encoder, model.decoder = Column(d, width), Row(width, d, group)
     with torch.no_grad():
-        model.encoder.weight.copy_(enc[rank * width : (rank + 1) * width])
-        model.encoder.bias.copy_(benc[rank * width : (rank + 1) * width])
-        model.decoder.weight.copy_(dec[:, rank * width : (rank + 1) * width])
+        model.encoder.weight.copy_(model.feature_shard.select(enc, 0))
+        model.encoder.bias.copy_(model.feature_shard.select(benc, 0))
+        model.decoder.weight.copy_(model.feature_shard.select(dec, 1))
     model.b_dec = nn.Parameter(bdec.clone())
     model.hook_sae_input = model.hook_sae_acts_pre = model.hook_sae_acts_post = (
         model.hook_sae_recons

@@ -245,7 +245,11 @@ def train_runtime_window(
                     if n:
                         if local_firing is not None:
                             width = local_firing.numel()
-                            counts[h].narrow(0, unit.model.tp_rank * width, width).add_(local_firing)
+                            features = getattr(unit.model, "feature_shard", None)
+                            if features is None:
+                                counts[h].narrow(0, unit.model.tp_rank * width, width).add_(local_firing)
+                            else:
+                                counts[h].index_add_(0, features.ids(local_firing.device), local_firing)
                         else:
                             firing = feature_counts_from_output(output)
                             counts[h] += firing.to_dense() if firing.is_sparse else firing
@@ -357,7 +361,11 @@ def train_runtime_window(
                 local = output.local_feature_firing_counts
                 assert local is not None
                 final = torch.zeros_like(summary)
-                final.narrow(0, unit.model.tp_rank * local.numel(), local.numel()).copy_(local)
+                features = getattr(unit.model, "feature_shard", None)
+                if features is None:
+                    final.narrow(0, unit.model.tp_rank * local.numel(), local.numel()).copy_(local)
+                else:
+                    final.index_copy_(0, features.ids(local.device), local)
                 summary = torch.stack((summary, final))
             tp_group = unit.parallel_context.require_local().tp_group
             if tp_group.size() > 1:

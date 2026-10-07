@@ -1168,4 +1168,10 @@ def _disable_hooks(sae: SAE[Any]):
 
 
 def mse_loss(preds: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    # Input storage and SAE computation can use different dtypes. Native MSE
+    # forward promotes mixed operands, but its backward requires matching
+    # dtypes. Promote explicitly without rounding an FP32 target down to BF16.
+    if preds.dtype != target.dtype:
+        dtype = torch.promote_types(preds.dtype, target.dtype)
+        preds, target = preds.to(dtype), target.to(dtype)
     return torch.nn.functional.mse_loss(preds, target, reduction="none")

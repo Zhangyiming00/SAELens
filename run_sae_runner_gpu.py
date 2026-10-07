@@ -468,7 +468,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--vllm-text-only", action="store_true",
                         help="Disable image/video inputs for multimodal vLLM models.")
-    parser.add_argument("--dtype", default="float32")
+    parser.add_argument("--dtype", "--sae-dtype", dest="dtype", default="float32")
+    parser.add_argument("--vllm-dtype", choices=("float32", "bfloat16"), default="bfloat16")
+    parser.add_argument(
+        "--activation-dtype", choices=("none", "float32", "bfloat16"),
+        help="Explicit input storage/transport dtype; omitted/none uses the conversion policy.",
+    )
+    parser.add_argument(
+        "--activation-conversion", choices=("auto", "vllm", "sae"), default="auto",
+        help="auto: use smaller source/SAE compute dtype; vllm: convert before transport; "
+        "sae: retain source dtype until consumption. Explicit activation dtype wins.",
+    )
     parser.add_argument("--autocast", action="store_true")
     parser.add_argument("--autocast-lm", action="store_true")
     parser.add_argument(
@@ -880,6 +890,29 @@ def _resolve_d_in_for_cached(args: argparse.Namespace) -> int:
                 f"Could not infer d_in from cache ({cache_err}) or model "
                 f"({model_err})"
             ) from cache_err
+
+
+def _resolve_cached_source_dtype(args: argparse.Namespace) -> str:
+    """Preserve cached FP32 data when no activation dtype was requested."""
+    cache_dir = Path(args.cached_activations_path)
+    manifest_path = cache_dir / "cache_activations_manifest.json"
+    try:
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text())
+            locations = [
+                (cache_dir / manifest["hook_to_dir"][hook], hook)
+                for hook in manifest["hook_names"]
+            ]
+        else:
+            locations = [(cache_dir, args.hook_name)]
+        dtypes = {
+            json.loads((directory / "dataset_info.json").read_text())["features"][hook]["dtype"]
+            for directory, hook in locations
+        }
+        # One shared management dtype must also preserve mixed/unknown caches.
+        return "bfloat16" if dtypes == {"bfloat16"} else "float32"
+    except (OSError, KeyError, ValueError, TypeError):
+        return "float32"
 
 
 def _validate_checkpoint_args(args: argparse.Namespace) -> None:
@@ -1350,6 +1383,12 @@ def main() -> None:
         if args.use_cached_activations
         else _resolve_hidden_size(args.model_name)
     )
+    from sae_lens.precision import resolve_activation_dtype
+    activation_dtype = resolve_activation_dtype(
+        _resolve_cached_source_dtype(args) if args.use_cached_activations else args.vllm_dtype,
+        args.dtype, args.activation_dtype,
+        args.activation_conversion, autocast=args.autocast,
+    )
     cfg = LanguageModelSAERunnerConfig(
         sae=TopKTrainingSAEConfig(
             **execution_config_kwargs(args),
@@ -1368,6 +1407,7 @@ def main() -> None:
         model_name=args.model_name,
         model_class_name="VLLMModel",
         model_from_pretrained_kwargs={
+            "dtype": args.vllm_dtype,
             "tensor_parallel_size": vllm_tp_size,
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": 0.5,
@@ -1389,7 +1429,7 @@ def main() -> None:
         activations_mixing_fraction=args.activations_mixing_fraction,
         device=device,
         act_store_device=args.act_store_device,
-        dtype=args.dtype,
+        dtype=activation_dtype,
         autocast=args.autocast,
         autocast_lm=args.autocast_lm,
         compile_llm=False,
@@ -1481,6 +1521,8 @@ def main() -> None:
     if hook_names is not None:
         print(f"  hooks={','.join(hook_names)}")
     print(f"  d_in={d_in} d_sae={args.d_sae} k={args.k}")
+    print(f"  vllm_dtype={args.vllm_dtype} activation_dtype={cfg.dtype} "
+          f"sae_dtype={cfg.sae.dtype} activation_conversion={args.activation_conversion}")
     from sae_lens import adaptive_sae as execution
     if execution.enabled(cfg.sae):
         for branch, aux in (("main", False), ("aux", True)):
@@ -1668,7 +1710,7 @@ def main() -> None:
                 num_chunks=args.streaming_num_chunks,
                 chunk_size_tokens=args.streaming_chunk_size_tokens * num_hooks,
                 d_model=d_in,
-                dtype=args.dtype,
+                dtype=activation_dtype,
                 num_hooks=num_hooks,
             )
             write_control_state(args.control_state_path, ctrl)

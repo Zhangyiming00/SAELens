@@ -188,8 +188,11 @@ class DeadFeatureHistory:
         self.dp_group = dp_group
         self.dp_size = dist.get_world_size(dp_group) if distributed and dp_group is not None else 1
         self.widths = {hook: model.cfg.d_sae for hook, model in models.items()}
-        if any(width % self.tp_size for width in self.widths.values()):
-            raise ValueError("Dead history requires feature widths divisible by TP")
+        from sae_lens.tp_layout import balanced_widths
+        self.shard_widths = {hook: getattr(model, "feature_shard", None).widths
+                             if getattr(model, "feature_shard", None) is not None
+                             else balanced_widths(model.cfg.d_sae, self.tp_size)
+                             for hook, model in models.items()}
         self.metadata = dict(
             schema_version=2, mask_timing="update_start", aux_winner_scope="global_update",
             writer_rank=rank,
@@ -222,7 +225,13 @@ class DeadFeatureHistory:
             self.pending_aux.clear()
             self.pending_step = step
         if self.path is not None:
-            self.pending[hook] = mask.reshape(self.tp_size, -1).sum(dim=1)
+            features = getattr(model, "feature_shard", None)
+            if features is None:
+                self.pending[hook] = torch.stack([part.sum() for part in mask.split(self.shard_widths[hook])])
+            else:
+                self.pending[hook] = torch.stack([
+                    mask[torch.tensor(ids, device=mask.device)].sum() for ids in features.layout.ids
+                ])
         # E columns, B (only TP0 contributes), missing-observation count.
         self.pending_aux[hook] = torch.zeros(self.tp_size + 2, device=mask.device, dtype=torch.int64)
 
@@ -267,14 +276,17 @@ class DeadFeatureHistory:
             values = row[:self.tp_size]
             entries, tokens, missing = row[self.tp_size:-2], row[-2], row[-1]
             width = self.widths[hook]
-            local_width = width // self.tp_size
+            widths = self.shard_widths[hook]
             total = sum(values)
             record["hooks"][hook] = dict(
                 d_sae=width, total_dead=total, dead_fraction=total / width,
                 dead_by_tp_rank=values,
-                dead_fraction_by_tp_rank=[value / local_width for value in values],
-                feature_ranges=[[i * local_width, (i + 1) * local_width]
-                                for i in range(self.tp_size)],
+                dead_fraction_by_tp_rank=[value / size for value, size in zip(values, widths)],
+                feature_ranges=([[sum(widths[:i]), sum(widths[:i + 1])]
+                                 for i in range(self.tp_size)]
+                                if getattr(self.models[hook], "feature_shard", None) is None
+                                or tuple(i for part in self.models[hook].feature_shard.layout.ids for i in part) == tuple(range(width))
+                                else None),
                 max_to_mean=(max(values) * self.tp_size / total if total else None),
                 aux_winner_entries_by_tp_rank=entries if not missing else None,
                 aux_valid_tokens=tokens,
@@ -327,7 +339,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self._is_ddp = isinstance(sae, DDP) or is_megatron_ddp(sae)
         self.data_provider = data_provider
         self.evaluator = evaluator
-        self.activation_scaler = ActivationScaler()
+        self.activation_scaler = ActivationScaler(compute_dtype=self._base_sae.dtype)
         self.save_checkpoint_fn = save_checkpoint_fn
         self.cfg = cfg
         validate_accumulation(self)

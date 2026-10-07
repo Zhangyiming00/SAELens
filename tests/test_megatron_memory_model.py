@@ -29,7 +29,7 @@ def test_tp_shards_parameters_but_not_full_features_and_dp_keeps_gradients():
     assert 4 * tp["parameters"] - dp["parameters"] == 3 * 3 * 4096 * 4
 
 
-@pytest.mark.parametrize("kwargs", [{"ga": 0}, {"dp": 3}, {"tp": 3}, {"d_in": -1}])
+@pytest.mark.parametrize("kwargs", [{"ga": 0}, {"dp": 3}, {"tp": 16385}, {"d_in": -1}])
 def test_reject_invalid_shapes(kwargs):
     with pytest.raises(ValueError):
         MegatronMemoryConfig(**kwargs)
@@ -62,3 +62,11 @@ def test_malformed_trace_cannot_silently_reuse_active_storage():
     ]], segments=[])
     with pytest.raises(ValueError, match="active address"):
         replay_allocator_window(snapshot, start, 0, [])
+
+
+def test_unequal_tp_uses_largest_real_shard():
+    cfg = MegatronMemoryConfig(d_sae=4096, tp=3)
+    result = estimate_tensor_payloads(cfg)
+    width = 1366
+    assert result['parameters'] == cfg.hooks * 4 * ((2 * cfg.d_in + 1) * width + cfg.d_in)
+    assert result['local_feature_tensor'] == 4 * cfg.microbatch * width

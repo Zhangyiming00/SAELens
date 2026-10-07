@@ -59,6 +59,10 @@ def load_model(
         from sae_lens.vllm_model import HookedVLLMModel
 
         vllm_kwargs = dict(model_from_pretrained_kwargs)
+        if isinstance(vllm_kwargs.get("dtype"), str):
+            from sae_lens.util import str_to_dtype
+
+            vllm_kwargs["dtype"] = str_to_dtype(vllm_kwargs["dtype"])
         tokenizer = (
             None if vllm_kwargs.get("skip_tokenizer_init", False)
             else AutoTokenizer.from_pretrained(model_name)

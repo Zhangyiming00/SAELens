@@ -85,6 +85,37 @@ def gather_tp_state_dict_to_root_cpu(
     shard_dims = tp_param_shard_dims(base_sae)
     result: dict[str, Any] | None = {} if tp_rank == 0 else None
 
+    features = getattr(base_sae, "feature_shard", None)
+    if features is not None:
+        root = dist.get_global_rank(tp_cpu_group, 0)
+        for name, value in local_state_dict.items():
+            axis = shard_dims.get(name)
+            if not torch.is_tensor(value) or axis is None:
+                if result is not None:
+                    result[name] = value
+                continue
+            if value.device.type != "cpu":
+                raise RuntimeError("Checkpoint gather expects CPU tensors")
+            full = None
+            if tp_rank == 0:
+                shape = list(value.shape)
+                shape[axis] = features.total
+                full = value.new_empty(shape)
+            for i, ids in enumerate(features.layout.ids):
+                owner = dist.get_global_rank(tp_cpu_group, i)
+                if tp_rank == 0:
+                    shape = list(value.shape)
+                    shape[axis] = len(ids)
+                    part = value.detach().contiguous() if i == 0 else value.new_empty(shape)
+                    if i != 0:
+                        dist.recv(part, src=owner, group=tp_cpu_group)
+                    full.index_copy_(axis, torch.tensor(ids), part)
+                elif tp_rank == i:
+                    dist.send(value.detach().contiguous(), dst=root, group=tp_cpu_group)
+            if result is not None:
+                result[name] = full
+        return result
+
     if tp_size == 1:
         for name, value in local_state_dict.items():
             if torch.is_tensor(value) and value.device.type != "cpu":

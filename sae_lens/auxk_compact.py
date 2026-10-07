@@ -37,7 +37,7 @@ class AuxKDensePlan:
 def plan_auxk_dense(*, num_dead: int, k: int, shard_width: int, tp_size: int,
                     element_size: int, decoder: str = "auto",
                     complement: str = "auto", selection_policy: str = "auto",
-                    protocol: str = "auto") -> AuxKDensePlan:
+                    protocol: str = "auto", shard_widths=None) -> AuxKDensePlan:
     """A host-only plan: no branch depends on rank-local nnz/timing.
 
     Complement exchange is used only when the excluded budget is smaller than
@@ -55,7 +55,9 @@ def plan_auxk_dense(*, num_dead: int, k: int, shard_width: int, tp_size: int,
         raise ValueError("Invalid TopK protocol")
     if min(shard_width, tp_size, element_size) < 1:
         raise ValueError("Invalid shard layout or dtype size")
-    if not 0 < k <= num_dead <= shard_width * tp_size <= (1 << 32):
+    total = shard_width * tp_size if shard_widths is None else sum(shard_widths)
+    planning_width = shard_width if shard_widths is None else min(shard_widths)
+    if not 0 < k <= num_dead <= total <= (1 << 32):
         raise ValueError("Invalid global eligible count or AuxK budget")
     q = num_dead - k
     route = "topk"
@@ -63,11 +65,11 @@ def plan_auxk_dense(*, num_dead: int, k: int, shard_width: int, tp_size: int,
         if q == 0:
             route = "select_all"
         elif (complement == "auto" and protocol != "radix" and q < k
-              and (q == 1 or tp_size * q * 8 <= shard_width * element_size)):
+              and (q == 1 or tp_size * q * 8 <= planning_width * element_size)):
             route = "complement_min" if q == 1 else "complement_candidates"
     pack = (decoder == "compact_dense" or
             (decoder == "auto" and route != "topk"
-             and num_dead * 2 <= shard_width * tp_size))
+             and num_dead * 2 <= total))
     return AuxKDensePlan(route, "compact_dense" if pack else "local_dense", k,
                         num_dead, q if route.startswith("complement") else 0,
                         tp_size, shard_width)
@@ -214,7 +216,7 @@ class PendingAuxKSelection:
 def launch_auxk_selection(scores, k, eligible, num_eligible, group=None, *,
                           layout="dense", decoder="auto", complement="auto",
                           selection_policy="auto", protocol="auto", key_backend="torch",
-                          tie_policy="stable_id", known_columns=None, stream=None):
+                          tie_policy="stable_id", known_columns=None, stream=None, feature_shard=None):
     """Launch local candidates and global selection without consuming winners.
 
     TP peers use the existing single ordered TP stream/communicator. The caller
@@ -235,7 +237,7 @@ def launch_auxk_selection(scores, k, eligible, num_eligible, group=None, *,
     plan = plan_auxk_dense(num_dead=num_eligible, k=k, shard_width=scores.shape[-1],
                           tp_size=_group_size(group), element_size=scores.element_size(),
                           decoder=decoder, complement=complement, selection_policy=selection_policy,
-                          protocol=protocol)
+                          protocol=protocol, shard_widths=None if feature_shard is None else feature_shard.widths)
     columns = eligible.nonzero(as_tuple=True)[0] if known_columns is None else known_columns
     pending = PendingAuxKSelection(scores, eligible, columns, plan, layout)
     if stream is not None:
@@ -252,11 +254,11 @@ def launch_auxk_selection(scores, k, eligible, num_eligible, group=None, *,
                     sparse=layout == "sparse", packed=layout == "ragged",
                     protocol=protocol, key_backend=key_backend,
                     compact_radix=selection_policy == "auto", tie_policy=tie_policy,
-                    known_columns=columns,
+                    known_columns=columns, feature_shard=feature_shard,
                 )
             elif plan.selection.startswith("complement"):
                 values = scores.reshape(-1, scores.shape[-1]).index_select(1, columns)
-                ids = columns + _group_rank(group) * scores.shape[-1]
+                ids = columns + _group_rank(group) * scores.shape[-1] if feature_shard is None else feature_shard.ids(scores.device)[columns]
                 pending.keep = _complement_mask(values, ids, plan.exclude_k, group)
         if stream is not None:
             pending.ready = torch.cuda.Event()
@@ -271,7 +273,7 @@ def prepare_auxk_dense(scores: torch.Tensor, k: int, eligible: torch.Tensor,
                        decoder: str = "auto", complement: str = "auto",
                        selection_policy: str = "auto", protocol: str = "auto",
                        key_backend: str = "torch", tie_policy: str = "stable_id",
-                       winner_count=None, known_columns=None) -> tuple[torch.Tensor, torch.Tensor | None, AuxKDensePlan]:
+                       winner_count=None, known_columns=None, feature_shard=None) -> tuple[torch.Tensor, torch.Tensor | None, AuxKDensePlan]:
     """Return local values, optional ORIGINAL local feature columns, and plan.
 
     columns=None: values already have local shard width (native decoder).
@@ -294,11 +296,12 @@ def prepare_auxk_dense(scores: torch.Tensor, k: int, eligible: torch.Tensor,
     plan = plan_auxk_dense(num_dead=num_eligible, k=k, shard_width=scores.shape[-1],
                           tp_size=_group_size(group), element_size=scores.element_size(),
                           decoder=decoder, complement=complement,
-                          selection_policy=selection_policy, protocol=protocol)
+                          selection_policy=selection_policy, protocol=protocol,
+                          shard_widths=None if feature_shard is None else feature_shard.widths)
     if plan.selection == "topk":
         acts = sharded_auxk(scores, k, eligible, num_eligible, group, sparse=False,
                             policy=selection_policy, protocol=protocol, key_backend=key_backend, tie_policy=tie_policy,
-                            winner_count=winner_count, known_columns=known_columns)
+                            winner_count=winner_count, known_columns=known_columns, feature_shard=feature_shard)
         if plan.decoder == "local_dense":
             return acts, None, plan
         columns = eligible.nonzero(as_tuple=True)[0] if known_columns is None else known_columns
@@ -311,7 +314,7 @@ def prepare_auxk_dense(scores: torch.Tensor, k: int, eligible: torch.Tensor,
     packed = _DeadColumnValues.apply(scores, columns)
     if plan.selection.startswith("complement"):
         flat = packed.reshape(math.prod(scores.shape[:-1]), columns.numel())
-        ids = columns + _group_rank(group) * scores.shape[-1]
+        ids = columns + _group_rank(group) * scores.shape[-1] if feature_shard is None else feature_shard.ids(scores.device)[columns]
         # Torch exact keys are the correctness backend for arbitrary column IDs;
         # main/general TopK still respect topk_key_backend. No dynamic global gather.
         keep = _complement_mask(flat.detach(), ids, plan.exclude_k, group)

@@ -160,6 +160,8 @@ class GpuStreamingActivationProvider:
 
         # Add to storage pools
         for hook, chunk in chunk_dict.items():
+            if self._pool_by_hook[hook].shape[0] == 0:
+                self._pool_by_hook[hook] = self._pool_by_hook[hook].to(chunk.dtype)
             self._pool_by_hook[hook] = torch.cat(
                 [self._pool_by_hook[hook], chunk.to(self._device)], dim=0
             )
@@ -196,6 +198,8 @@ class GpuStreamingActivationProvider:
 
         for hook in self._pp_hook_names:
             serving = self._pool_by_hook[hook][:serving_cutoff]
+            if self._serving_by_hook[hook].shape[0] == 0:
+                self._serving_by_hook[hook] = self._serving_by_hook[hook].to(serving.dtype)
             self._serving_by_hook[hook] = torch.cat(
                 [self._serving_by_hook[hook], serving], dim=0
             )

@@ -116,7 +116,7 @@ class SelectedEntries:
     selection: str
 
 
-def represent_latents(acts, kind, group):
+def represent_latents(acts, kind, group, *, feature_shard=None):
     """Return an actual dense/full tensor or a local RaggedLatents value."""
     from sae_lens.megatron_tp import megatron_tp_allgather
 
@@ -133,17 +133,19 @@ def represent_latents(acts, kind, group):
     else:
         dense = acts
     if kind == "full":
-        dense = megatron_tp_allgather(dense, group)
+        dense = megatron_tp_allgather(dense, group, feature_shard=feature_shard)
     if metadata is not None:
         dense._sae_selected_entries = metadata
     return dense
 
 
-def local_latent_tensor(acts, kind, rank, width):
+def local_latent_tensor(acts, kind, rank, width, *, feature_shard=None):
+    if kind == "full" and feature_shard is not None:
+        return feature_shard.select(acts)
     return acts.narrow(-1, rank * width, width) if kind == "full" else acts
 
 
-def selected_latents_view(acts, kind, rank, width):
+def selected_latents_view(acts, kind, rank, width, *, feature_shard=None):
     """Sparse computation reads dense storage through saved winner indices.
 
     Do not recover winners with nonzero(): AuxK may select zero-valued entries
@@ -158,7 +160,7 @@ def selected_latents_view(acts, kind, rank, width):
             "Sparse/compact Main decode requires selection metadata from encode(); "
             "use dense computation for arbitrary externally supplied activations"
         )
-    local = local_latent_tensor(acts, kind, rank, width)
+    local = local_latent_tensor(acts, kind, rank, width, feature_shard=feature_shard)
     values = _EntryValues.apply(local, meta.rows, meta.columns)
     return RaggedLatents(
         meta.offsets,
@@ -216,7 +218,7 @@ def launch_ragged_topk(scores, k, group=None, **kwargs):
 
 def ragged_auxk(scores, k, eligible, num_eligible, group=None, *, policy='auto',
                 protocol='auto', key_backend='torch', complement='auto', tie_policy='stable_id',
-                known_columns=None):
+                known_columns=None, feature_shard=None):
     from sae_lens.auxk_compact import plan_auxk_dense, _DeadColumnValues, _complement_mask
     from sae_lens.sharded_topk import _group_size, _group_rank
     if eligible.dtype != torch.bool or eligible.shape != (scores.shape[-1],) or eligible.device != scores.device:
@@ -227,15 +229,15 @@ def ragged_auxk(scores, k, eligible, num_eligible, group=None, *, policy='auto',
         if k < num_eligible:
             return launch_ragged_topk(scores, k, group, eligible=eligible, relu=False,
                                      protocol=protocol, key_backend=key_backend,
-                                     tie_policy=tie_policy, known_columns=known_columns).wait()
+                                     tie_policy=tie_policy, known_columns=known_columns, feature_shard=feature_shard).wait()
     plan = plan_auxk_dense(num_dead=num_eligible, k=k, shard_width=scores.shape[-1],
                           tp_size=_group_size(group), element_size=scores.element_size(),
                           decoder='auto', complement=complement, selection_policy=policy,
-                          protocol=protocol)
+                          protocol=protocol, shard_widths=None if feature_shard is None else feature_shard.widths)
     if plan.selection == 'topk':
         result = launch_ragged_topk(scores, k, group, eligible=eligible, relu=False,
                                    protocol=protocol, key_backend=key_backend,
-                                   compact_radix=(policy == 'auto'), known_columns=known_columns).wait()
+                                   compact_radix=(policy == 'auto'), known_columns=known_columns, feature_shard=feature_shard).wait()
         return replace(result, selection='topk')
     columns = eligible.nonzero(as_tuple=True)[0] if known_columns is None else known_columns
     if plan.selection == 'select_all':
@@ -244,7 +246,7 @@ def ragged_auxk(scores, k, eligible, num_eligible, group=None, *, policy='auto',
     # for actual winners from the original local scores.
     with torch.no_grad():
         packed = scores.reshape(-1, scores.shape[-1]).index_select(1, columns)
-        ids = columns + _group_rank(group) * scores.shape[-1]
+        ids = columns + _group_rank(group) * scores.shape[-1] if feature_shard is None else feature_shard.ids(scores.device)[columns]
         keep = _complement_mask(packed, ids, plan.exclude_k, group)
     return from_dead_columns(scores, columns, keep, selection=plan.selection)
 
