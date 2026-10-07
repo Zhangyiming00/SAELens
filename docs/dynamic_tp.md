@@ -18,9 +18,178 @@
 - 单个 DP 副本内多个 hook 的动态 TP；不同 hook 可以使用不同 d_sae，API 逐 hook 建计划。
 - `DynamicTPSession` 训练 API、读取真实 safetensors 激活的 `run_dynamic_tp_sae.py`，以及真实 Gloo/NCCL 验收脚本。
 
-边界必须保留：动态 session 为 **DP=1、FP32 SAE、每 hook 一组 torch Adam**。CUDA 入口使用 fused Adam。它不是现有 `elastic_streaming` DP/ZeRO 角色切换的开关；没有把该控制器改造成同时调 DP/TP 的实现，也没有实现 vLLM 冷启动/停止、世界进程数量变化、FSDP/ZeRO 状态重分片、AMP scaler 迁移、部分梯度累计窗口迁移。现有静态 runner 获得不等分 TP，动态训练走新入口。
+边界必须保留：动态 session 为 **DP=1、FP32 SAE、每 hook 一组 torch Adam**。CUDA 入口使用 fused Adam。它不是现有 `elastic_streaming` DP/ZeRO 角色切换的开关；没有把该控制器改造成同时调 DP/TP 的实现，也没有实现 vLLM 冷启动/停止、世界进程数量变化、FSDP/ZeRO 状态重分片、AMP scaler 迁移、部分梯度累计窗口迁移。现有静态 runner 获得不等分 TP；在线动态 TP 已接入 `run_sae_runner_gpu.py --elastic-tp`。
 
 动态 session 使用原生 Megatron encoder/decoder 与现有 sharded TopK/AuxK。`tp_overlap=off/eager/lazy/bounded` 复用原有 `forward_tp_wavefront` / `PendingWavefrontOutputs` 调度；bounded 的窗口由 `tp_overlap_max_live_hooks` 指定，每个完整 step 后才能切换。它尚未接入原 MultiSAETrainer 的 DDP optimizer-overlap、完整日志/调度器体系，不支持动态 DP/ZeRO、AMP 或部分 GA 窗口。不能把这个独立入口的耗时直接当成旧 runner 的性能对照。已有训练数据应按原有方式先做 activation scaling，入口要求 `normalize_activations=none`。
+
+## 主入口：在线 elastic TP
+
+在线 producer、异步 SHM 写入、水位控制、训练循环、迁移验证和进程管理均由 `sae_lens` 包提供。主入口为 `run_sae_runner_gpu.py`，运行和子进程启动均不依赖 `scripts/`、Git 元数据或仓库相对路径。用普通 Python 启动一次，入口自行创建固定的 worker pool；不要在外面再套 `torchrun`。
+
+### 准备本地输入
+
+- 模型目录需已准备好权重及 `config.json`。输入维度从模型配置自动读取，每个 vLLM producer 使用 TP1，因此完整模型必须能放入单张卡。
+- 数据目录需是 `datasets.save_to_disk` 保存的单个 Dataset，包含非空、等长的二维 `tokens` 列。数据应事先使用该模型对应的 tokenizer 处理。每行 token 数必须是 `context-size` 的整数倍；运行时切为 context 窗口并循环读取至训练结束，不做下载或在线分词。
+- `train-batch-size-tokens` 必须是 `context-size` 的整数倍；`training-tokens` 必须是训练 batch 的整数倍。训练步数为两者相除。`max-model-len` 必须大于 `context-size`。
+- `/dev/shm` 要有足够空间。激活主体占用约为 `streaming-num-chunks × train-batch-size-tokens × d_in × dtype字节数`，另有少量元数据。例如 BF16、96 块、4096 tokens、d_in=4096 约需 3 GiB。
+- 当前在线模式支持单机、单 hook、SAE FP32、DP=PP=1、GA=1。模型与数据之外，Python 环境需已安装兼容的 PyTorch、vLLM、Transformers、Datasets 等依赖。
+
+入口在导入 Transformers 前默认设置 `HF_HUB_OFFLINE=1`、`HF_DATASETS_OFFLINE=1`、`HF_HUB_DISABLE_TELEMETRY=1`、`VLLM_NO_USAGE_STATS=1`，所有子进程继承这些值，用户无需手写环境变量。加载前会拒绝远程模型标识和不存在的本地模型/数据目录。使用这些库读取本地文件不需要 Hugging Face 服务、账号或联网。
+
+### 日常启动：选卡、卡池和初始 TP
+
+以下 Bash 示例先定义一次公共配置；模型、数据、hook 和训练规模按本地任务修改。学习率等训练算法配置保持默认，日常系统使用不需要额外设置。
+
+```bash
+COMMON=(
+  --model-name /root/models/Llama-3.1-8B
+  --dataset-path /root/datasets/wikitext2_tokenized_llama31_ctx2048
+  --hook-name blocks.21.hook_resid_post
+  --d-sae 65536 --k 128 --dead-feature-window 1500
+  --training-tokens 16384000 --train-batch-size-tokens 4096
+  --context-size 1024 --max-model-len 1025
+  --store-batch-size-prompts 1
+  --streaming-num-chunks 96 --streaming-prefetch-chunks 2
+  --tp-overlap bounded
+)
+
+# 两卡：默认 SAE TP1 + 一个活跃 producer，自动在 TP1/TP2 间调整。
+CUDA_VISIBLE_DEVICES=3,1 python run_sae_runner_gpu.py \
+  "${COMMON[@]}" --elastic-tp-size 2 --output-path results/elastic_2gpu
+
+# 三卡：默认 SAE TP1 + 两个活跃 producer，自动在 TP1..TP3 间调整。
+CUDA_VISIBLE_DEVICES=3,0,2 python run_sae_runner_gpu.py \
+  "${COMMON[@]}" --elastic-tp-size 3 --output-path results/elastic_3gpu
+
+# 四卡：显式从 SAE TP2 + 两个活跃 producer 开始。
+CUDA_VISIBLE_DEVICES=3,1,0,2 python run_sae_runner_gpu.py \
+  "${COMMON[@]}" --elastic-tp-size 4 --sae-tp-size 2 \
+  --output-path results/elastic_4gpu
+```
+
+每条启动命令是一次独立运行，输出目录必须未用于先前运行。`--elastic-tp-size N` 同时启用 elastic TP 并设置卡池大小，不必额外传 `--elastic-tp`。单独 `--elastic-tp` 默认使用四卡，`--elastic-tp-pool-size` 是卡池参数的别名。
+
+GPU 顺序由 `CUDA_VISIBLE_DEVICES` 决定，池内 rank 对应其前 N 张卡。上面的两卡示例中，rank 0 是物理卡 3、rank 1 是物理卡 1；rank 0 始终训练，rank 1 可在 SAE 与活跃生产之间切换。不设置可见卡时使用前 N 张可见卡；程序不会自动寻找空闲 GPU，启动前应选择空闲且显存足够的卡。
+
+`--sae-tp-size N`（或 `-stp N`）只设置初始 SAE TP，**不会限制后续缩容**。省略时从最低允许 TP 启动，默认下限为 1。高低水位自动决定相邻切换，无需传入“从什么切换到什么”的列表。
+
+### 显存放不下 TP1：限制最低 SAE TP
+
+如果已知 SAE 至少需要 TP2，设置下限；四卡的例子如下：
+
+```bash
+CUDA_VISIBLE_DEVICES=3,1,0,2 python run_sae_runner_gpu.py \
+  "${COMMON[@]}" --elastic-tp-size 4 --elastic-tp-min-size 2 \
+  --output-path results/elastic_4gpu_min2
+```
+
+此时默认从 TP2 开始，只允许 TP2、TP3、TP4。也可另传 `--sae-tp-size 3` 或 `4` 指定更大的初始 TP。在 TP2 且缓存不足时，训练等待 producer 补充数据，不会继续缩到 TP1。这个参数是显式边界，不会自动探测最低显存需求或在 OOM 后自动回滚重试；如果 TP2 本身仍然放不下，运行仍会失败。
+
+参数须满足 `pool_size >= 2`、`1 <= min_tp <= initial_tp <= pool_size <= d_sae`，并且 **`min_tp < pool_size`**。初始值低于下限会在启动模型前报错。下限等于卡池大小也会报错，因为在线模式需要保留恢复至少一个 producer 的可能性：例如两卡且 SAE 至少需要 TP2，就不能使用当前在线角色切换模式持续补充输入，需要增加卡数或另用预存激活训练入口。
+
+producer 暂停时仍保留模型权重，加入 SAE 的卡可能同时驻留 vLLM 权重、SAE 分片与迁移临时存储；最低 TP 应根据实际显存余量设置。卡池大小固定，控制器不会临时调用池外 GPU。
+
+### 零活跃 vLLM：训练中进入，或从全卡 SAE 启动
+
+活跃 producer 数为 `pool_size - 当前 SAE TP`。SAE TP 达到池大小时，所有 producer 暂停，SAE 使用已有缓存；低水位后自动缩容一个 TP rank，并恢复该卡的生产。SAE 至少保留一个 rank，不支持 SAE TP0。
+
+从零活跃 vLLM 状态开始 SAE 训练，可使用：
+
+```bash
+CUDA_VISIBLE_DEVICES=3,1 python run_sae_runner_gpu.py \
+  "${COMMON[@]}" --elastic-tp-size 2 --sae-tp-size 2 \
+  --output-path results/elastic_2gpu_full_start
+
+CUDA_VISIBLE_DEVICES=3,0,2 python run_sae_runner_gpu.py \
+  "${COMMON[@]}" --elastic-tp-size 3 --sae-tp-size 3 \
+  --output-path results/elastic_3gpu_full_start
+```
+
+不要传 `--vllm-dp-size 0`；活跃 producer 数由卡池与当前 TP 推导。全卡启动时 supervisor 先在 SAE worker 启动前临时运行 producer，预填充目标为 `min(streaming-num-chunks, streaming-prefetch-chunks, 训练步数)` 块，然后等待所有在途写入完成并确认 producer 暂停，再以请求的全卡 TP 执行第一个训练 step。排空期间已生成的完整块也会保留，因此实际预填充数可能多于目标。预填充期间没有 SAE 更新，最低 SAE TP 限制不受影响。
+
+“零活跃 vLLM”不等于不启动 vLLM：producer 进程与模型权重保持驻留，之后才能恢复。完全不加载 vLLM 的预存激活训练不属于这个在线模式；已有独立文件输入入口 `run_dynamic_tp_sae.py`，用法见后文。
+
+### 自动切换与可调系统参数
+
+水位为 SHM 已占用槽位占总槽位的比例，包含正在写入的块；训练侧已取走的本地缓存不计入该水位。高水位说明输入积压，控制器尝试增加一个 SAE TP rank；低水位说明生产不足，尝试减少一个 SAE TP rank。扩容前必须先等待将加入 SAE 的 producer 排空异步写入并确认暂停，切换发生在完整 optimizer step 之间。
+
+| 参数 | 默认值 | 用途 |
+|---|---|---|
+| `--elastic-tp-size` | 4（使用 `--elastic-tp` 时） | 固定 GPU 池大小；显式传此项即启用 elastic TP |
+| `--elastic-tp-min-size` | 1 | SAE TP 硬下限，也是未指定初始 TP 时的启动值 |
+| `--sae-tp-size` | 最低允许 TP | 初始 SAE TP，允许等于卡池大小 |
+| `--elastic-tp-low-watermark` | 0.05 | 低于或等于此水位时考虑缩容 |
+| `--elastic-tp-high-watermark` | 0.85 | 高于或等于此水位时考虑扩容 |
+| `--elastic-tp-poll-interval` | 0.5 秒 | 水位采样间隔 |
+| `--elastic-tp-watermark-samples` | 3 | 连续满足阈值所需的采样次数 |
+| `--elastic-tp-cooldown` | 12 秒 | 每次切换后的冷却时间 |
+| `--streaming-num-chunks` | 96 | SHM 槽位总数，每块一个训练 batch |
+| `--streaming-prefetch-chunks` | 2 | 训练侧一次补充、打乱的最大块数 |
+| `--elastic-tp-startup-timeout` | 300 秒 | producer 初始化 / 全卡启动预填充的超时限制 |
+| `--elastic-tp-pause-timeout` | 120 秒 | 切换等待 producer 排空与确认的超时限制 |
+
+一般保留水位、采样和冷却默认值。短验收为了观察切换，可以缩小缓存并缩短采样/冷却，但这些不是日常启动必需参数。是否发生切换取决于实际生产、消费速率与水位；短任务可能在满足连续采样条件前就结束，处于 TP 下限或上限时也不会越界切换。
+
+通用参数仍由 `run_sae_runner_gpu.py` 配置，无需使用 elastic TP 专属副本：
+
+| 类别 | 可复用参数 |
+|---|---|
+| 本地输入 | `--model-name`、`--dataset-path`、`--hook-name`、`--context-size`、`--store-batch-size-prompts`、`--max-model-len`、`--max-num-batched-tokens`、`--vllm-text-only` |
+| 训练规模 | `--d-sae`、`--k`、`--training-tokens`、`--train-batch-size-tokens`、`--dead-feature-window`、`--seed` |
+| 精度与执行策略 | `--vllm-dtype`、`--activation-dtype`、`--activation-conversion`、FP32 `--dtype`、Main/Aux storage/compute/stage 参数、TopK/AuxK 参数、`--tp-overlap`、`--tp-overlap-max-live-hooks` |
+| 缓存与输出 | `--streaming-num-chunks`、`--streaming-prefetch-chunks`、`--output-path`、`--no-save-final-sae`、`--no-save-final`、`--performance-only` |
+
+首次加载缓存时自动估计固定 activation scale，一般无需设置；专用诊断选项包括 `--elastic-tp-activation-scale`、`--elastic-tp-audit-inputs`（完整输入 SHA-256 校验）和 `--elastic-tp-validate-activations`（检查 producer 激活是否有限），后两者有额外开销。
+
+显式设置 `--streaming-chunk-size-tokens` 时必须等于训练 batch。传输固定为异步 SHM；普通 streaming 的 rolling mix 与 exact 后台队列、DDP/FSDP optimizer overlap、普通 runner 的 profiling 尚未接入。`--elastic-streaming` 是另一套 elastic DP 模式，不能同时启用。尚不支持在线 checkpoint 恢复或定期训练状态保存；显式传入未支持参数会报错。
+
+`--hook-name` 控制在线 hook；显式 `--hook-names` 只接受一个 hook，未指定时不采用静态 runner 的四 hook 默认值。默认导出 canonical feature 顺序的最终 SAE 至 `model/`，`--no-save-final-sae` 或 `--performance-only` 可关闭导出。
+
+### 如何确认运行和切换结果
+
+启动终端打印卡池大小、初始/最低 SAE TP、初始活跃 vLLM 数和离线状态。详细信息写入输出目录：
+
+| 文件 | 查看内容 |
+|---|---|
+| `startup.json`、`run_config.json` | 实际 GPU 映射、初始角色、最低 TP、离线环境与完整配置 |
+| `startup_prefill.json` | 仅全卡启动时生成；预填充目标、实际块数与耗时 |
+| `progress.json`、`train_rank0.jsonl` | 最新定期进度，以及完整 step、TP、水位、loss 和输入事件 |
+| `switches.json` | 每次已提交切换的 old/new ranks、触发原因、水位和迁移验证；未切换时可能不存在 |
+| `producerN.jsonl`、`producerN_status.json` | producer 暂停/恢复、生产 chunk、当前角色与 epoch |
+| `training_report.json` | 完成步数、tokens、唯一 chunk 数、切换记录与模型导出状态 |
+| `result.json` | supervisor 返回码、错误和所有子进程退出码 |
+| `train.log`、`producerN.log` | 初始化日志和失败 traceback |
+
+例如 `tail -f results/elastic_3gpu/train.log` 可查看训练日志。正常完成应有 `training_report.json` 中 `passed=true`，`result.json` 中 `returncode=0` 且所有 `process_returncodes` 为 0。确认零活跃 vLLM 应同时查看全卡 TP 下的 step 和各 producer 的 `paused` 记录，再检查低水位缩容后的 `running` 与新 `produced` 事件。
+
+结束或失败后 supervisor 负责停止其启动的进程并清理本次 SHM。失败时保留输出目录中的日志；重跑请换一个新输出目录，已有 `run_config.json` 的目录不会覆盖。库调用入口为 `sae_lens.elastic_tp_runner.ElasticTPSAETrainingRunner`，配置类为 `sae_lens.training.elastic_tp_config.ElasticTPConfig`；库调用设置 `min_tp` 时需同时保证 `initial_tp >= min_tp`。
+
+### 实测记录
+
+本轮两卡/三卡、零活跃 vLLM 与最低 TP 验收保存在 [`results/elastic_tp_2_3gpu_20261007/`](../results/elastic_tp_2_3gpu_20261007/)。使用本地 Llama-3.1-8B、RTX 5090、d_sae=1025、k=32、batch=256、context=32，每组均为 64 步 / 16384 tokens：
+
+| 目录 | 卡池 / 初始 / 最低 SAE TP | 实际切换 | 切换次数 | 全卡 SAE 训练步数 |
+|---|---|---|---|---|
+| `pool2_initial1` | 2 / 1 / 1 | 1→2→1 | 2 | 5 |
+| `pool2_initial2` | 2 / 2 / 1 | 2→1 | 1 | 2 |
+| `pool3_initial1` | 3 / 1 / 1 | 1↔2↔3，反复切换 | 28 | 34 |
+| `pool3_initial3` | 3 / 3 / 1 | 3→2→1 后反复扩缩容 | 32 | 40 |
+| `pool3_initial3_min2` | 3 / 3 / 2 | 3→2，此后保持 TP2 | 1 | 2 |
+| `pool4_min2` | 4 / 2 / 2 | 2↔3↔4，未进入 TP1 | 30 | 40 |
+
+这些短验收将 SHM 设置为 8 块，并使用 low=0.25、high=0.5、poll=0.01 秒、连续采样 1 次、cooldown=0，以覆盖切换路径；**不是使用默认控制器时延的吞吐测试，也不是大尺寸显存容量或训练数值等价证明**。启动命令未设置学习率，也未手写四个离线环境变量；不同案例使用不同的非连续 GPU 顺序。
+
+全卡启动案例的首个训练 step 确实使用请求的 TP2 / TP3。各案例都核对了 producer 的暂停确认、全卡 SAE 训练，以及缩容后恢复 `running` 并发布新 chunk；producer 确认暂停后没有继续写入。`pool3_initial3_min2` 在 TP2 观察到 181 次低水位采样，其中 118 次无 READY 块且尚未完成生产，没有准备或提交 TP1 切换，随后完成全部训练。四卡下限案例未显式设置初始 TP，首个 step 自动为 TP2。
+
+六组均完整消费 64 个唯一 chunk，无重复或遗漏；共 282 次完整输入 SHA-256 校验和 94 次切换缓存校验通过，loss 有限，模型成功导出，所有子进程退出码为 0，SHM 与 GPU 资源已释放。参数与入口回归 63 项通过，4 项独立 CUDA 调度单测在沙箱中跳过；上表为在可访问 GPU 的环境实际运行的在线测试。
+
+完整命令见 [`commands.json`](../results/elastic_tp_2_3gpu_20261007/commands.json)，逐项验收结果见 [`verification.json`](../results/elastic_tp_2_3gpu_20261007/verification.json)。可用 `python3 results/elastic_tp_2_3gpu_20261007/verify.py` 重查日志；若重跑训练命令，先更换输出目录。两卡全卡启动后只发生缩容是此次生产/消费速率下的正常行为，不要求每个任务都反复扩容。
+
+整合验收：66 项入口/传输/精度回归、16 项原生 Megatron 回归、23 项动态 TP 独立测试通过。`results/elastic_tp_integration_20261007/` 保存新主入口的两卡真实在线测试：本地 Llama-3.1-8B、d_sae=1025、32 步/8192 tokens，完成 TP1→TP2→TP1、28 次完整输入 SHA-256 检查、最终模型导出和 SHM 清理。另有 CUDA 测试覆盖 off/eager/lazy/bounded 四种调度的分项 loss 输出。此验收不扩大前述大尺寸训练数值等价的结论。
+
+全卡启动与离线默认值的后续验收保存在 `results/elastic_tp_full_start_20261007/`：使用 `CUDA_VISIBLE_DEVICES=3,1,0,2 --elastic-tp-size 4 --sae-tp-size 4` 对应的启动配置，命令中没有设置上述四个离线环境变量。首个训练 step 为 TP4；64 步/16384 tokens 完整消费 64 个 chunk，自动完成 28 次切换（七轮 4→3→2→3→4），通过 32 次完整输入校验并导出模型，所有子进程正常退出且 SHM 已清理。参数、源路径检查、预填充握手和既有 streaming/精度回归共 98 项通过，2 项 CUDA 用例在沙箱内跳过。
+
+当前工作区 `.venv` 的 Transformers 与全局 huggingface-hub 版本不匹配，以上验收沿用已有的 `PYTHONPATH=results/dynamic_tp_e2e_20261007/dependencies:.` 兼容环境。正常安装的兼容依赖环境无需该设置，包内运行代码也不引用该目录。
 
 ## 扩缩容算法
 

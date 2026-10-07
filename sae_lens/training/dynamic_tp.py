@@ -776,6 +776,9 @@ class DynamicTPSession:
 
         if self.state.in_step or self.state.retired or self.groups.failed:
             raise RuntimeError("Session is not at a usable optimizer boundary")
+        # Wavefront execution bypasses nn.Module forward hooks. Publish detached
+        # component losses through the session for every execution schedule.
+        self.last_loss_components = {}
         if self.groups.rank not in self.groups.active_ranks:
             return {}
         if set(batches) != set(self.state.models):
@@ -815,6 +818,9 @@ class DynamicTPSession:
                 since.add_(1)
                 since.masked_fill_(counts > 0, 0)
                 result[h] = output.loss.detach()
+                self.last_loss_components[h] = {
+                    name: value.detach() for name, value in output.losses.items()
+                }
 
         if enabled and self.tp_overlap != "eager":
             from sae_lens.training.multi_hook_sae import PendingWavefrontOutputs

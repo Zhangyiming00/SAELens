@@ -36,6 +36,16 @@ from pathlib import Path
 # choice when the variable is already set.
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
+# This entrypoint consumes prepared local models and datasets. Set offline
+# policy before importing Transformers/Hugging Face, which cache these flags.
+# The packaged elastic supervisor applies the same policy to library calls
+# and child processes (OFFLINE_ENV in elastic_tp_config).
+for _offline_flag in (
+    "HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE",
+    "HF_HUB_DISABLE_TELEMETRY", "VLLM_NO_USAGE_STATS",
+):
+    os.environ[_offline_flag] = "1"
+
 import torch
 import torch.distributed as dist
 from transformers import AutoConfig
@@ -69,6 +79,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--d-sae", type=int, default=32768)
     parser.add_argument("--k", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=3e-4,
+        help="SAE learning rate, shared by ordinary and elastic TP training.",
+    )
     parser.add_argument("--training-tokens", type=int, default=2048 * 4096)
     parser.add_argument("--train-batch-size-tokens", type=int, default=4096)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
@@ -86,7 +99,9 @@ def parse_args() -> argparse.Namespace:
 
     # 3. Parallelism parameters (including streaming)
     parser.add_argument("--vllm-tp-size", "-vtp", type=int, default=None)
-    parser.add_argument("--sae-tp-size", "-stp", type=int, default=None)
+    parser.add_argument("--sae-tp-size", "-stp", type=int, default=None,
+        help="SAE TP size; in elastic TP mode this is the initial TP (defaults to --elastic-tp-min-size, up to the full GPU pool).",
+    )
     parser.add_argument("--vllm-dp-size", "-vdp", type=int, default=1)
     parser.add_argument("--sae-dp-size", "-sdp", type=int, default=1)
     parser.add_argument("--sae-pp-size", "-spp", type=int, default=1)
@@ -146,7 +161,7 @@ def parse_args() -> argparse.Namespace:
         help="Number of shared-memory chunk slots in streaming_mode.",
     )
     parser.add_argument("--streaming-prefetch-chunks", type=int, default=2,
-        help="Max chunks to acquire per consumer refill in streaming_mode.",
+        help="Max chunks to acquire per consumer refill in streaming or elastic TP mode.",
     )
     parser.add_argument("--streaming-exact-prefetch-batches", type=int, default=0,
         help="Background logical batch queue for exact SHM streaming (SAE TP1/PP1); 0 disables.",
@@ -633,7 +648,15 @@ def parse_args() -> argparse.Namespace:
         argv.append(token)
 
     add_execution_arguments(parser)
+    from sae_lens.elastic_tp_cli import add_elastic_tp_arguments
+    add_elastic_tp_arguments(parser)
     args = parser.parse_args(argv)
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        parser.error("--lr must be finite and positive")
+    if args.elastic_tp_pool_size is not None:
+        args.elastic_tp = True
+    else:
+        args.elastic_tp_pool_size = 4
     resolve_execution_arguments(args, argv)
 
     if args.elastic_streaming:
@@ -701,6 +724,13 @@ def parse_args() -> argparse.Namespace:
     if args.no_save_final:
         args.save_final_checkpoint = False
         args.no_save_final_sae = True
+
+    if args.elastic_tp:
+        from sae_lens.elastic_tp_cli import validate_elastic_tp_arguments
+        try:
+            validate_elastic_tp_arguments(args, argv, parser)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     return args
 
@@ -1022,6 +1052,25 @@ def main() -> None:
         return
     args = parse_args()
     os.environ.setdefault("SAE_ADAM_IMPL", "fused")
+
+    if args.elastic_tp:
+        from sae_lens.elastic_tp_cli import config_from_runner_args
+        from sae_lens.elastic_tp_runner import ElasticTPSAETrainingRunner
+        from sae_lens.training.elastic_tp_config import (
+            configure_offline_environment, validate_local_sources,
+        )
+        configure_offline_environment()
+        validate_local_sources(args.model_name, args.dataset_path)
+        d_in = _resolve_hidden_size(args.model_name)
+        cfg = config_from_runner_args(args, d_in=d_in)
+        print(
+            f"[elastic TP] pool={cfg.pool_size}, initial SAE TP={cfg.initial_tp}, "
+            f"minimum SAE TP={cfg.min_tp}, "
+            f"initial active vLLM={cfg.pool_size - cfg.initial_tp}, offline=True",
+            flush=True,
+        )
+        ElasticTPSAETrainingRunner(cfg).run()
+        return
 
     # Cached-mode validation must run before control-state processing so the
     # mutual-exclusion errors fire even if the user passes both.
@@ -1423,6 +1472,7 @@ def main() -> None:
         is_dataset_tokenized=args.is_dataset_tokenized,
         context_size=args.context_size,
         training_tokens=training_tokens,
+        lr=args.lr,
         train_batch_size_tokens=train_batch_size_tokens,
         store_batch_size_prompts=store_batch_size_prompts,
         n_batches_in_buffer=n_batches_in_buffer,
