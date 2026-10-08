@@ -596,6 +596,17 @@ def switch_tp(
     return target, {h: p.new for h, p in plans.items()}, metrics
 
 
+@dataclass
+class _TPGradientWindow:
+    target: int
+    microbatches: int = 0
+    tokens: int = 0
+    masks: dict = field(default_factory=dict)
+    counts: dict = field(default_factory=dict)
+    losses: dict = field(default_factory=dict)
+    components: dict = field(default_factory=dict)
+
+
 class DynamicTPSession:
     """Native MegatronTopKSAE + FP32 Adam, one DP replica, multiple hooks.
 
@@ -618,11 +629,17 @@ class DynamicTPSession:
         tp_overlap="off",
         tp_overlap_max_live_hooks=2,
         input_scale=1.0,
+        gradient_accumulation_steps=1,
     ):
         from sae_lens.megatron_tp import require_megatron_core
         from sae_lens.saes.megatron_topk_sae import MegatronTopKSAE
 
         self.configs, self.groups = copy.deepcopy(configs), groups
+        if type(gradient_accumulation_steps) is not int or gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be a positive integer")
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self._window = None
+        self._microbatch_active = False
         if not configs:
             raise ValueError("At least one hook config is required")
         # Warm Python/native dependencies on idle workers at startup too. Their
@@ -645,11 +662,11 @@ class DynamicTPSession:
         self.tp_overlap = tp_overlap
         self.tp_overlap_max_live_hooks = tp_overlap_max_live_hooks
         self.last_forward_schedule = "off"
-        settings = (tp_overlap, tp_overlap_max_live_hooks, self.input_scale)
+        settings = (tp_overlap, tp_overlap_max_live_hooks, self.input_scale, gradient_accumulation_steps)
         groups.check(
             None
             if all(s == settings for s in groups.agree(settings))
-            else "TP overlap/input scale settings disagree"
+            else "TP overlap/input scale/gradient accumulation settings disagree"
         )
         self.layouts = {
             h: FeatureLayout.balanced(c.d_sae, groups.active_ranks)
@@ -697,10 +714,13 @@ class DynamicTPSession:
         self.groups.prepare(ranks)
 
     def stage_inputs(self, batches):
-        """Attach identical pending input rows on each active TP rank."""
-        if self.state.in_step or self.state.retired or self.groups.failed:
+        """Refill at a microbatch boundary, without retaining forward graphs."""
+        if (
+            self._microbatch_active or self.state.retired or self.groups.failed
+            or (self.state.in_step and self._window is None)
+        ):
             raise RuntimeError(
-                "Inputs can only be staged at a usable optimizer boundary"
+                "Inputs can only be staged at a usable microbatch boundary"
             )
         if self.groups.rank not in self.groups.active_ranks:
             return
@@ -730,6 +750,16 @@ class DynamicTPSession:
 
     def train_cached_step(self, batch_size):
         """Consume exactly one batch; a switch never changes this row cursor."""
+        if self.state.in_step:
+            raise RuntimeError("train_cached_step requires an optimizer boundary")
+        return self.train_cached_microbatch(batch_size, window_microbatches=1)
+
+    def train_cached_microbatch(self, batch_size, *, window_microbatches=None):
+        """Consume one microbatch; return losses only when its update completes.
+
+        A short final window supplies its actual size on every call. Input may
+        be refilled between calls, but prepare/switch/checkpoint may not occur.
+        """
         if self.groups.rank not in self.groups.active_ranks:
             return {}
         cache = self.state.activation_caches
@@ -739,7 +769,10 @@ class DynamicTPSession:
             or any(t.shape[0] < batch_size for t in cache.values())
         ):
             raise ValueError("The pending cache must contain a full positive batch")
-        result = self.train_step({h: t[:batch_size] for h, t in cache.items()})
+        result = self.train_microbatch(
+            {h: t[:batch_size] for h, t in cache.items()},
+            window_microbatches=window_microbatches,
+        )
         self.state.activation_caches = {h: t[batch_size:] for h, t in cache.items()}
         return result
 
@@ -772,10 +805,30 @@ class DynamicTPSession:
         return load_checkpoint(self, path)
 
     def train_step(self, batches):
+        """One complete update from one batch (the backwards-compatible API)."""
+        if self.state.in_step:
+            raise RuntimeError("train_step requires an optimizer boundary")
+        return self.train_microbatch(batches, window_microbatches=1)
+
+    def train_microbatch(self, batches, *, window_microbatches=None):
+        """Accumulate token-weighted gradients, then clip/Adam/stats once.
+
+        Dead masks are frozen for the entire window. No graph survives a call;
+        only parameter gradients and small detached summaries remain resident.
+        A failed backward/update leaves the session unusable for migration.
+        """
         from sae_lens.saes.sae import TrainStepInput
 
-        if self.state.in_step or self.state.retired or self.groups.failed:
-            raise RuntimeError("Session is not at a usable optimizer boundary")
+        if (
+            self._microbatch_active or self.state.retired or self.groups.failed
+            or (self.state.in_step and self._window is None)
+        ):
+            raise RuntimeError("Session is not at a usable microbatch boundary")
+        target = self.gradient_accumulation_steps if window_microbatches is None else window_microbatches
+        if type(target) is not int or not 1 <= target <= self.gradient_accumulation_steps:
+            raise ValueError("window_microbatches must be between 1 and gradient_accumulation_steps")
+        if self._window is not None and self._window.target != target:
+            raise ValueError("Cannot change the size of an active gradient window")
         # Wavefront execution bypasses nn.Module forward hooks. Publish detached
         # component losses through the session for every execution schedule.
         self.last_loss_components = {}
@@ -786,15 +839,30 @@ class DynamicTPSession:
         sizes = {x.shape[0] for x in batches.values()}
         if len(sizes) != 1 or min(sizes) < 1:
             raise ValueError("All hooks require the same positive token count")
+        tokens = sizes.pop()
         self.state.in_step = True
+        self._microbatch_active = True
+        if self._window is None:
+            self._window = _TPGradientWindow(target)
+            self.last_loss_components = {}
+            for h in self.state.models:
+                self.state.optimizers[h].zero_grad(set_to_none=True)
+                self._window.masks[h] = (
+                    self.state.replicated[h + "/since_fired"] > self.dead_feature_window
+                )
+        window = self._window
+        window.microbatches += 1
+        window.tokens += tokens
+        final = window.microbatches == window.target
+        # Keep the GA1 numerical path unchanged. Larger windows sum token
+        # gradients and normalize exactly once, including unequal microbatches.
+        weight = tokens if target > 1 else 1
         inputs = {}
         for h, model in self.state.models.items():
-            self.state.optimizers[h].zero_grad(set_to_none=True)
-            mask = self.state.replicated[h + "/since_fired"] > self.dead_feature_window
             inputs[h] = TrainStepInput(
                 sae_in=prepare_sae_input(batches[h], model.dtype, self.input_scale),
                 coefficients={},
-                dead_neuron_mask=mask,
+                dead_neuron_mask=window.masks[h],
                 n_training_steps=self.state.progress["steps"],
                 is_logging_step=False,
             )
@@ -808,19 +876,36 @@ class DynamicTPSession:
         def update(h, output):
             model = models[h]
             with torch.no_grad():
+                loss = output.loss.detach()
+                components = {name: value.detach() for name, value in output.losses.items()}
+                counts = output.feature_firing_counts
+                if target > 1:
+                    window.losses[h] = window.losses.get(h, 0.0) + loss * weight
+                    sums = window.components.setdefault(h, {})
+                    for name, value in components.items():
+                        sums[name] = sums.get(name, 0.0) + value * weight
+                    if h not in window.counts:
+                        window.counts[h] = counts.detach().clone()
+                    else:
+                        window.counts[h].add_(counts)
+                    if not final:
+                        return
+                    for parameter in model.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.div_(window.tokens)
+                    loss = window.losses[h] / window.tokens
+                    components = {name: value / window.tokens for name, value in sums.items()}
+                    counts = window.counts[h]
                 if self.max_grad_norm is not None:
                     model.clip_grad_norm_(self.max_grad_norm)
                 self.state.optimizers[h].step()
                 self.state.optimizers[h].zero_grad(set_to_none=True)
-                counts = output.feature_firing_counts
                 self.state.replicated[h + "/firing_counts"].add_(counts)
                 since = self.state.replicated[h + "/since_fired"]
                 since.add_(1)
                 since.masked_fill_(counts > 0, 0)
-                result[h] = output.loss.detach()
-                self.last_loss_components[h] = {
-                    name: value.detach() for name, value in output.losses.items()
-                }
+                result[h] = loss
+                self.last_loss_components[h] = components
 
         if enabled and self.tp_overlap != "eager":
             from sae_lens.training.multi_hook_sae import PendingWavefrontOutputs
@@ -835,7 +920,7 @@ class DynamicTPSession:
             )
             for h in models:
                 output = pending.pop(h)
-                output.loss.backward()
+                (output.loss if target == 1 else output.loss * weight).backward()
                 update(h, output)
                 del output
             assert not pending
@@ -846,11 +931,16 @@ class DynamicTPSession:
                 outputs = forward_tp_wavefront(list(models), models, inputs)
             else:
                 outputs = {h: model(inputs[h]) for h, model in models.items()}
-            sum(o.loss for o in outputs.values()).backward()
+            loss = sum(o.loss for o in outputs.values())
+            (loss if target == 1 else loss * weight).backward()
             for h, output in outputs.items():
                 update(h, output)
-            del outputs
-        self.state.progress["steps"] += 1
-        self.state.progress["tokens"] += sizes.pop()
-        self.state.in_step = False
-        return result
+            del outputs, loss
+        self._microbatch_active = False
+        if final:
+            self.state.progress["steps"] += 1
+            self.state.progress["tokens"] += window.tokens
+            self.state.in_step = False
+            self._window = None
+            return result
+        return None

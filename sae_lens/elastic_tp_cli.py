@@ -40,6 +40,15 @@ def add_elastic_tp_arguments(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--elastic-tp-activation-scale", type=float)
     group.add_argument("--elastic-tp-startup-timeout", type=float, default=300.0)
     group.add_argument("--elastic-tp-pause-timeout", type=float, default=120.0)
+    group.add_argument("--elastic-tp-resume-timeout", type=float, default=300.0)
+    group.add_argument(
+        "--elastic-tp-vllm-residency", choices=("release", "resident"), default="release",
+        help="release (default): close vLLM and release GPU memory before SAE joins; reload on return. resident: retain warm weights while paused for faster switching.",
+    )
+    group.add_argument(
+        "--elastic-tp-release-tolerance-mib", type=int, default=64,
+        help="Maximum residual live PyTorch memory above the pre-model baseline at a release handoff. Context/NCCL allocations are separate.",
+    )
     group.add_argument("--elastic-tp-audit-inputs", action="store_true")
     group.add_argument("--elastic-tp-validate-activations", action="store_true")
 
@@ -71,8 +80,8 @@ def validate_elastic_tp_arguments(
         raise ValueError(
             "--elastic-tp requires FP32 SAE without autocast; --vllm-dtype controls the LLM"
         )
-    if args.gradient_accumulation_steps != 1:
-        raise ValueError("--elastic-tp requires --gradient-accumulation-steps 1")
+    if type(args.gradient_accumulation_steps) is not int or args.gradient_accumulation_steps < 1:
+        raise ValueError("--gradient-accumulation-steps must be a positive integer")
     if args.use_cached_activations or not args.is_dataset_tokenized:
         raise ValueError(
             "--elastic-tp requires a local tokenized dataset for online vLLM capture"
@@ -237,6 +246,7 @@ def config_from_runner_args(args: argparse.Namespace, *, d_in: int) -> ElasticTP
         k=args.k,
         batch_size=args.train_batch_size_tokens,
         steps=args.training_tokens // args.train_batch_size_tokens,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         context=args.context_size,
         prompts=args.store_batch_size_prompts,
         dead=args.dead_feature_window,
@@ -258,6 +268,9 @@ def config_from_runner_args(args: argparse.Namespace, *, d_in: int) -> ElasticTP
         watermark_samples=args.elastic_tp_watermark_samples,
         startup_timeout=args.elastic_tp_startup_timeout,
         pause_timeout=args.elastic_tp_pause_timeout,
+        resume_timeout=args.elastic_tp_resume_timeout,
+        vllm_residency=args.elastic_tp_vllm_residency,
+        release_tolerance_mib=args.elastic_tp_release_tolerance_mib,
         activation_dtype=args.activation_dtype,
         vllm_dtype=args.vllm_dtype,
         activation_conversion=args.activation_conversion,

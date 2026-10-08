@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--training-tokens", type=int, default=2048 * 4096)
     parser.add_argument("--train-batch-size-tokens", type=int, default=4096)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
-        help="Provider microbatches per native SAE update; supports static and exact SHM TopK streaming.",
+        help="Provider microbatches per SAE update; supports static, exact SHM streaming and elastic TP. Effective batch = train-batch-size-tokens times this value (except a short final window).",
     )
     parser.add_argument("--dead-feature-window", type=int, default=1000,
         help=(
@@ -1066,6 +1066,8 @@ def main() -> None:
         print(
             f"[elastic TP] pool={cfg.pool_size}, initial SAE TP={cfg.initial_tp}, "
             f"minimum SAE TP={cfg.min_tp}, "
+            f"GA={cfg.gradient_accumulation_steps}, microbatch={cfg.batch_size}, "
+            f"effective batch={cfg.batch_size * cfg.gradient_accumulation_steps}, "
             f"initial active vLLM={cfg.pool_size - cfg.initial_tp}, offline=True",
             flush=True,
         )

@@ -27,6 +27,11 @@ from sae_lens.training.elastic_tp_config import (
     validate_local_sources,
     write_json,
 )
+from sae_lens.training.elastic_tp_handoff import (
+    producer_quiesced,
+    producer_running,
+    read_status,
+)
 
 logger = logging.getLogger(__name__)
 WORKER_MODULE = "sae_lens.elastic_tp_runner"
@@ -107,11 +112,11 @@ def worker_environment(
     return env
 
 
-def stop_process(process: subprocess.Popen) -> None:
+def stop_process(process: subprocess.Popen, *, grace_s: float = 20) -> None:
     if process.poll() is not None:
         return
     try:
-        process.wait(timeout=20)
+        process.wait(timeout=grace_s)
     except subprocess.TimeoutExpired:
         with suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGTERM)
@@ -123,6 +128,26 @@ def stop_process(process: subprocess.Popen) -> None:
             process.wait()
 
 
+def wait_for_producers(cfg, producers, *, tp, epoch):
+    """Finish startup handoffs before any initial SAE tensors are allocated."""
+    started = time.monotonic()
+    while True:
+        if any(p.poll() is not None for p in producers):
+            raise RuntimeError("A vLLM producer exited during startup; see producer logs")
+        acknowledged = []
+        for gpu in range(1, cfg.pool_size):
+            status = read_status(cfg.output / f"producer{gpu}_status.json")
+            acknowledged.append(
+                producer_quiesced(status, epoch, cfg.vllm_residency)
+                if gpu < tp else producer_running(status, epoch)
+            )
+        if all(acknowledged):
+            return
+        if time.monotonic() - started > cfg.startup_timeout:
+            raise TimeoutError(f"vLLM startup handoff timed out at epoch {epoch}")
+        time.sleep(0.02)
+
+
 def prefill_for_full_tp(cfg: ElasticTPConfig, buffer, producers) -> None:
     """Fill a bounded cache and quiesce every producer before full-pool SAE init.
 
@@ -130,47 +155,35 @@ def prefill_for_full_tp(cfg: ElasticTPConfig, buffer, producers) -> None:
     running, the ordinary low-watermark controller can restore a producer.
     """
     control = cfg.output / "producer_control.json"
-    target = min(cfg.chunks, cfg.cache_batches, cfg.steps)
+    target = min(cfg.chunks, max(cfg.cache_batches, cfg.gradient_accumulation_steps), cfg.steps)
     started = time.monotonic()
 
     def check_producers():
-        if any(p.poll() not in (None, 0) for p in producers):
+        if any(p.poll() is not None for p in producers):
             raise RuntimeError("A vLLM producer failed during startup prefill")
         if time.monotonic() - started > cfg.startup_timeout:
             raise TimeoutError("Elastic TP startup prefill timed out")
 
-    write_json(control, dict(tp=1, epoch=0, stop=False))
+    write_json(control, dict(tp=1, epoch=1, stop=False, startup=True))
     while buffer.queue_counts()["ready"] < target:
         check_producers()
-        if all(p.poll() == 0 for p in producers):
-            raise RuntimeError("All producers exited before startup prefill completed")
         time.sleep(0.02)
-    write_json(control, dict(tp=cfg.pool_size, epoch=1, stop=False))
-    while True:
-        check_producers()
-        acknowledged = []
-        for gpu in range(1, cfg.pool_size):
-            state = json.loads((cfg.output / f"producer{gpu}_status.json").read_text())
-            acknowledged.append(
-                state["state"] == "done"
-                or state["state"] == "paused"
-                and state["epoch"] == 1
-            )
-        if all(acknowledged):
-            break
-        time.sleep(0.02)
+    write_json(control, dict(tp=cfg.pool_size, epoch=2, stop=False, startup=True))
+    wait_for_producers(cfg, producers, tp=cfg.pool_size, epoch=2)
     write_json(
         cfg.output / "startup_prefill.json",
         dict(
             target_chunks=target,
             ready_chunks=buffer.queue_counts()["ready"],
             elapsed_s=time.monotonic() - started,
+            epoch=2,
+            vllm_residency=cfg.vllm_residency,
         ),
     )
 
 
 class ElasticTPSAETrainingRunner:
-    """Own the SHM buffer, warm producers, torchrun workers and their cleanup."""
+    """Own the SHM buffer, releasable producers, workers and their cleanup."""
 
     def __init__(self, cfg: ElasticTPConfig):
         self.cfg = cfg
@@ -199,6 +212,7 @@ class ElasticTPSAETrainingRunner:
                 initial_sae_devices=devices[: cfg.initial_tp],
                 initial_active_vllm_devices=devices[cfg.initial_tp :],
                 prefill_before_training=cfg.initial_tp == cfg.pool_size,
+                vllm_residency=cfg.vllm_residency,
                 offline_environment=OFFLINE_ENV,
             ),
         )
@@ -214,7 +228,12 @@ class ElasticTPSAETrainingRunner:
                 packages=packages,
                 devices=devices,
                 dataset_cycles=True,
-                producer_weights="Resident on GPU while paused; inference drains before SAE joins",
+                producer_weights=(
+                    "Close/release before SAE joins; cold reload after SAE releases"
+                    if cfg.vllm_residency == "release"
+                    else "Resident on GPU while paused; inference drains before SAE joins"
+                ),
+                vllm_residency=cfg.vllm_residency,
             ),
         )
         name = f"elastic_tp_{os.getpid()}_{time.time_ns()}"
@@ -227,7 +246,7 @@ class ElasticTPSAETrainingRunner:
                 activation_dtype=activation_dtype(cfg),
             ),
         )
-        buffer = None
+        buffer = training = None
         processes, handles = [], []
         started = time.perf_counter()
         returncode = 1
@@ -235,7 +254,7 @@ class ElasticTPSAETrainingRunner:
         try:
             buffer = open_buffer(cfg, create=True, name=name)
             control_path = cfg.output / "producer_control.json"
-            write_json(control_path, dict(tp=cfg.pool_size, epoch=0, stop=False))
+            write_json(control_path, dict(tp=cfg.pool_size, epoch=0, stop=False, startup=True))
             for gpu in range(1, cfg.pool_size):
                 handle = (cfg.output / f"producer{gpu}.log").open("w")
                 handles.append(handle)
@@ -249,19 +268,12 @@ class ElasticTPSAETrainingRunner:
                     )
                 )
             producers = processes.copy()
-            while not all(
-                (cfg.output / f"producer{gpu}_status.json").exists()
-                for gpu in range(1, cfg.pool_size)
-            ):
-                if any(p.poll() is not None for p in producers):
-                    raise RuntimeError(
-                        "A vLLM producer failed to initialize; see producer logs"
-                    )
-                if time.perf_counter() - started > cfg.startup_timeout:
-                    raise TimeoutError("vLLM startup timed out")
-                time.sleep(0.5)
+            wait_for_producers(cfg, producers, tp=cfg.pool_size, epoch=0)
             if cfg.initial_tp == cfg.pool_size:
                 prefill_for_full_tp(cfg, buffer, producers)
+            else:
+                write_json(control_path, dict(tp=cfg.initial_tp, epoch=1, stop=False, startup=True))
+                wait_for_producers(cfg, producers, tp=cfg.initial_tp, epoch=1)
             handle = (cfg.output / "train.log").open("w")
             handles.append(handle)
             training = subprocess.Popen(
@@ -312,15 +324,28 @@ class ElasticTPSAETrainingRunner:
             raise
         finally:
             try:
+                control_path = cfg.output / "producer_control.json"
+                control = (
+                    json.loads(control_path.read_text()) if control_path.exists()
+                    else dict(epoch=0, stop=False)
+                )
                 write_json(
                     cfg.output / "producer_control.json",
-                    dict(tp=cfg.pool_size, epoch=-1, stop=True),
+                    dict(tp=cfg.pool_size,
+                         epoch=control["epoch"] + (not control["stop"]), stop=True),
                 )
             finally:
                 try:
                     for process in reversed(processes):
-                        stop_process(process)
+                        # A stop can arrive inside a non-interruptible cold
+                        # load. Let it return and close before escalating.
+                        stop_process(
+                            process, grace_s=20 if process is training else cfg.resume_timeout
+                        )
                 finally:
+                    if not returncode and any(p.returncode != 0 for p in processes):
+                        returncode = 1
+                        error = "A worker failed during shutdown; see worker logs"
                     for handle in handles:
                         handle.close()
                     if buffer is not None:
@@ -334,6 +359,8 @@ class ElasticTPSAETrainingRunner:
                             process_returncodes=[p.returncode for p in processes],
                         ),
                     )
+        if returncode:
+            raise RuntimeError(error)
         return report
 
 

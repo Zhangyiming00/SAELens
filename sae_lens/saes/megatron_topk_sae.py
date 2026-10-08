@@ -142,7 +142,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             if cfg.ragged_decoder_engine == "triton":
                 # Eager import catches missing dependency before any forward
                 # collective. No runtime dense fallback on import/JIT errors.
-                from sae_lens.ragged_sae_triton import forward as _ragged_forward
+                from sae_lens.ragged_sae_triton import forward as _ragged_forward  # noqa: F401
         if runtime is not None:
             runtime_group = runtime.require_local().tp_group
             if tp_group is not None and tp_group is not runtime_group:
@@ -397,7 +397,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             scope[0] = self.decoder.weight.T.contiguous()
         return scope[0]
 
-    def _decode_ragged_partial(self, acts, norm=None, *, auxiliary=False, known_columns=None):
+    def _decode_ragged_partial(self, acts, norm=None, *, auxiliary=False, known_columns=None, aux_global_k=None):
         from sae_lens.ragged_sae import (
             RaggedLatents,
             compact_ragged_dense,
@@ -413,7 +413,8 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         from sae_lens.adaptive_sae import active, decode_adaptive
         if active(self.cfg, auxiliary):
             result, diagnostic = decode_adaptive(acts, self._decoder_vectors(), self.cfg,
-                                                 auxiliary=auxiliary, known_columns=known_columns)
+                                                 auxiliary=auxiliary, known_columns=known_columns,
+                                                 aux_global_k=aux_global_k)
             if auxiliary:
                 self._last_auxk_execution = diagnostic
             else:
@@ -495,6 +496,17 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             else None
         )
         if k == num_dead:
+            norm = self._decoder_norm() if self.cfg.rescale_acts_by_decoder_norm else None
+            direct = execution.try_direct_aux(
+                self.feature_shard.select(hidden_pre), self.feature_shard.select(mask, 0),
+                num_dead, requested, self.decoder.weight, norm, self.cfg, known_columns=columns)
+            if direct is not None:
+                out, diagnostic = direct
+                if winner_count is not None:
+                    winner_count(diagnostic["entries"])
+                diagnostic.update(representation="full", num_dead=num_dead, k=k)
+                self._last_auxk_execution = diagnostic
+                return out
             acts = torch.where(mask, hidden_pre, 0.0)
             selection = "select_all"
             if winner_count is not None:
@@ -516,7 +528,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 k,
                 rank=self.tp_rank,
                 shard_width=width,
-                packed=stages not in (("local_dense",) * 3, ("compact_dense",) * 3),
+                packed=stages != ("local_dense",) * 3,
                 relu=False,
                 eligible=mask,
                 key_backend=self.cfg.topk_key_backend,
@@ -525,7 +537,8 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 feature_shard=self.feature_shard,
             )
             selection = "full_topk"
-        out = self._decode_execution_partial(acts, auxiliary=True, columns=columns)
+        out = self._decode_execution_partial(acts, auxiliary=True, columns=columns,
+                                             aux_global_k=k, select_all=selection == "select_all")
         self._last_auxk_execution.update(selection=selection, num_dead=num_dead, k=k)
         return out
 
@@ -557,7 +570,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         return out.reshape(*local.shape[:-1], self.cfg.d_in)
 
     def _decode_execution_partial(
-        self, acts, *, auxiliary=False, norm=None, columns=None
+        self, acts, *, auxiliary=False, norm=None, columns=None, aux_global_k=None, select_all=False
     ):
         from sae_lens.ragged_sae import RaggedLatents
 
@@ -573,7 +586,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                 forward="dense", value_gradient="dense", weight_gradient="dense"
             )
         elif (
-            auxiliary and stages == ("compact_dense",) * 3 and kind != "sharded_ragged"
+            auxiliary and select_all and stages == ("compact_dense",) * 3 and kind != "sharded_ragged"
         ):
             local = local_latent_tensor(acts, kind, self.tp_rank, width, feature_shard=self.feature_shard)
             values = local.index_select(-1, columns)
@@ -589,7 +602,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         else:
             packed = selected_latents_view(acts, kind, self.tp_rank, width, feature_shard=self.feature_shard)
             out = self._decode_ragged_partial(
-                packed, norm, auxiliary=auxiliary, known_columns=columns
+                packed, norm, auxiliary=auxiliary, known_columns=columns, aux_global_k=aux_global_k
             )
             diagnostic = dict(
                 getattr(
@@ -621,7 +634,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         norm = self._decoder_norm() if self.cfg.rescale_acts_by_decoder_norm else None
         # Regular select-all ragged rows can use the shared column set directly;
         # avoid B*dead repeated row/column metadata, as on the existing fast path.
-        if kind == "sharded_ragged":
+        if kind in ("sharded_ragged", "sharded_dense"):
             direct = try_direct_aux(
                 hidden_pre,
                 local_mask,
@@ -647,7 +660,7 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
         packed = kind == "sharded_ragged" or stages not in (
             ("local_dense",) * 3,
             ("compact_dense",) * 3,
-        )
+        ) or (stages == ("compact_dense",) * 3 and k < num_dead)
         if packed:
             local = pending_selection.wait()[0] if pending_selection is not None else ragged_auxk(
                 hidden_pre,
@@ -686,7 +699,8 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             selection = plan.selection
         acts = represent_latents(local, kind, self._tp_group, feature_shard=self.feature_shard)
         out = self._decode_execution_partial(
-            acts, auxiliary=True, norm=norm, columns=columns
+            acts, auxiliary=True, norm=norm, columns=columns, aux_global_k=k,
+            select_all=selection == "select_all"
         )
         self._last_auxk_execution.update(selection=selection, num_dead=num_dead, k=k)
         return out
@@ -904,7 +918,8 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
                         winner_count(aux.nnz)
                     # Eligible IDs are shared across this batch, not values.
                     columns = (local_mask.nonzero(as_tuple=True)[0] if known_columns is None else known_columns) if enabled else None
-                    recons = self._decode_ragged_partial(aux, auxiliary=True, known_columns=columns)
+                    recons = self._decode_ragged_partial(aux, auxiliary=True, known_columns=columns,
+                                                          aux_global_k=min(k_aux, num_dead))
                 self._last_auxk_execution.update(num_dead=num_dead, k=min(k_aux, num_dead))
                 if self.tp_size > 1 and not wavefront:
                     recons = require_megatron_core().reduce_from_tensor_model_parallel_region(recons, group=self._tp_group)
@@ -1002,9 +1017,8 @@ class MegatronTopKSAE(TrainingSAE[TopKTrainingSAEConfig]):
             raise RuntimeError("AuxK selection must be submitted once")
         if self._decoupled_execution:
             stages = execution.stage_requests(self.cfg, True)
-            packed = execution.branch_representation(self.cfg, True) == "sharded_ragged" or stages not in (
-                ("local_dense",) * 3, ("compact_dense",) * 3,
-            )
+            packed = (execution.branch_representation(self.cfg, True) == "sharded_ragged"
+                      or stages != ("local_dense",) * 3)
             layout, decoder = ("ragged", "auto") if packed else ("dense", "local_dense")
         else:
             layout = {"sharded_dense": "dense", "sharded_sparse": "sparse", "sharded_ragged": "ragged"}[self.cfg.topk_backend]

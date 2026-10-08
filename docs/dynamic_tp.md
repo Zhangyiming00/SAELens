@@ -18,7 +18,7 @@
 - 单个 DP 副本内多个 hook 的动态 TP；不同 hook 可以使用不同 d_sae，API 逐 hook 建计划。
 - `DynamicTPSession` 训练 API、读取真实 safetensors 激活的 `run_dynamic_tp_sae.py`，以及真实 Gloo/NCCL 验收脚本。
 
-边界必须保留：动态 session 为 **DP=1、FP32 SAE、每 hook 一组 torch Adam**。CUDA 入口使用 fused Adam。它不是现有 `elastic_streaming` DP/ZeRO 角色切换的开关；没有把该控制器改造成同时调 DP/TP 的实现，也没有实现 vLLM 冷启动/停止、世界进程数量变化、FSDP/ZeRO 状态重分片、AMP scaler 迁移、部分梯度累计窗口迁移。现有静态 runner 获得不等分 TP；在线动态 TP 已接入 `run_sae_runner_gpu.py --elastic-tp`。
+边界必须保留：动态 session 为 **DP=1、FP32 SAE、每 hook 一组 torch Adam**。CUDA 入口使用 fused Adam。它不是现有 `elastic_streaming` DP/ZeRO 角色切换的开关；没有把该控制器改造成同时调 DP/TP 的实现，也没有实现世界进程数量变化、FSDP/ZeRO 状态重分片、AMP scaler 迁移、部分梯度累计窗口迁移。现有静态 runner 获得不等分 TP；在线动态 TP 已接入 `run_sae_runner_gpu.py --elastic-tp`，支持 vLLM close/reload 与保留权重两种交接模式。
 
 动态 session 使用原生 Megatron encoder/decoder 与现有 sharded TopK/AuxK。`tp_overlap=off/eager/lazy/bounded` 复用原有 `forward_tp_wavefront` / `PendingWavefrontOutputs` 调度；bounded 的窗口由 `tp_overlap_max_live_hooks` 指定，每个完整 step 后才能切换。它尚未接入原 MultiSAETrainer 的 DDP optimizer-overlap、完整日志/调度器体系，不支持动态 DP/ZeRO、AMP 或部分 GA 窗口。不能把这个独立入口的耗时直接当成旧 runner 的性能对照。已有训练数据应按原有方式先做 activation scaling，入口要求 `normalize_activations=none`。
 
@@ -30,9 +30,9 @@
 
 - 模型目录需已准备好权重及 `config.json`。输入维度从模型配置自动读取，每个 vLLM producer 使用 TP1，因此完整模型必须能放入单张卡。
 - 数据目录需是 `datasets.save_to_disk` 保存的单个 Dataset，包含非空、等长的二维 `tokens` 列。数据应事先使用该模型对应的 tokenizer 处理。每行 token 数必须是 `context-size` 的整数倍；运行时切为 context 窗口并循环读取至训练结束，不做下载或在线分词。
-- `train-batch-size-tokens` 必须是 `context-size` 的整数倍；`training-tokens` 必须是训练 batch 的整数倍。训练步数为两者相除。`max-model-len` 必须大于 `context-size`。
+- `train-batch-size-tokens` 是微批 token 数，必须是 `context-size` 的整数倍；`training-tokens` 必须是微批的整数倍。微批数为两者相除，optimizer 更新数为 `ceil(微批数 / GA)`。`max-model-len` 必须大于 `context-size`。
 - `/dev/shm` 要有足够空间。激活主体占用约为 `streaming-num-chunks × train-batch-size-tokens × d_in × dtype字节数`，另有少量元数据。例如 BF16、96 块、4096 tokens、d_in=4096 约需 3 GiB。
-- 当前在线模式支持单机、单 hook、SAE FP32、DP=PP=1、GA=1。模型与数据之外，Python 环境需已安装兼容的 PyTorch、vLLM、Transformers、Datasets 等依赖。
+- 当前在线模式支持单机、单 hook、SAE FP32、DP=PP=1、任意正整数 GA。模型与数据之外，Python 环境需已安装兼容的 PyTorch、vLLM、Transformers、Datasets 等依赖。
 
 入口在导入 Transformers 前默认设置 `HF_HUB_OFFLINE=1`、`HF_DATASETS_OFFLINE=1`、`HF_HUB_DISABLE_TELEMETRY=1`、`VLLM_NO_USAGE_STATS=1`，所有子进程继承这些值，用户无需手写环境变量。加载前会拒绝远程模型标识和不存在的本地模型/数据目录。使用这些库读取本地文件不需要 Hugging Face 服务、账号或联网。
 
@@ -73,6 +73,43 @@ GPU 顺序由 `CUDA_VISIBLE_DEVICES` 决定，池内 rank 对应其前 N 张卡�
 
 `--sae-tp-size N`（或 `-stp N`）只设置初始 SAE TP，**不会限制后续缩容**。省略时从最低允许 TP 启动，默认下限为 1。高低水位自动决定相邻切换，无需传入“从什么切换到什么”的列表。
 
+### 梯度累积：GA > 1
+
+沿用普通 runner 的 `--gradient-accumulation-steps K`，默认 1。`--train-batch-size-tokens B` 始终是 provider 微批大小，通常每次 optimizer 更新消费 `B × K` tokens，**不会自动把 B 除以 K**。例如保留原先有效 batch=4096、降低单次前后向的激活显存：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python run_sae_runner_gpu.py \
+  "${COMMON[@]}" --elastic-tp-size 2 \
+  --train-batch-size-tokens 1024 --gradient-accumulation-steps 4 \
+  --output-path results/elastic_ga4
+```
+
+若保留 `B=4096` 并设置 `GA=4`，有效 batch 将变为 16384。`training-tokens` 是总输入预算，不会乘以 GA。例如 9 个微批、GA4，执行 4+4+1 三个 optimizer 更新；末尾窗口按实际 token 数归一化，不丢弃、不补齐样本。
+
+- 各微批前后向结束即释放计算图，只保留累积梯度和小型统计；缓存可以在窗口中途补充，`streaming-prefetch-chunks` 不要求大于等于 GA。
+- 整个窗口固定参数和 dead mask；梯度、loss components 按微批 token 数加权，窗口末尾才裁剪梯度、执行一次 Adam、更新 firing/dead counters。`dead-feature-window` 与 step 日志按 optimizer 更新计数。
+- TP prepare、迁移和 checkpoint 只允许完整窗口之间；不迁移部分梯度。GA>1 的已准备切换在 producer ACK 后的 optimizer 边界提交，不额外强制运行一个旧 TP 窗口。
+- 暂停最后一个 producer 前，必须有足够的 READY+本地缓存微批覆盖下一整个窗口。全卡 SAE 若储备不足，会在窗口开始前恢复 producer（`reason=ga_input_reserve`），可越过 cooldown；不在累积中途缩容。GA 大于缓存总容量时保留 producer，并边训练边补充。
+- 全卡启动预填充尽量覆盖一个 GA 窗口，仍受 SHM 容量限制；容量不足时允许在第一个 optimizer 更新之前缩容。Adam 尚未初始化的迁移诊断也支持此路径。
+
+`run_config.json` 中 `steps` 保留为微批/生产 chunk 数，`gradient_accumulation_steps` 单独保存。`train_rank*.jsonl` 的 `step` 和报告的 `steps` 是 optimizer 更新数；`microbatches`、`consumed_microbatches`、`tokens` 用于区分窗口大小与累计输入。`step_s/input_s` 是窗口内各微批对应阶段的时间之和，完整墙钟时间还包含供给等待和控制开销。GA1 行为保持原有语义。
+
+离线 `run_dynamic_tp_sae.py` 同样接受 `--gradient-accumulation-steps`，其 `--steps` 和 TP schedule 仍表示 optimizer 更新；激活文件需至少 `steps × GA × batch-size` 行，checkpoint 保存并恢复 GA，旧 checkpoint 默认 GA1。在线 checkpoint 的原有限制不变。
+
+Python API：`train_step()` / `train_cached_step()` 保持一次输入完成一次更新；配置 `DynamicTPSession(..., gradient_accumulation_steps=K)` 后，用 `train_microbatch()` / `train_cached_microbatch()` 累积。非末尾调用返回 `None`；末尾返回窗口平均 loss。短尾通过每次调用相同的 `window_microbatches=实际微批数` 指定。
+
+CPU 数学与调度回归：
+
+```bash
+python -m pytest --confcutdir=tests/sharded_topk_standalone \
+  tests/sharded_topk_standalone/test_dynamic_tp_ga.py -q
+# 支持本机 TCP 通信的环境，可额外运行三进程真实 Gloo 测试：
+SAE_TEST_GLOO=1 python -m pytest --confcutdir=tests/sharded_topk_standalone \
+  tests/sharded_topk_standalone/test_dynamic_tp_ga.py -q
+```
+
+CPU 测试使用真实 SAE/TopK/AuxK 方法、PyTorch Adam 与 F.linear 替代 Megatron 线性层；线程通信测试覆盖 1→2→3→2→1、非末尾 rank 退出、Adam 状态与 checkpoint。它们不替代原生 Megatron、fused Adam、NCCL、vLLM 的 GPU 端到端验收。
+
 ### 显存放不下 TP1：限制最低 SAE TP
 
 如果已知 SAE 至少需要 TP2，设置下限；四卡的例子如下：
@@ -87,7 +124,75 @@ CUDA_VISIBLE_DEVICES=3,1,0,2 python run_sae_runner_gpu.py \
 
 参数须满足 `pool_size >= 2`、`1 <= min_tp <= initial_tp <= pool_size <= d_sae`，并且 **`min_tp < pool_size`**。初始值低于下限会在启动模型前报错。下限等于卡池大小也会报错，因为在线模式需要保留恢复至少一个 producer 的可能性：例如两卡且 SAE 至少需要 TP2，就不能使用当前在线角色切换模式持续补充输入，需要增加卡数或另用预存激活训练入口。
 
-producer 暂停时仍保留模型权重，加入 SAE 的卡可能同时驻留 vLLM 权重、SAE 分片与迁移临时存储；最低 TP 应根据实际显存余量设置。卡池大小固定，控制器不会临时调用池外 GPU。
+默认 `release` 模式先释放 vLLM 模型与 KV cache，再让对应卡加入 SAE；`resident` 模式暂停时仍保留权重。最低 TP 应根据 SAE 分片及迁移临时存储的峰值设置；resident 还需容纳 vLLM。卡池大小固定，控制器不会临时调用池外 GPU。
+
+### vLLM 显存交接：release 与 resident
+
+2026-10-08 的交接补丁基于 `origin/main@7b47ebf`，同时保留 GA 支持。默认使用：
+
+```bash
+--elastic-tp-vllm-residency release
+```
+
+扩容 `m→m+1`：控制器发布新 epoch 和目标 TP，加入卡上的 producer 停止领取新 chunk；已经领取的请求完成推理、D2H 和 SHM 发布后，调用现有 `HookedVLLMModel.close()`。随后同步、清理引用、运行 GC 和 `empty_cache()`，检查存活 PyTorch 分配量，再发布该 epoch 的 `released / ready=true / memory_released=true`。SAE 只在收到有效确认并抵达完整 optimizer 更新边界后迁移参数、Adam、dead/firing 状态及激活缓存，提交备用训练通信域。旧 SAE ranks 可在 producer 排空期间继续训练；GA>1 暂停最后一个 producer 时保留完整窗口输入。
+
+缩容 `m→m−1`：先在更新边界迁走退出 rank 的状态并提交新 TP，再在退出 rank 上释放 SAE 张量引用、同步、GC 和 `empty_cache()`，写出 `saeN_status.json` 的同 epoch `released` 确认。所有 worker 确认交接成功后，控制器才发布较小 TP。producer 核对 SAE release ACK，重新加载模型，CUDA 同步完成后发布 `running / ready=true`，随后继续领取输入。冷加载期间剩余 SAE ranks 可以消耗缓存；控制器等到 producer ready 后才允许下一次拓扑切换，超时或失败会广播给全部 SAE workers 并中止本次运行。
+
+显存充足时可显式保留原来的暖驻留路径：
+
+```bash
+--elastic-tp-vllm-residency resident
+```
+
+resident 扩容仅排空并确认 `paused`，不销毁模型；缩容仍先清理 SAE allocator，再恢复推理，无需重新加载权重。不会因为 release 失败自动切回 resident。
+
+交接约束：
+
+- `done` 只在输出排空且模型关闭、缓存归还后发布。输入预算耗尽后 producer 保留 CPU 控制循环，为后续 epoch 重新确认 `done`，直到 stop；不会重新加载。旧 epoch 的 `done/released` 不能放行新交接。
+- 初始 SAE ranks 在 release 模式下不会先加载 vLLM；全卡启动预填充结束也必须先收到全部当前 epoch 的释放确认，才启动 SAE worker。startup 特例只用于尚未启动 SAE 的阶段，训练开始后关闭。
+- CUDA context、固定控制/迁移通信域和至多两套训练通信域仍驻留。`memory_released` 表示模型/训练张量及可归还 allocator 缓存的交接，不代表 NVML 为 0。默认允许比建模前 PyTorch allocated 基线多 64 MiB；`--elastic-tp-release-tolerance-mib` 可调。超过阈值即失败，日志保留分配量，不能用空闲状态替代释放确认。此检查不能验证第三方 allocator 的所有分配。
+- release 复用当前 fork 的 `close()`，恢复采用冷加载。没有实现或声称验证 vLLM level-1 sleep/wake，也不使用 checkpoint/resume 搬运 SAE 状态。冷加载可能是显著成本，缓存不足时会反映为训练等待。
+
+计时应同时检查 `switches.json` 的 `prepare_s`、`pause_s_max`、`handoff_s`、`request_to_commit_s`，以及 `producerN.jsonl` 的 `drain_s/close_s/quiesce_s/load_s` 和 `train_rank0.jsonl` 的 `producer_resumed.resume_s`。其中 `pause_s_max` 仅为核心迁移暂停，`handoff_s` 含诊断与退出 SAE 的释放，`request_to_commit_s` 还包括等待 producer 释放和更新边界；`resume_s` 从缩容释放完成后的恢复请求开始，不属于核心迁移时间。不要只用 `pause_s_max` 宣称释放模式没有切换损失。
+
+CPU 回归命令：
+
+```bash
+python -m pytest --confcutdir=tests/sharded_topk_standalone \
+  tests/sharded_topk_standalone/test_dynamic_tp_ga.py \
+  tests/sharded_topk_standalone/test_elastic_tp_handoff.py -q
+```
+
+测试覆盖 epoch、防提前 ACK、关闭/重新加载失败、残留分配、加载期间 stop、全卡启动预填充、三 rank 的 `1→2→3→2→1`、GA1/3、不等宽分片、Adam 状态和恢复超时。CUDA/vLLM/SHM 在协议测试中被模拟；CPU 数学/线程通信测试不替代 H100/5090 原生验收。GPU 验收应分别跑两种模式、普通与全卡启动，并核对同卡的 producer released → SAE 加入、SAE released → producer running 顺序、allocated/reserved 与 NVML、唯一输入数和全部退出码。本文下方的历史 GPU 记录属于原驻留实现，不能当作本次 release 模式的性能证据。
+
+#### 本次补丁的 GPU 验收（2026-10-08）
+
+在 RTX 5090 32 GiB 上，使用本地 Llama-3.1-8B 和已分词的 WikiText-2，通过 `run_sae_runner_gpu.py` 完成以下四项真实运行。每个微批 256 tokens，`d_sae=1025`，开启输入哈希核对和 bounded overlap；包含非整除分片、AuxK 和保存模型。下面的 TP 序列均由控制器自动触发。
+
+| 模式 | 卡数 / 初始 SAE TP | GA | 微批数 → optimizer 更新数 | 实际切换 |
+|---|---|---|---|---|
+| release | 2 / 1 | 3 | 49 → 17，末尾 1 个微批 | TP1 → TP2 → TP1 |
+| release | 3 / 3，初始零活跃 vLLM | 4 | 17 → 5，末尾 1 个微批 | TP3 → TP2 → TP3 |
+| resident | 2 / 1 | 1 | 17 → 17 | TP1 ↔ TP2，累计 14 次切换 |
+| resident | 2 / 2，初始零活跃 vLLM | 3 | 17 → 6，末尾 2 个微批 | TP2 → TP1 |
+
+三卡 release 用例特意只留 2 个 SHM chunks、本地缓存 1 个微批，均小于 GA4：系统在第一个 optimizer 更新之前以 `ga_input_reserve` 缩容，释放退出 rank 的 SAE 状态后恢复 producer，并在窗口中补充输入；剩余最后一个微批时重新进入 TP3。所有运行的生产和消费序号恰好覆盖输入预算，无重复或遗漏；切换全部发生在完整更新边界，交接 epoch 和释放顺序通过日志审计，所有子进程退出码为 0，SHM 正常清理。
+
+释放效果使用 producer 进程级 NVML 采样交叉验证：加载后约 16194 MiB，release 确认后稳定为 728 MiB；同期 PyTorch allocated 为 39.44 MiB、reserved 为 62 MiB。全卡启动的 resident 用例在暂停期间仍约 16194 MiB。这验证了真实显存归还，但不会清空 CUDA context 等常驻开销。两次 release 恢复耗时分别约 2.73 和 2.76 秒；resident 恢复约 22–38 ms。这里使用小 SAE，数据用于功能与交接验收，不是大 SAE 的容量或吞吐结论，也不是 H100 测量。
+
+额外的三卡原生 NCCL/fused Adam 测试位于 `tests/training/test_elastic_tp_ga_native.py`：两个 hook、不等宽分片、BF16 输入，比较 GA3 的不等长微批与拼接后的完整 batch，覆盖 TP1/2/3 以及非连续 active ranks、短尾窗口、off/bounded 调度。损失、参数和 Adam 状态在容差内一致，进度及 dead/firing 统计完全一致。
+
+```bash
+# 真实三进程 Gloo 的 GA 迁移与 checkpoint 对照
+SAE_TEST_GLOO=1 python -m pytest --confcutdir=tests/sharded_topk_standalone \
+  tests/sharded_topk_standalone/test_dynamic_tp_ga.py::test_uneven_tp_migration_and_checkpoint -q
+
+# 需要三张可见 GPU；使用项目兼容的本地依赖环境
+python -m pytest --confcutdir=tests/training \
+  tests/training/test_elastic_tp_ga_native.py -q
+```
+
+本次共通过 159 项测试（补丁 CPU 60、真实 Gloo 1、原生 GPU 2、runner/精度/显存回归 96），另有上述 4 项真实 vLLM 端到端运行。本机完整命令、NVML 采样、worker 日志和审计结果保存在 `results/elastic_handoff_20261008/`，汇总为 `summary.json`；`run_e2e.py --case <用例名> --tag <新目录名>` 可按记录的本地路径复现，`audit.py` 检查原始四组结果。
 
 ### 零活跃 vLLM：训练中进入，或从全卡 SAE 启动
 
@@ -105,13 +210,55 @@ CUDA_VISIBLE_DEVICES=3,0,2 python run_sae_runner_gpu.py \
   --output-path results/elastic_3gpu_full_start
 ```
 
-不要传 `--vllm-dp-size 0`；活跃 producer 数由卡池与当前 TP 推导。全卡启动时 supervisor 先在 SAE worker 启动前临时运行 producer，预填充目标为 `min(streaming-num-chunks, streaming-prefetch-chunks, 训练步数)` 块，然后等待所有在途写入完成并确认 producer 暂停，再以请求的全卡 TP 执行第一个训练 step。排空期间已生成的完整块也会保留，因此实际预填充数可能多于目标。预填充期间没有 SAE 更新，最低 SAE TP 限制不受影响。
+不要传 `--vllm-dp-size 0`；活跃 producer 数由卡池与当前 TP 推导。全卡启动时 supervisor 先在 SAE worker 启动前临时运行 producer，预填充目标为 `min(streaming-num-chunks, max(streaming-prefetch-chunks, GA), 总微批数)` 块，然后等待所有在途写入完成并确认 producer 已释放（release）或暂停（resident），再初始化请求的全卡 SAE TP。若储备不足一个 GA 窗口，先恢复 producer 再训练。排空期间已生成的完整块也会保留，因此实际预填充数可能多于目标。预填充期间没有 SAE 更新，最低 SAE TP 限制不受影响。控制 epoch 从启动 0、预填充 1、交还全卡 SAE 2 单调递增，trainer 不会重置为 1。
 
-“零活跃 vLLM”不等于不启动 vLLM：producer 进程与模型权重保持驻留，之后才能恢复。完全不加载 vLLM 的预存激活训练不属于这个在线模式；已有独立文件输入入口 `run_dynamic_tp_sae.py`，用法见后文。
+“零活跃 vLLM”时 producer 控制进程仍存活；release 模式释放模型，resident 模式保留模型。完全不加载 vLLM 的预存激活训练不属于这个在线模式；已有独立文件输入入口 `run_dynamic_tp_sae.py`，用法见后文。
+
+### AuxK 的默认解码策略
+
+普通 `run_sae_runner_gpu.py` 和 elastic TP 共用 Aux 解码策略。省略
+`--aux-compute`（或传 `none`）时使用 `auto`，**正常情况始终 compact**，
+无需另外调节计算方式；TopK、近全选和 select-all 都遵循这个默认值。
+`--sae-aux-k K` 设置每个 token 在所有 TP rank 上合计的选择预算；省略时
+为 `d_in // 2`，设为 `0` 则关闭 Aux。
+
+全量、分片与列压缩是三个不同概念。设 batch 为 `B`，本卡拥有 `S_r`
+个特征，本批次在本卡实际选中的 dead 列并集为 `C_r`：
+
+| 路径 | 激活形状或计算宽度 |
+| --- | --- |
+| full 存储 | 全局 `[B, d_sae]`，可能涉及 TP all-gather |
+| local dense | 本地 `[B, S_r]`，仍包含本卡未选中的列 |
+| compact 解码 | 本地 `[B, |C_r|]`，只对选中列及其 decoder 权重做 GEMM |
+
+`--aux-storage full|sharded_dense|sharded_ragged` 控制存储与选择路径；
+compact 解码在本卡进行，不把压缩后的激活或权重重新聚合到全局。
+各 rank 的 `C_r` 可以大小不同，切换 TP 后按新的实际归属重新计算。
+
+每个 token 全部 rank 的有效选中数之和是 `min(K, dead)`。不同 token
+可能选择不同特征，因此本批次 compact 宽度之和 `sum(|C_r|)` 可能大于
+K，最多达到全局 dead 数；它不是固定的 K，也不是 `max(K, dead)`。
+需要筛选时用本地 feature bitmap 求准确并集，不排序整个 `B*K` ID 数组。
+选中值恰好为零的项仍保留，以保证梯度正确。
+
+全选条件是 **全局 `dead <= K`，包含相等**：同步与异步入口都跳过 TopK
+比较。此时 `C_r` 就是本卡 dead 列；workspace 足够时直接 compact GEMM，
+避免逐项 ragged 元数据，超出 workspace 时使用分块 compact。
+
+默认 auto 的 dense 例外是保守的：用户显式设置的 K 至少为全局
+`d_sae / 2`，过滤后的 `min(K, dead)` 仍至少为 `d_sae / 2`，且本卡的
+实际选中列并集覆盖整个本地 shard。三者同时满足时，列压缩已经不再减少
+该卡矩阵宽度，直接使用 local dense。缺少全局选择元数据时保留 compact。
+普通 AuxK 不因本地 K 越过 512、本地 dead 比例或密度而自动改走 sparse。
+
+显式 `--aux-compute sparse|compact|dense` 和阶段覆盖项仍然生效。
+旧的 Aux 本地 K 阈值字段仅保留配置兼容性，不再控制 Aux auto；列宽比例
+和密度阈值用于 Main auto。普通 Main TopK 默认仍是 sparse，可用
+`--main-compute sparse` 显式指定，与 Aux 的 compact 策略独立。
 
 ### 自动切换与可调系统参数
 
-水位为 SHM 已占用槽位占总槽位的比例，包含正在写入的块；训练侧已取走的本地缓存不计入该水位。高水位说明输入积压，控制器尝试增加一个 SAE TP rank；低水位说明生产不足，尝试减少一个 SAE TP rank。扩容前必须先等待将加入 SAE 的 producer 排空异步写入并确认暂停，切换发生在完整 optimizer step 之间。
+水位为 SHM 已占用槽位占总槽位的比例，包含正在写入的块；训练侧已取走的本地缓存不计入该水位。高水位说明输入积压，控制器尝试增加一个 SAE TP rank；低水位说明生产不足，尝试减少一个 SAE TP rank。扩容前必须先等待将加入 SAE 的 producer 完成所选模式的交接确认，切换发生在完整 optimizer step 之间。
 
 | 参数 | 默认值 | 用途 |
 |---|---|---|
@@ -127,6 +274,9 @@ CUDA_VISIBLE_DEVICES=3,0,2 python run_sae_runner_gpu.py \
 | `--streaming-prefetch-chunks` | 2 | 训练侧一次补充、打乱的最大块数 |
 | `--elastic-tp-startup-timeout` | 300 秒 | producer 初始化 / 全卡启动预填充的超时限制 |
 | `--elastic-tp-pause-timeout` | 120 秒 | 切换等待 producer 排空与确认的超时限制 |
+| `--elastic-tp-resume-timeout` | 300 秒 | 缩容后等待 producer 重新加载/ready 的超时；也作为关闭时等待冷加载返回的宽限期 |
+| `--elastic-tp-vllm-residency` | `release` | `release` 关闭/重载，`resident` 保留暖权重 |
+| `--elastic-tp-release-tolerance-mib` | 64 MiB | 释放后比模型初始化前基线额外存活的 PyTorch 分配上限 |
 
 一般保留水位、采样和冷却默认值。短验收为了观察切换，可以缩小缓存并缩短采样/冷却，但这些不是日常启动必需参数。是否发生切换取决于实际生产、消费速率与水位；短任务可能在满足连续采样条件前就结束，处于 TP 下限或上限时也不会越界切换。
 
@@ -135,7 +285,7 @@ CUDA_VISIBLE_DEVICES=3,0,2 python run_sae_runner_gpu.py \
 | 类别 | 可复用参数 |
 |---|---|
 | 本地输入 | `--model-name`、`--dataset-path`、`--hook-name`、`--context-size`、`--store-batch-size-prompts`、`--max-model-len`、`--max-num-batched-tokens`、`--vllm-text-only` |
-| 训练规模 | `--d-sae`、`--k`、`--training-tokens`、`--train-batch-size-tokens`、`--dead-feature-window`、`--seed` |
+| 训练规模 | `--d-sae`、`--k`、`--training-tokens`、`--train-batch-size-tokens`、`--gradient-accumulation-steps`、`--dead-feature-window`、`--seed` |
 | 精度与执行策略 | `--vllm-dtype`、`--activation-dtype`、`--activation-conversion`、FP32 `--dtype`、Main/Aux storage/compute/stage 参数、TopK/AuxK 参数、`--tp-overlap`、`--tp-overlap-max-live-hooks` |
 | 缓存与输出 | `--streaming-num-chunks`、`--streaming-prefetch-chunks`、`--output-path`、`--no-save-final-sae`、`--no-save-final`、`--performance-only` |
 
@@ -156,11 +306,12 @@ CUDA_VISIBLE_DEVICES=3,0,2 python run_sae_runner_gpu.py \
 | `progress.json`、`train_rank0.jsonl` | 最新定期进度，以及完整 step、TP、水位、loss 和输入事件 |
 | `switches.json` | 每次已提交切换的 old/new ranks、触发原因、水位和迁移验证；未切换时可能不存在 |
 | `producerN.jsonl`、`producerN_status.json` | producer 暂停/恢复、生产 chunk、当前角色与 epoch |
+| `saeN_status.json` | 退出 SAE rank 的同 epoch 张量/allocator 释放确认或失败 |
 | `training_report.json` | 完成步数、tokens、唯一 chunk 数、切换记录与模型导出状态 |
 | `result.json` | supervisor 返回码、错误和所有子进程退出码 |
 | `train.log`、`producerN.log` | 初始化日志和失败 traceback |
 
-例如 `tail -f results/elastic_3gpu/train.log` 可查看训练日志。正常完成应有 `training_report.json` 中 `passed=true`，`result.json` 中 `returncode=0` 且所有 `process_returncodes` 为 0。确认零活跃 vLLM 应同时查看全卡 TP 下的 step 和各 producer 的 `paused` 记录，再检查低水位缩容后的 `running` 与新 `produced` 事件。
+例如 `tail -f results/elastic_3gpu/train.log` 可查看训练日志。正常完成应有 `training_report.json` 中 `passed=true`，`result.json` 中 `returncode=0` 且所有 `process_returncodes` 为 0。确认零活跃 vLLM 应同时查看全卡 TP 下的 step 和各 producer 的 `released`（release）或 `paused`（resident）记录，再检查低水位缩容后的 `running` 与新 `produced` 事件。输入已耗尽时允许同 epoch、已释放的 `done`，无需重新生产。训练完成后关闭 producer 失败也会令 `result.json` 非零；不能单看训练报告判断整个运行成功。
 
 结束或失败后 supervisor 负责停止其启动的进程并清理本次 SHM。失败时保留输出目录中的日志；重跑请换一个新输出目录，已有 `run_config.json` 的目录不会覆盖。库调用入口为 `sae_lens.elastic_tp_runner.ElasticTPSAETrainingRunner`，配置类为 `sae_lens.training.elastic_tp_config.ElasticTPConfig`；库调用设置 `min_tp` 时需同时保证 `initial_tp >= min_tp`。
 

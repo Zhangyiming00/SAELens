@@ -22,9 +22,14 @@ def snapshot(session):
                 ("encoder.weight", "encoder.bias", "decoder.weight")
             ):
                 p = model.get_parameter(name)
+                adam = optimizer.state.get(p, {})
                 for j, tensor in enumerate(
-                    (p, optimizer.state[p]["exp_avg"], optimizer.state[p]["exp_avg_sq"])
+                    (p, adam.get("exp_avg"), adam.get("exp_avg_sq"))
                 ):
+                    # A full-pool GA start can restore a producer before its
+                    # first optimizer update; Adam moments are still lazy.
+                    if tensor is None:
+                        continue
                     sample = (
                         tensor[:, 0] if i == 0 else tensor if i == 1 else tensor[-1, :]
                     )
@@ -33,16 +38,11 @@ def snapshot(session):
                 values[:, 9] = session.state.replicated[h + "/since_fired"]
                 values[:, 10] = session.state.replicated[h + "/firing_counts"]
                 p = model.b_dec
-                bias.copy_(
-                    torch.stack(
-                        (
-                            p,
-                            optimizer.state[p]["exp_avg"],
-                            optimizer.state[p]["exp_avg_sq"],
-                        ),
-                        dim=1,
-                    )
-                )
+                bias[:, 0].copy_(p)
+                adam = optimizer.state.get(p, {})
+                for j, name in enumerate(("exp_avg", "exp_avg_sq"), start=1):
+                    if name in adam:
+                        bias[:, j].copy_(adam[name])
         dist.all_reduce(values, group=groups.transfer)
         dist.all_reduce(bias, group=groups.transfer)
         result[h] = (values, bias)

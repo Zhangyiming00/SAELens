@@ -108,11 +108,11 @@ def add_v5_arguments(parser):
             'OpenAI sparse forward/dvalues page-row budget: auto (default) chooses 256 MiB. '
             'Explicit integer: 1..4096 MiB; excludes dweight sort/COO and whole-step memory.',
         '--sae-dispatch-k-metric':
-            'Metric for compute=auto: mean uses actual local entries / rows; max adds a GPU scalar readback.',
+            'Main auto metric: mean uses actual local entries / rows; max adds a GPU scalar readback.',
         '--sae-compact-max-ratio':
-            'For compute=auto, maximum compact-column / local-shard width ratio in [0,1]; default 0.5.',
+            'For Main compute=auto, maximum compact-column / local-shard width ratio in [0,1]; default 0.5. Aux auto does not use this cut.',
         '--sae-compact-min-density':
-            'For compute=auto, minimum entries / (rows * compact columns) in [0,1]; default 0.25.',
+            'For Main compute=auto, minimum entries / (rows * compact columns) in [0,1]; default 0.25. Aux auto does not use this cut.',
         '--sae-aux-k':
             'AuxK budget: omitted uses d_in//2, 0 disables AuxK, positive values cap selected dead features.',
     }
@@ -125,6 +125,11 @@ def add_v5_arguments(parser):
             option_help[f'--sae-{branch}-{stage}-threshold'] = (
                 f'Override the {branch} auto threshold for {stage}; omitted inherits its branch threshold.'
             )
+    for suffix in ('dense-threshold', *(stage + '-threshold' for stage in ('forward', 'dvalues', 'dweight'))):
+        option_help['--sae-aux-' + suffix] = (
+            'Legacy local-K threshold, retained for configuration compatibility. '
+            'Aux auto uses compact selected columns and global AuxK eligibility instead.'
+        )
     for flag, dest, key, typ, default, choices in option_specs():
         if flag in named:
             # Prior v4 optional runner integration is allowed. Do not duplicate
@@ -149,14 +154,14 @@ def add_v5_arguments(parser):
 def set_experiment_policy_defaults(parser):
     # None distinguishes an omitted branch policy from an explicit inherit.
     parser.set_defaults(sae_ragged_engine='openai', sae_main_compute=None, sae_aux_compute=None)
-    for branch, default in (('main', 'sparse'), ('aux', 'compact_dense')):
+    for branch, default in (('main', 'sparse'), ('aux', 'auto')):
         parser._option_string_actions[f'--sae-{branch}-compute'].help += (
             f' Experiment default: {default} for sharded_ragged, inherit otherwise.'
         )
 
 
 def resolve_experiment_policy_defaults(args, argv):
-    for branch, default in (('main', 'sparse'), ('aux', 'compact_dense')):
+    for branch, default in (('main', 'sparse'), ('aux', 'auto')):
         dest = f'sae_{branch}_compute'
         if getattr(args, dest) is None:
             old_flag = f'--sae-ragged-{branch}-compute'
@@ -257,7 +262,7 @@ def add_execution_arguments(parser):
             action.default = None
             help_text = (
                 "Independent decoder computation; none defaults to "
-                + ("sparse" if branch == "main" else "compact")
+                + ("sparse" if branch == "main" else "auto (compact selected dead columns; dense only for large global AuxK and a full local union)")
                 + "."
                 if stage == "compute"
                 else "Stage override; none inherits branch computation (backward sets dvalues/dweight)."

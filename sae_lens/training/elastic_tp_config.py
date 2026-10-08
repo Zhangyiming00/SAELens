@@ -39,10 +39,12 @@ def validate_local_sources(model: str, dataset: str) -> None:
 class ElasticTPConfig:
     """Single-node, single-hook FP32 SAE training over a fixed GPU pool.
 
-    Rank zero always trains. Other GPUs keep warm vLLM producers and join or
+    Rank zero always trains. Other GPUs host vLLM producers and join or
     leave the SAE TP group at optimizer boundaries as the SHM buffer fills.
     ``min_tp`` bounds training TP; it must leave room to restore a producer.
-    ``steps`` counts full ``batch_size`` token updates; the dataset cycles.
+    ``steps`` counts provider microbatches of ``batch_size`` tokens. One update
+    consumes up to ``gradient_accumulation_steps`` microbatches; the final
+    window may be shorter. The dataset cycles without increasing the budget.
     """
 
     model: str
@@ -53,6 +55,7 @@ class ElasticTPConfig:
     d_sae: int = 65536
     batch_size: int = 4096
     steps: int = 4000
+    gradient_accumulation_steps: int = 1
     dead: int = 1500
     k: int = 128
     lr: float = 3e-4
@@ -75,6 +78,9 @@ class ElasticTPConfig:
     watermark_samples: int = 3
     startup_timeout: float = 300.0
     pause_timeout: float = 120.0
+    resume_timeout: float = 300.0
+    vllm_residency: str = "release"
+    release_tolerance_mib: int = 64
     validate_activations: bool = False
     profile_only: bool = False
     audit_inputs: bool = False
@@ -89,6 +95,8 @@ class ElasticTPConfig:
 
     def __post_init__(self) -> None:
         self.output = Path(self.output).resolve()
+        if type(self.gradient_accumulation_steps) is not int or self.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be a positive integer")
         for name in (
             "d_in",
             "d_sae",
@@ -104,6 +112,10 @@ class ElasticTPConfig:
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
+        if self.vllm_residency not in ("release", "resident"):
+            raise ValueError("vllm_residency must be release or resident")
+        if type(self.release_tolerance_mib) is not int or self.release_tolerance_mib < 0:
+            raise ValueError("release_tolerance_mib must be a nonnegative integer")
         if (
             self.pool_size < 2
             or not 1 <= self.initial_tp <= self.pool_size <= self.d_sae
@@ -122,7 +134,7 @@ class ElasticTPConfig:
             raise ValueError("batch_size must contain whole context windows")
         if not 0 <= self.low < self.high <= 1:
             raise ValueError("watermarks must satisfy 0 <= low < high <= 1")
-        for name in ("lr", "poll_interval", "startup_timeout", "pause_timeout"):
+        for name in ("lr", "poll_interval", "startup_timeout", "pause_timeout", "resume_timeout"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")

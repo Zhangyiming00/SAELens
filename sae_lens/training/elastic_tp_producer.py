@@ -1,4 +1,4 @@
-"""Warm vLLM producers and asynchronous activation transport for elastic TP."""
+"""Releasable or resident vLLM producers for online elastic TP."""
 
 from __future__ import annotations
 
@@ -9,6 +9,12 @@ from sae_lens.training.elastic_tp_config import (
     activation_dtype,
     open_buffer,
     write_json,
+)
+from sae_lens.training.elastic_tp_handoff import (
+    cuda_memory,
+    read_status,
+    release_cuda_memory,
+    released,
 )
 
 
@@ -86,6 +92,46 @@ def capture_chunk_gpu(model, tokens, args, sequence):
     return result
 
 
+class ProducerModel:
+    """Keep CPU control/data state alive while destroying GPU model state."""
+
+    def __init__(self, args, device):
+        self.args, self.device = args, device
+        self.model = None
+        self.baseline = cuda_memory(device)["allocated"]
+        self.release_report = None
+
+    def load(self):
+        if self.model is None:
+            self.release_report = None
+            self.model = load_llm(self.args)
+
+    def quiesce(self, writer, *, release):
+        import torch
+
+        began = time.perf_counter()
+        writer.drain()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        drain_s = time.perf_counter() - began
+        if not release:
+            return dict(memory_released=False, memory=cuda_memory(self.device),
+                        drain_s=drain_s, close_s=0.0, quiesce_s=drain_s)
+        close_started = time.perf_counter()
+        if self.model is not None:
+            self.model.close()
+            self.model = None
+        close_s = time.perf_counter() - close_started
+        if self.release_report is None:
+            self.release_report = release_cuda_memory(
+                self.device, baseline_allocated=self.baseline,
+                tolerance_mib=self.args.release_tolerance_mib,
+            )
+        return dict(memory_released=True, memory=self.release_report,
+                    drain_s=drain_s, close_s=close_s,
+                    quiesce_s=time.perf_counter() - began)
+
+
 def producer(args):
     import torch
 
@@ -96,12 +142,15 @@ def producer(args):
 
     torch.set_num_threads(1)
     tokens = load_tokens(args)
-    buffer = model = log = writer = None
+    buffer = lifecycle = log = writer = None
+    status_path = args.output / f"producer{args.producer_id}_status.json"
+    control_path = args.output / "producer_control.json"
+    sae_status_path = args.output / f"sae{args.producer_id}_status.json"
+    control = dict(epoch=0)
     try:
         buffer = open_buffer(args)
-        model = load_llm(args)
-        status_path = args.output / f"producer{args.producer_id}_status.json"
-        control_path = args.output / "producer_control.json"
+        device = torch.device("cuda", torch.cuda.current_device())
+        lifecycle = ProducerModel(args, device)
         previous = None
         log = AsyncJsonlWriter(args.output / f"producer{args.producer_id}.jsonl")
         in_flight = {}
@@ -131,7 +180,7 @@ def producer(args):
 
         writer = AsyncVLLMShmWriter(
             buffer=buffer,
-            device=torch.device("cuda", torch.cuda.current_device()),
+            device=device,
             dtype=getattr(torch, activation_dtype(args)),
             max_rows=args.batch_size,
             d_model=args.d_in,
@@ -139,26 +188,71 @@ def producer(args):
             staging_slots=2,
             on_written=on_written,
         )
+        if args.vllm_residency == "resident":
+            lifecycle.load()
+        active = terminal = False
+
+        def publish(state, *, ready, **data):
+            nonlocal previous
+            payload = dict(epoch=control["epoch"], state=state, ready=ready,
+                           mode=args.vllm_residency, **data)
+            write_json(status_path, payload)
+            record("role", **payload)
+            previous = (control["epoch"], state)
+
         while True:
             control = json.loads(control_path.read_text())
-            if control["stop"] or int(buffer._header[3]) >= args.steps:
+            if control["stop"]:
                 break
-            paused = args.producer_id < control["tp"]
-            state = (control["epoch"], "paused" if paused else "running")
-            if state != previous:
-                # A pause acknowledgement hands this GPU to SAE. Publish all
-                # submitted chunks before ACK, including CPU SHM writes; CUDA
-                # synchronization alone does not drain the background writer.
-                writer.drain()
-                torch.cuda.synchronize()
-                write_json(
-                    status_path, dict(epoch=state[0], state=state[1], ready=True)
-                )
-                record("role", epoch=state[0], state=state[1])
-                previous = state
-            if paused:
+            if int(buffer._header[3]) >= args.steps or terminal:
+                if previous != (control["epoch"], "done"):
+                    # Close and release BEFORE publishing terminal readiness.
+                    # Stay alive to acknowledge later epochs without reloading.
+                    memory = lifecycle.quiesce(writer, release=True)
+                    if not terminal:
+                        buffer.signal_done()
+                    terminal, active = True, False
+                    publish("done", ready=True, **memory)
                 time.sleep(0.02)
                 continue
+            paused = args.producer_id < control["tp"]
+            if paused:
+                state = "released" if args.vllm_residency == "release" else "paused"
+                if previous != (control["epoch"], state):
+                    publish("releasing" if state == "released" else "draining",
+                            ready=False, memory_released=False)
+                    memory = lifecycle.quiesce(writer, release=state == "released")
+                    active = False
+                    publish(state, ready=True, **memory)
+                time.sleep(0.02)
+                continue
+
+            if not active:
+                # During startup there is no SAE process yet. Every later
+                # resume needs the departing SAE worker's matching release ACK,
+                # even in resident mode; the two allocators are process-local.
+                if not control.get("startup", False) and not released(
+                    read_status(sae_status_path), control["epoch"]
+                ):
+                    if previous != (control["epoch"], "waiting_for_sae_release"):
+                        publish("waiting_for_sae_release", ready=False,
+                                memory_released=lifecycle.model is None)
+                    time.sleep(0.02)
+                    continue
+                publish("loading", ready=False, memory_released=False)
+                began = time.perf_counter()
+                lifecycle.load()
+                torch.cuda.synchronize(device)
+                loaded_control = json.loads(control_path.read_text())
+                if loaded_control != control:
+                    # A pause/stop can arrive during a cold load. Never publish
+                    # stale running readiness or allocate a chunk for that epoch.
+                    continue
+                active = True
+                publish("running", ready=True, memory_released=False,
+                        load_s=time.perf_counter() - began)
+            elif previous != (control["epoch"], "running"):
+                publish("running", ready=True, memory_released=False, load_s=0.0)
 
             def interrupted():
                 current = json.loads(control_path.read_text())
@@ -169,7 +263,7 @@ def producer(args):
                 continue
             slot, sequence = ticket
             began = time.perf_counter()
-            chunk = capture_chunk_gpu(model, tokens, args, sequence)
+            chunk = capture_chunk_gpu(lifecycle.model, tokens, args, sequence)
             capture_s = time.perf_counter() - began
             in_flight[sequence] = dict(began=began, epoch=control["epoch"])
             submit_started = time.perf_counter()
@@ -194,9 +288,14 @@ def producer(args):
                 cycle_s=time.perf_counter() - began,
                 staging_wait_s=staging_wait_s,
             )
-        writer.close()
-        buffer.signal_done()
-        write_json(status_path, dict(epoch=control["epoch"], state="done", ready=True))
+        memory = lifecycle.quiesce(writer, release=True)
+        if not terminal:
+            buffer.signal_done()
+        publish("done", ready=True, **memory)
+    except BaseException as exc:
+        write_json(status_path, dict(epoch=control["epoch"], state="failed",
+                                    ready=False, memory_released=False, error=repr(exc)))
+        raise
     finally:
         try:
             if writer is not None:
@@ -207,8 +306,8 @@ def producer(args):
                     log.close()
             finally:
                 try:
-                    if model is not None:
-                        model.close()
+                    if lifecycle is not None and writer is not None:
+                        lifecycle.quiesce(writer, release=True)
                 finally:
                     if buffer is not None:
                         buffer.close()

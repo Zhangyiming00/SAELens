@@ -10,10 +10,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import math
-from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 MODES = ('inherit', 'sparse', 'local_dense', 'compact_dense', 'auto')
 STAGES = ('forward', 'dvalues', 'dweight')
@@ -70,7 +68,7 @@ def branch_compute(cfg, auxiliary=False):
     value = computation(
         getattr(cfg, ("aux" if auxiliary else "main") + "_compute", None)
     )
-    return ("compact" if auxiliary else "sparse") if value == "none" else value
+    return ("auto" if auxiliary else "sparse") if value == "none" else value
 
 
 def stage_requests(cfg, auxiliary=False):
@@ -173,13 +171,16 @@ def requests(cfg, auxiliary=False):
 
 
 def choose_plan(cfg, *, auxiliary, rows, width, entries, columns=None,
-                max_k=None, select_all=False):
+                max_k=None, select_all=False, aux_global_k=None):
     """Pure host policy. K means REAL local entries, never global K/TP.
 
     `mean` requires no additional GPU readback after packing; `max` has an
     explicit one-scalar readback at the caller. Thresholds are strict > cuts.
-    Compact auto requires a useful column reduction and enough within-compact
-    density. Explicit modes do not silently fall back on allocation/JIT errors.
+    Main auto uses local K/column-density cuts. Aux auto normally compacts its
+    exact selected columns, independent of local K and local shard ratios.
+    Aux can omit compaction only for an explicitly large global budget whose
+    effective global selection is still large and whose local union is full.
+    Explicit modes do not silently fall back on allocation/JIT errors.
     """
     branch = 'aux' if auxiliary else 'main'
     metric = (entries / max(rows, 1) if getattr(cfg, 'v5_k_metric', 'mean') == 'mean'
@@ -195,9 +196,18 @@ def choose_plan(cfg, *, auxiliary, rows, width, entries, columns=None,
             threshold = getattr(cfg, f'v5_{branch}_threshold', 512)
         if requested != 'auto':
             mode, reason = requested, 'explicit/inherited'
-        elif auxiliary and select_all:
-            mode = 'compact_dense' if compact_ok or columns == 0 else 'local_dense'
-            reason = 'all eligible selected; regular submatrix'
+        elif auxiliary:
+            configured = getattr(cfg, 'auxk', None)
+            global_width = getattr(cfg, 'd_sae', None)
+            large_selection = (configured is not None and global_width is not None
+                               and aux_global_k is not None
+                               and configured * 2 >= global_width
+                               and aux_global_k * 2 >= global_width)
+            if large_selection and columns == width:
+                mode, reason = 'local_dense', 'large explicit global AuxK; effective selection large; local union is full'
+            else:
+                mode, reason = 'compact_dense', ('all eligible selected; regular submatrix'
+                                               if select_all else 'Aux compacts actual selected columns')
         elif metric <= threshold:
             mode, reason = 'sparse', f'local K <= {threshold}'
         else:
@@ -234,15 +244,49 @@ def _columns(acts, known_columns=None):
     return columns, inverse
 
 
-def make_plan(acts, cfg, auxiliary=False, known_columns=None):
+@torch.no_grad()
+def _selected_columns(acts):
+    """Exact union, including selected zeros, without sorting all B*K entries.
+
+    The bitmap has local-shard width. Duplicate IDs write the same True value.
+    Its dynamic nonzero is only needed when a compact decoder is a candidate;
+    explicit sparse Aux and the regular select-all shortcut skip it.
+    """
+    used = torch.zeros(acts.width, dtype=torch.bool, device=acts.device)
+    used.scatter_(0, acts.feature_ids, True)
+    return used.nonzero(as_tuple=True)[0]
+
+
+def make_plan(acts, cfg, auxiliary=False, known_columns=None, *, aux_global_k=None):
     maximum = None
     if getattr(cfg, 'v5_k_metric', 'mean') == 'max':
         maximum = int(acts.row_offsets.diff().max()) if acts.nrows else 0
-    count = None if known_columns is None else known_columns.numel()
+    select_all = acts.selection == 'select_all'
+    # Only select-all makes eligible columns an exact selected-column union.
+    # TopK/complement may leave many of these columns unused across the batch.
+    count = (known_columns.numel() if known_columns is not None
+             and (not auxiliary or select_all) else None)
     plan = choose_plan(cfg, auxiliary=auxiliary, rows=acts.nrows, width=acts.width,
                        entries=acts.nnz, columns=count, max_k=maximum,
-                       select_all=acts.selection == 'select_all')
+                       select_all=select_all, aux_global_k=aux_global_k)
     requested = requests(cfg, auxiliary)
+    if auxiliary:
+        # Actual per-rank selections already reflect min(auxk, global_dead).
+        # Never substitute auxk/TP: ownership and winner counts can be uneven.
+        consider_compact = 'compact_dense' in requested or plan.needs_compact
+        columns = inverse = None
+        if consider_compact:
+            with phase(plan.branch, 'column_map'):
+                union = (known_columns if select_all and known_columns is not None
+                         else _selected_columns(acts))
+                plan = choose_plan(cfg, auxiliary=True, rows=acts.nrows, width=acts.width,
+                                   entries=acts.nnz, columns=union.numel(), max_k=maximum,
+                                   select_all=select_all, aux_global_k=aux_global_k)
+                # Sparse/dense plans need no E-sized inverse map, even when
+                # the union was inspected to rule out compact computation.
+                if plan.needs_compact:
+                    columns, inverse = _columns(acts, union)
+        return plan, columns, inverse
     # Only discover Main's union when explicitly requested or when an auto
     # dense stage might benefit. Small-K sparse never pays torch.unique.
     discover = ('compact_dense' in requested or plan.needs_compact or
@@ -356,9 +400,9 @@ def _dense_tile(values, ids, rows, lo, hi, a, b, width):
     return out
 
 
-def decode_adaptive(acts, vectors, cfg, *, auxiliary=False, known_columns=None):
+def decode_adaptive(acts, vectors, cfg, *, auxiliary=False, known_columns=None, aux_global_k=None):
     """Return output and scalar-only diagnostics; never stores a cross-step cache."""
-    plan, columns, inverse = make_plan(acts, cfg, auxiliary, known_columns)
+    plan, columns, inverse = make_plan(acts, cfg, auxiliary, known_columns, aux_global_k=aux_global_k)
     dtype = computation_dtype(vectors)
     with torch.autocast(device_type=vectors.device.type, enabled=False):
         out = _HybridDecoder.apply(vectors.to(dtype), acts.values.to(dtype), acts.feature_ids,
@@ -368,6 +412,8 @@ def decode_adaptive(acts, vectors, cfg, *, auxiliary=False, known_columns=None):
     info.update(plan.diagnostics())
     info['k_metric'] = getattr(cfg, 'v5_k_metric', 'mean')
     info['workspace_mib'] = getattr(cfg, 'v5_workspace_mib', DEFAULT_COMPUTE_WORKSPACE_MIB)
+    if auxiliary:
+        info['global_selected_per_token'] = aux_global_k
     return out.reshape(*acts.leading_shape, vectors.shape[1]), info
 
 
@@ -387,7 +433,7 @@ def try_direct_aux(scores, eligible, num_dead, k_aux, weight, norm, cfg, *, know
     if (rows*m + weight.shape[0]*m)*max(4, weight.element_size()) > (getattr(cfg, 'v5_workspace_mib', DEFAULT_COMPUTE_WORKSPACE_MIB) << 20):
         return None
     plan = choose_plan(cfg, auxiliary=True, rows=rows, width=scores.shape[-1], entries=rows*m,
-                       columns=m, max_k=m, select_all=True)
+                       columns=m, max_k=m, select_all=True, aux_global_k=min(num_dead, k_aux))
     if (plan.forward, plan.dvalues, plan.dweight) != ('compact_dense',)*3:
         return None
     from sae_lens.auxk_compact import _DeadColumnValues, compact_aux_decode

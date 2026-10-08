@@ -32,6 +32,8 @@ def main():
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--auxk", type=int)
     parser.add_argument("--batch-size", type=int, default=8192)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                        help="Microbatches per optimizer update; --batch-size is the microbatch size.")
     parser.add_argument("--cache-batches", type=int, default=4)
     parser.add_argument(
         "--activation-dtype", choices=("none", "float32", "bfloat16"),
@@ -61,8 +63,8 @@ def main():
     )
     parser.add_argument("--tp-overlap-max-live-hooks", type=int, default=2)
     args = parser.parse_args()
-    if min(args.steps, args.batch_size, args.cache_batches) < 1:
-        parser.error("steps, batch-size and cache-batches must be positive")
+    if min(args.steps, args.batch_size, args.cache_batches, args.gradient_accumulation_steps) < 1:
+        parser.error("steps, batch-size, cache-batches and gradient-accumulation-steps must be positive")
     if args.checkpoint_every < 0:
         parser.error("checkpoint-every cannot be negative")
     if args.profile_only and (args.checkpoint_every or args.checkpoint_final):
@@ -129,12 +131,13 @@ def main():
                     args.activation_dtype, args.activation_conversion,
                 ) for h in args.hooks
             }
+            microbatches = args.steps * args.gradient_accumulation_steps
             if any(
-                len(s) != 2 or s[0] < args.steps * args.batch_size
+                len(s) != 2 or s[0] < microbatches * args.batch_size
                 for s in shapes.values()
             ):
                 raise ValueError(
-                    "Each activation tensor needs [steps*batch_size, d_in] rows; no cycling or discarded tokens"
+                    "Each activation tensor needs [steps*gradient_accumulation_steps*batch_size, d_in] rows; no cycling or discarded tokens"
                 )
             configs = {
                 h: TopKTrainingSAEConfig(
@@ -159,6 +162,7 @@ def main():
                 adam_kwargs={"fused": args.backend == "nccl"},
                 tp_overlap=args.tp_overlap,
                 tp_overlap_max_live_hooks=args.tp_overlap_max_live_hooks,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
             )
             provider = None
             if args.resume or args.checkpoint_every or args.checkpoint_final:
@@ -168,6 +172,7 @@ def main():
                     {
                         "activation_sha256": _digest(Path(args.activations)),
                         "batch_size": args.batch_size,
+                        "gradient_accumulation_steps": args.gradient_accumulation_steps,
                         "hooks": args.hooks,
                         "activation_dtypes": input_dtypes,
                     }
@@ -181,6 +186,7 @@ def main():
                 # Old checkpoints used FP32 transport unconditionally.
                 old_dtype = restored_provider.pop("activation_dtype", "float32")
                 restored_provider.setdefault("activation_dtypes", {h: old_dtype for h in args.hooks})
+                restored_provider.setdefault("gradient_accumulation_steps", 1)
                 if restored_provider != provider:
                     raise ValueError(
                         "Resume activation source/batching differs from checkpoint"
@@ -200,30 +206,32 @@ def main():
                     following = [s for s in events if s > step]
                     if following:
                         session.prepare(schedule[following[0]])
-                batches = {}
-                cache_empty = (
-                    not session.state.activation_caches
-                    or not next(iter(session.state.activation_caches.values())).shape[0]
-                )
-                if rank in groups.active_ranks and cache_empty:
-                    rows = min(args.cache_batches, args.steps - step) * args.batch_size
-                    for h, shape in shapes.items():
-                        batch = (
-                            source.get_slice(h)[
-                                step * args.batch_size : step * args.batch_size + rows
-                            ].to(device, getattr(torch, input_dtypes[h]))
-                            if rank == groups.active_ranks[0]
-                            else torch.empty(rows, shape[1], device=device,
-                                             dtype=getattr(torch, input_dtypes[h]))
-                        )
-                        dist.broadcast(
-                            batch, src=groups.active_ranks[0], group=groups.active_group
-                        )
-                        batches[h] = batch
-                    session.stage_inputs(batches)
-                    batches.clear()
-                    del batch
-                loss = session.train_cached_step(args.batch_size)
+                for micro in range(args.gradient_accumulation_steps):
+                    cursor = step * args.gradient_accumulation_steps + micro
+                    batches = {}
+                    cache_empty = (
+                        not session.state.activation_caches
+                        or not next(iter(session.state.activation_caches.values())).shape[0]
+                    )
+                    if rank in groups.active_ranks and cache_empty:
+                        rows = min(args.cache_batches, microbatches - cursor) * args.batch_size
+                        for h, shape in shapes.items():
+                            batch = (
+                                source.get_slice(h)[
+                                    cursor * args.batch_size : cursor * args.batch_size + rows
+                                ].to(device, getattr(torch, input_dtypes[h]))
+                                if rank == groups.active_ranks[0]
+                                else torch.empty(rows, shape[1], device=device,
+                                                 dtype=getattr(torch, input_dtypes[h]))
+                            )
+                            dist.broadcast(
+                                batch, src=groups.active_ranks[0], group=groups.active_group
+                            )
+                            batches[h] = batch
+                        session.stage_inputs(batches)
+                        batches.clear()
+                        del batch
+                    loss = session.train_cached_microbatch(args.batch_size)
                 if rank == groups.active_ranks[0]:
                     print(
                         json.dumps(
@@ -232,6 +240,8 @@ def main():
                                 step=step + 1,
                                 tp=len(groups.active_ranks),
                                 loss={h: float(v) for h, v in loss.items()},
+                                tokens=session.state.progress["tokens"],
+                                microbatches=args.gradient_accumulation_steps,
                             )
                         ),
                         flush=True,
