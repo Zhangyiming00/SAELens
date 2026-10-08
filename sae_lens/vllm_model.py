@@ -1275,12 +1275,18 @@ class HookedVLLMModel:
         # permanent vLLM rank in another process.
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.utils.func_utils import supports_kw
+        from vllm.v1.sample.ops.topk_topp_triton import reset_buffer_cache
 
         supports_kw.cache_clear()
         # get_rope() caches module instances, including their CUDA
         # cos_sin_cache buffer. The storage release above intentionally empties
         # that buffer, so a later cold start must build a fresh RoPE module.
         _ROPE_DICT.clear()
+        # Sampler warmup stores per-SM, vocabulary-sized CUDA workspaces in
+        # module globals, outside the engine/model runner object graph. They
+        # can exceed the handoff budget by themselves and must be recreated
+        # lazily on the next cold start, just like the RoPE cache.
+        reset_buffer_cache()
         self._closed = True
         # Drop the locals that rooted the now-detached vLLM graph before asking
         # the caching allocator to return its blocks to the CUDA driver.

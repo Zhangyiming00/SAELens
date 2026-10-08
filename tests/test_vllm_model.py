@@ -497,11 +497,14 @@ def test_close_detaches_inprocess_model_and_kv_state(monkeypatch):
     import sae_lens.vllm_model as vllm_model_module
     from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
     from vllm.utils.func_utils import supports_kw
+    from vllm.v1.sample.ops import topk_topp_triton
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     cache_clear = MagicMock(wraps=supports_kw.cache_clear)
     monkeypatch.setattr(supports_kw, "cache_clear", cache_clear)
     _ROPE_DICT[("close-test",)] = object()  # type: ignore[assignment]
+    topk_topp_triton._TRITON_BUFFER_CACHE[(torch.device("cpu"), torch.float32, 7)] = torch.ones(2, 7)
+    topk_topp_triton._TRITON_TABLE_CACHE[torch.device("cpu")] = (torch.ones(1), torch.ones(1))
     hook_handle = MagicMock()
     memory_handle = MagicMock()
     raw_model = SimpleNamespace(
@@ -561,6 +564,8 @@ def test_close_detaches_inprocess_model_and_kv_state(monkeypatch):
     assert not hasattr(model, "llm")
     cache_clear.assert_called_once_with()
     assert not _ROPE_DICT
+    assert not topk_topp_triton._TRITON_BUFFER_CACHE
+    assert not topk_topp_triton._TRITON_TABLE_CACHE
     assert vllm_model_module._CUDA_IPC_PINNED == {}
 
 

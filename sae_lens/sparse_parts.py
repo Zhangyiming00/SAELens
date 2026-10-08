@@ -28,7 +28,7 @@ def sparse_forward(vectors, values, ids, rows, offsets, opts):
         vv, aa = _openai_inputs(vectors, values)
         if opts['forward_mode'] == 'coo':
             out = a._coo_multiply(ids, rows, aa, vv, offsets.numel()-1)
-            return out[:, :vectors.shape[1]].to(values.dtype), None
+            return out[:, :vectors.shape[1]].to(values.dtype).contiguous(), None
         groups = a.page_groups(offsets, vectors.shape[0], opts['page_k'])
         out = vv.new_zeros((offsets.numel()-1, vv.shape[1]))
         for group in groups:
@@ -37,7 +37,10 @@ def sparse_forward(vectors, values, ids, rows, offsets, opts):
                 rr = group.rows[begin:begin+tile]
                 ii, av, _, _ = a._page(offsets, ids, aa, group, rr)
                 out.index_add_(0, rr, a._forward_page(vv, ii, av))
-        return out[:, :vectors.shape[1]].to(values.dtype), groups
+        # Removing power-of-two padding leaves a strided view (e.g. d_in=5120
+        # padded to 8192). Megatron's reduce mapping reduces input.contiguous()
+        # but returns input, so a strided result silently loses the TP sum.
+        return out[:, :vectors.shape[1]].to(values.dtype).contiguous(), groups
     if engine == 'triton':
         from sae_lens.ragged_sae_triton import forward
         return forward(vectors, values, ids, offsets), None

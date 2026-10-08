@@ -22,6 +22,17 @@
 
 动态 session 使用原生 Megatron encoder/decoder 与现有 sharded TopK/AuxK。`tp_overlap=off/eager/lazy/bounded` 复用原有 `forward_tp_wavefront` / `PendingWavefrontOutputs` 调度；bounded 的窗口由 `tp_overlap_max_live_hooks` 指定，每个完整 step 后才能切换。它尚未接入原 MultiSAETrainer 的 DDP optimizer-overlap、完整日志/调度器体系，不支持动态 DP/ZeRO、AMP 或部分 GA 窗口。不能把这个独立入口的耗时直接当成旧 runner 的性能对照。已有训练数据应按原有方式先做 activation scaling，入口要求 `normalize_activations=none`。
 
+## 2026-10-08 H100 v29 数值与卸载修复
+
+`v29-sparse-colocated-20261008-external.tar.gz` 和 `v29-sparse-elastic-tp-20261008-external.tar.gz` 的 `sae_lens` 源码与当时远端 `origin/main@1e02754` 一致。该版本存在以下两个已在当前工作区修复的问题：
+
+- **非二次幂输入宽度的 OpenAI 稀疏前向漏掉 TP 求和。** 独立计算策略路径把 `d_in=5120` 补到 8192 后，切回原宽度时留下非连续输出。Megatron 的 reduce mapping 在 `input.contiguous()` 副本上求和，却返回原输入，各 rank 因而看到自己的局部重建。修复在稀疏前向出口恢复连续布局，覆盖 bucketed 和 COO 两种适配。`d_in=4096` 的此前测试没有触发此问题；TP1 也不涉及这个跨 rank 求和错误。该问题影响 Main，不能通过调整 AuxK、学习率或日志缩放解决。
+- **vLLM 采样器的全局 CUDA 缓存未随模型卸载。** 只清理 engine/model runner 无法释放 `_TRITON_BUFFER_CACHE` 和 `_TRITON_TABLE_CACHE`。`HookedVLLMModel.close()` 现在调用 vLLM 自带 `reset_buffer_cache()`。没有提高 `release_tolerance_mib`；冷加载会按需重建缓存。
+
+当前集群为 RTX 5090，未运行 H100 原 Qwen3.6-27B 模型。原维度 SAE 的 TP4、GA2 固定状态对照覆盖 sharded_dense/sharded_ragged、eager/bounded、前向、梯度、参数、Adam 和 firing ages；在线本地 Llama-3.1-8B 则使用同样的 `context=2048`、4 prompts 和 `max-num-batched-tokens=8192`，完成 TP2→TP3→TP2→TP3、GA2 以及 13 个微批的内容/消费审计。冷加载前后激活逐位相同，残留活跃内存为 8.125 MiB，低于原 64 MiB 限制。详细证据位于 `results/h100_v29_20261008/`。
+
+固定状态算子/更新一致不等于不同 FP32 算法的长期训练轨迹逐位相同。大维度独立轨迹在第五次更新出现一对近边界 TopK winner 交换，报告保留了该严格对照失败；逐更新对齐参数及 Adam 状态的对照通过。H100 原共置任务停在第 893 步且未保存退出原因，现有包仍不足以解释其终止原因。受错误 TP 重建影响的训练结果应重新运行，不能作为等价训练的性能结论。
+
 ## 主入口：在线 elastic TP
 
 在线 producer、异步 SHM 写入、水位控制、训练循环、迁移验证和进程管理均由 `sae_lens` 包提供。主入口为 `run_sae_runner_gpu.py`，运行和子进程启动均不依赖 `scripts/`、Git 元数据或仓库相对路径。用普通 Python 启动一次，入口自行创建固定的 worker pool；不要在外面再套 `torchrun`。
@@ -193,6 +204,57 @@ python -m pytest --confcutdir=tests/training \
 ```
 
 本次共通过 159 项测试（补丁 CPU 60、真实 Gloo 1、原生 GPU 2、runner/精度/显存回归 96），另有上述 4 项真实 vLLM 端到端运行。本机完整命令、NVML 采样、worker 日志和审计结果保存在 `results/elastic_handoff_20261008/`，汇总为 `summary.json`；`run_e2e.py --case <用例名> --tag <新目录名>` 可按记录的本地路径复现，`audit.py` 检查原始四组结果。
+
+#### 大 SAE 显存、迁移时间与恢复专项验收（2026-10-08）
+
+进一步使用三张 RTX 5090、本地 Llama-3.1-8B、`d_in=4096`、`d_sae=262145`、微批 128 tokens、Main K32、AuxK64、最低 SAE TP2。测试辅助 worker 记录显存和事件时间、保存并核对激活，调度与迁移仍调用原生产代码；这部分插桩只存在于测试目录，不改变正常启动流程。NVML 每 50 ms 采样，另记录 PyTorch 的分配峰值；短于采样间隔的驱动峰值可能没有被 NVML 捕获。
+
+| 用例 | 结果 |
+|---|---|
+| release，TP2 启动，GA3，49 微批 | 17 次更新，末尾 1 微批；6 次 TP2↔TP3 切换全部通过 |
+| release，TP3/零活跃 vLLM 启动，GA4，37 微批 | 10 次更新，末尾 1 微批；缓存仅 2 chunks，第一个更新前 TP3→TP2，通过 |
+| resident，其余配置同第一行 | OOM：常驻 vLLM 约 15.81 GiB，SAE 申请额外 1.33 GiB 时只剩约 1.1–1.2 GiB；未完成训练 |
+
+**显存归还。** 第一组的 producer 进程从约 16192 MiB 降到 728 MiB；四次真实关闭后的平台值相同，未观察到逐轮增长。释放后 PyTorch allocated 为 39.44 MiB、reserved 为 62 MiB。退出 SAE rank 在三次缩容后的 allocated 均为 16.25 MiB、reserved 均为 40 MiB。SAE 迁移峰值为 20.07 GiB，训练峰值为 24.16 GiB；两者是 PyTorch 分配量，不能代替驱动总占用。保留的训练 ranks 仍会缓存 allocator 块，NVML 不会随每次扩容立即降到新分片的理论大小。
+
+**卸载位置与顺序。** `elastic_tp_producer.ProducerModel.quiesce()` 在对应 producer 进程的本地 GPU 上先 drain 异步输出，再调用 `HookedVLLMModel.close()`，最后发布释放 ACK。权重 storage 被销毁，CPU 只留下空占位张量，不把完整权重 offload 到 CPU；该次关闭前后 RSS 变化不超过 0.12 MiB。三次加入事件中，producer 的释放 ACK 均早于任一 SAE rank 开始迁移，间隔约 12–37 ms。缩容由 `elastic_tp_trainer` 先完成迁移，再调用 `release_inactive_sae()`；三次 producer 重新加载均晚于同卡 SAE release ACK，间隔约 20–27 ms。全卡启动用例中，两张 producer 卡都在 SAE 初始化前约 5.85 秒完成释放。恢复读取已有本地模型；缓存中的激活和输入游标继续使用。
+
+**迁移时间。** 第一组中，初始化 Adam 后的五次迁移测量如下；第 0 步尚无 Adam moments，核心迁移为 217 ms，未混入表中。正式测量包含诊断开销，不是关闭诊断后的吞吐基准。
+
+| 阶段 | 范围 | 中位数 |
+|---|---:|---:|
+| 迁移前检查 | 41.5–47.7 ms | 44.8 ms |
+| 目标状态分配 | 29.8–82.1 ms | 59.7 ms |
+| 参数/Adam 等传输，约 8 GiB | 245.9–261.4 ms | 252.2 ms |
+| 提交通信域与状态 | 1.9–2.8 ms | 2.3 ms |
+| 核心迁移 `pause_s_max` | 321–393 ms | 360 ms |
+| 含诊断和 SAE 释放的 `handoff_s` | 381–833 ms | 739 ms |
+| 从请求到提交 | 479–863 ms | 766 ms |
+| 缩容后 vLLM 冷恢复，单独计时 | 3.43–3.56 s | 3.55 s |
+
+**恢复和数据完整性。** 两组成功运行共 86 个微批、11008 tokens。验证生产、发布、加载的 chunk 序号恰好覆盖预算，原始 token 窗口索引互不重复；反转 shuffle 后，SHM 数据与 producer 捕获数据逐字节相同；每次实际训练的微批哈希与缓存消费顺序相同，且每个 active rank 一致。另外从重载前、三次重载后以及末尾选取五个块，用另一个新加载且未切换的 vLLM 重算，激活逐位一致。
+
+新增 `tests/training/test_elastic_tp_handoff_native.py` 使用始终 TP1 的独立参考，以两个 hook（`d_in=64`，`d_sae=257/263`）检查完整状态，覆盖 BF16 输入、不等长 GA3 微批、短尾窗口、不等宽分片、非连续 ranks 和 off/bounded 两种调度，共比较 18 次更新。迁移前后检查全部参数、Adam 一阶/二阶矩与 step、dead/firing 状态、进度和剩余缓存；TP3 保存后在 TP2 加载 checkpoint 也逐位一致。与固定 TP1 参考的训练结果最大绝对误差为 `4.66e-8`。大 SAE 运行仍使用生产路径中的参数/Adam 坐标采样检查，不能把小规模全状态对照说成大 SAE 全量参数对照。
+
+**异常退出修复。** 压力测试曾发现 resident OOM 后，`elastic_tp_trainer.train()` 的 `finally` 无条件调用 `TPGroupPair.close()`；OOM rank 在控制 barrier 等待，另一 rank 仍处于 CUDA collective，导致额外等待约 180 秒，整次任务约 293 秒才结束。
+
+现已将失败清理与正常清理分开：训练初始化或训练期间发生异常时，先在 CPU 上写出 `train_rankN_error.json`，保存 rank、PID、时间、原始异常类型/信息和 traceback；失败路径不等待输入 loader 的 CUDA event，也不再调用 CUDA synchronize、barrier 或 communicator destruction。supervisor 在轮询中检测这些错误文件，保留最早的原始错误，立即终止整个训练进程组，然后停止 producer 并销毁 SHM。即使 worker 的解释器/CUDA 析构尚未退出，也能通过错误文件启动清理。
+
+使用完全相同的 resident 大 SAE 配置复测，仍如预期触发 OOM，但从错误文件发布到最终失败结果仅 **2.12 秒**，完整任务 **41.62 秒**；日志没有 180 秒 collective/barrier 超时，原始 `OutOfMemoryError` 出现在最终 `result.json`。全部进程退出、SHM 删除，四卡显存均回到约 1 MiB。另有正常 release、GA4、三卡全 SAE 启动及 TP 迁移回归通过。CPU 协议/GA/失败测试 69 项、runner 回归 63 项通过；其中新增 9 项覆盖初始化/训练失败、取消、错误报告写入失败以及训练进程未退出时的及时终止。证据汇总为 `results/elastic_tp_failure_20261008/summary.json`。修复解决的是失败退出等待，不会让原本显存不足的 resident 配置自动恢复训练。
+
+本机证据目录为 `results/elastic_handoff_deep_20261008/`：`summary.json` 汇总通过和失败用例，`memory_and_handoff.png/.svg` 展示显存与阶段耗时，各用例的 `deep_audit.json` 保存逐次检查结果。复现方式：
+
+```bash
+# 本机脚本中的模型/数据均为已有本地目录；--tag 必须使用新目录名
+python results/elastic_handoff_deep_20261008/run.py --case pressure_release --tag repeat_release
+python results/elastic_handoff_deep_20261008/run.py --case pressure_full_start --tag repeat_full
+# resident 用例用于复现上述 OOM 与异常退出问题，预期失败
+python results/elastic_handoff_deep_20261008/run.py --case pressure_resident --tag repeat_resident
+
+# 需要三张可见 GPU；使用项目兼容的本地依赖环境
+python -m pytest --confcutdir=tests/training \
+  tests/training/test_elastic_tp_handoff_native.py -q
+```
 
 ### 零活跃 vLLM：训练中进入，或从全卡 SAE 启动
 

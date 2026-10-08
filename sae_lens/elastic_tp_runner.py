@@ -128,6 +128,24 @@ def stop_process(process: subprocess.Popen, *, grace_s: float = 20) -> None:
             process.wait()
 
 
+def raise_for_training_failure(cfg: ElasticTPConfig) -> None:
+    """Observe rank-local errors before waiting for torchrun/CUDA teardown."""
+    failures = []
+    for rank in range(cfg.pool_size):
+        path = cfg.output / f"train_rank{rank}_error.json"
+        try:
+            record = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue
+        failures.append((record, path))
+    if failures:
+        record, path = min(failures, key=lambda item: item[0]["timestamp"])
+        raise RuntimeError(
+            f"Elastic TP rank {record['rank']} failed: "
+            f"{record['error_type']}: {record['error']}; see {path}"
+        )
+
+
 def wait_for_producers(cfg, producers, *, tp, epoch):
     """Finish startup handoffs before any initial SAE tensors are allocated."""
     started = time.monotonic()
@@ -294,6 +312,7 @@ class ElasticTPSAETrainingRunner:
             )
             last_status = -float("inf")
             while training.poll() is None:
+                raise_for_training_failure(cfg)
                 if any(p.poll() not in (None, 0) for p in producers):
                     raise RuntimeError(
                         "A vLLM producer failed during training; see producer logs"
@@ -309,6 +328,7 @@ class ElasticTPSAETrainingRunner:
                     last_status = time.perf_counter()
                 time.sleep(1)
             returncode = training.returncode
+            raise_for_training_failure(cfg)
             if returncode:
                 raise RuntimeError(
                     f"Elastic TP training exited with code {returncode}; see {cfg.output / 'train.log'}"
@@ -340,7 +360,9 @@ class ElasticTPSAETrainingRunner:
                         # A stop can arrive inside a non-interruptible cold
                         # load. Let it return and close before escalating.
                         stop_process(
-                            process, grace_s=20 if process is training else cfg.resume_timeout
+                            process,
+                            grace_s=(0 if error else 20)
+                            if process is training else cfg.resume_timeout,
                         )
                 finally:
                     if not returncode and any(p.returncode != 0 for p in processes):

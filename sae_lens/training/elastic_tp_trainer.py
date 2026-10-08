@@ -9,6 +9,8 @@ import math
 import os
 import statistics
 import time
+import traceback
+from contextlib import suppress
 
 from sae_lens.training.elastic_tp_config import (
     activation_dtype,
@@ -155,11 +157,14 @@ def train(args):
 
     from sae_lens.training.dynamic_tp_input import DynamicTPInputLoader
 
-    session = setup_session(args, initial_tp=args.initial_tp)
-    groups = session.groups
-    rank = groups.rank
+    groups = None
+    rank = int(os.environ.get("RANK", "0"))
     buffer = input_loader = log = None
+    failed = False
     try:
+        session = setup_session(args, initial_tp=args.initial_tp)
+        groups = session.groups
+        rank = groups.rank
         buffer = open_buffer(args) if rank == 0 else None
         input_loader = (
             DynamicTPInputLoader(
@@ -595,12 +600,39 @@ def train(args):
                     },
                 ),
             )
+    except BaseException as exc:
+        failed = True
+        if groups is not None:
+            groups.failed = True
+        # Report without CUDA or collectives: another rank can be stuck in a
+        # queued NCCL operation after this rank's OOM. The supervisor observes
+        # this file even if interpreter/CUDA teardown cannot finish promptly.
+        try:
+            write_json(
+                args.output / f"train_rank{rank}_error.json",
+                dict(rank=rank, pid=os.getpid(), timestamp=time.time(),
+                     error_type=type(exc).__name__, error=str(exc),
+                     traceback=traceback.format_exc()),
+            )
+        except Exception:
+            logger.exception("Could not publish elastic TP worker failure")
+        logger.exception("Elastic TP rank %s failed", rank)
+        raise
     finally:
-        if input_loader:
-            input_loader.close()
-        if buffer:
-            buffer.close()
-        if log is not None:
-            log.close()
-        groups.close()
-        dist.destroy_process_group()
+        if failed:
+            # No loader.close() (it waits for a CUDA event), CUDA synchronize,
+            # distributed barrier, or communicator destruction on rank-local
+            # failure. Process teardown reclaims device state; the supervisor
+            # stops the whole training process group and owns SHM destruction.
+            if log is not None:
+                with suppress(Exception):
+                    log.close()
+        else:
+            if input_loader:
+                input_loader.close()
+            if buffer:
+                buffer.close()
+            if log is not None:
+                log.close()
+            groups.close()
+            dist.destroy_process_group()
