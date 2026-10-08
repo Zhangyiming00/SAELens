@@ -157,6 +157,7 @@ def save_checkpoint(session, path, *, provider_state=None):
                 tp_overlap=session.tp_overlap,
                 tp_overlap_max_live_hooks=session.tp_overlap_max_live_hooks,
                 input_scale=session.input_scale,
+                input_scales=session.input_scales,
                 gradient_accumulation_steps=session.gradient_accumulation_steps,
                 files=[record for worker in records for record in worker],
             )
@@ -190,6 +191,7 @@ def load_checkpoint(session, path):
         if manifest["configs"] != {h: _config(c) for h, c in session.configs.items()}:
             raise ValueError("Checkpoint SAE configuration differs")
         accumulation = manifest.get("gradient_accumulation_steps", 1)
+        input_scales = session.validate_input_scales(manifest.get("input_scales"))
         if type(accumulation) is not int or accumulation < 1:
             raise ValueError("Invalid checkpoint gradient_accumulation_steps")
         if groups.prepared_ranks is not None:
@@ -346,6 +348,7 @@ def load_checkpoint(session, path):
     ):
         setattr(session, key, manifest[key])
     session.input_scale = float(manifest.get("input_scale", 1.0))
+    session.input_scales = input_scales
     session.gradient_accumulation_steps = manifest.get("gradient_accumulation_steps", 1)
     session._window = None
     session._microbatch_active = False

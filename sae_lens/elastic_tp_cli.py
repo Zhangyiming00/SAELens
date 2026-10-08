@@ -15,7 +15,7 @@ def add_elastic_tp_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help=(
             "Launch online watermark-controlled TP training with plain python. "
-            "Owns the GPU worker pool; one hook, FP32 SAE, DP=PP=1."
+            "Owns the GPU worker pool; hooks share SAE TP, FP32 SAE, DP=PP=1."
         ),
     )
     group.add_argument(
@@ -107,18 +107,20 @@ def validate_elastic_tp_arguments(
             "--elastic-tp requires training-tokens to be a positive multiple of train-batch-size-tokens"
         )
     # The shared CLI has a multi-hook default. Elastic TP preserves its existing
-    # single-hook online contract and uses --hook-name unless hooks are explicit.
+    # single-hook default and uses --hook-name unless hooks are explicit.
     if any(supplied(argv, flag) for flag in ("--hook-names", "--hooks")):
         hooks = [hook.strip() for hook in args.hook_names.split(",") if hook.strip()]
-        if len(hooks) != 1:
-            raise ValueError("--elastic-tp currently supports exactly one online hook")
+        if not hooks or len(set(hooks)) != len(hooks):
+            raise ValueError("--hook-names requires nonempty, unique hook names")
         if (
             any(supplied(argv, flag) for flag in ("--hook-name", "--hook"))
             and args.hook_name != hooks[0]
         ):
             raise ValueError("Conflicting --hook-name and --hook-names")
         args.hook_name = hooks[0]
-    args.hook_names = None
+        args.hook_names = ",".join(hooks) if len(hooks) > 1 else None
+    else:
+        args.hook_names = None
     # Validate numerical controls now, even when d_in will be inferred later.
     config_from_runner_args(args, d_in=1)
     # Shared parser acceptance must not silently turn unsupported options into
@@ -240,6 +242,7 @@ def config_from_runner_args(args: argparse.Namespace, *, d_in: int) -> ElasticTP
         model=args.model_name,
         dataset=args.dataset_path,
         hook=args.hook_name,
+        hook_names=args.hook_names.split(",") if args.hook_names else None,
         output=args.output_path,
         d_in=d_in,
         d_sae=args.d_sae,

@@ -37,7 +37,7 @@ def validate_local_sources(model: str, dataset: str) -> None:
 
 @dataclass
 class ElasticTPConfig:
-    """Single-node, single-hook FP32 SAE training over a fixed GPU pool.
+    """Single-node FP32 SAE training over a fixed GPU pool and shared hook TP.
 
     Rank zero always trains. Other GPUs host vLLM producers and join or
     leave the SAE TP group at optimizer boundaries as the SHM buffer fills.
@@ -92,9 +92,21 @@ class ElasticTPConfig:
     max_num_batched_tokens: int | None = None
     gpu_memory_utilization: float = 0.55
     vllm_text_only: bool = False
+    hook_names: list[str] | None = None
 
     def __post_init__(self) -> None:
         self.output = Path(self.output).resolve()
+        if self.hook_names is not None:
+            if not isinstance(self.hook_names, (list, tuple)) or not self.hook_names:
+                raise ValueError("hook_names must be a nonempty list of unique names")
+            if any(not isinstance(h, str) or not h.strip() for h in self.hook_names):
+                raise ValueError("hook_names must contain nonempty strings")
+            hooks = [h.strip() for h in self.hook_names]
+            if len(set(hooks)) != len(hooks):
+                raise ValueError("hook_names must be unique")
+            self.hook = hooks[0]
+            # A one-element list always takes the original single-hook path.
+            self.hook_names = hooks if len(hooks) > 1 else None
         if type(self.gradient_accumulation_steps) is not int or self.gradient_accumulation_steps < 1:
             raise ValueError("gradient_accumulation_steps must be a positive integer")
         for name in (
@@ -197,6 +209,10 @@ def activation_dtype(args):
     )
 
 
+def online_hooks(args):
+    return getattr(args, "hook_names", None) or [args.hook]
+
+
 def open_buffer(args, *, create=False, name=None):
     import torch
 
@@ -207,7 +223,7 @@ def open_buffer(args, *, create=False, name=None):
     buffer = SharedActivationBuffer(
         name,
         args.chunks,
-        args.batch_size,
+        args.batch_size * len(online_hooks(args)),
         args.d_in,
         num_producers=getattr(args, "pool_size", 4) - 1,
         target_chunks=args.steps,

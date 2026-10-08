@@ -23,6 +23,7 @@ from sae_lens.training.elastic_tp_config import (
     ElasticTPConfig,
     activation_dtype,
     configure_offline_environment,
+    online_hooks,
     open_buffer,
     validate_local_sources,
     write_json,
@@ -262,6 +263,9 @@ class ElasticTPSAETrainingRunner:
                 chunks=cfg.chunks,
                 tokens_per_chunk=cfg.batch_size,
                 activation_dtype=activation_dtype(cfg),
+                **(dict(hook_names=online_hooks(cfg),
+                        physical_rows_per_chunk=cfg.batch_size * len(online_hooks(cfg)))
+                   if cfg.hook_names else {}),
             ),
         )
         buffer = training = None

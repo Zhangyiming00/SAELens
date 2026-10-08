@@ -7,6 +7,7 @@ import time
 
 from sae_lens.training.elastic_tp_config import (
     activation_dtype,
+    online_hooks,
     open_buffer,
     write_json,
 )
@@ -70,6 +71,10 @@ def capture_chunk_gpu(model, tokens, args, sequence):
     """
     import torch
 
+    if len(online_hooks(args)) > 1:
+        from sae_lens.training.elastic_tp_multihook import capture_multi_hook_chunk
+
+        return capture_multi_hook_chunk(model, tokens, args, sequence)
     rows = args.batch_size // args.context
     batch = token_batch(tokens, sequence, rows)
     pieces = []
@@ -182,7 +187,7 @@ def producer(args):
             buffer=buffer,
             device=device,
             dtype=getattr(torch, activation_dtype(args)),
-            max_rows=args.batch_size,
+            max_rows=args.batch_size * len(online_hooks(args)),
             d_model=args.d_in,
             producer_id=args.producer_id,
             staging_slots=2,
@@ -272,7 +277,7 @@ def producer(args):
                 seq_no=sequence,
                 step=sequence + 1,
                 activations_gpu=chunk,
-                valid_rows=args.batch_size,
+                valid_rows=args.batch_size * len(online_hooks(args)),
                 valid_tokens_per_hook=args.batch_size,
                 inference_time_s=capture_s,
             )

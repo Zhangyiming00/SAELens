@@ -15,6 +15,7 @@ from contextlib import suppress
 from sae_lens.training.elastic_tp_config import (
     activation_dtype,
     emit,
+    online_hooks,
     open_buffer,
     write_json,
 )
@@ -84,8 +85,13 @@ def setup_session(args, initial_tp=1):
         normalize_activations="none",
     )
     baseline = cuda_memory(device)["allocated"]
+    configs = {args.hook: cfg}
+    if len(online_hooks(args)) > 1:
+        import copy
+
+        configs = {h: copy.deepcopy(cfg) for h in online_hooks(args)}
     session = DynamicTPSession(
-        {args.hook: cfg},
+        configs,
         groups,
         lr=args.lr,
         seed=getattr(args, "seed", 42),
@@ -132,7 +138,12 @@ def switch_and_validate(session, args):
     torch.cuda.synchronize()
     started = time.perf_counter()
     before = snapshot(session)
-    packet = [cache_digest(session, args.hook, full=args.audit_inputs)
+    digest = lambda: cache_digest(session, args.hook, full=args.audit_inputs)
+    if len(online_hooks(args)) > 1:
+        from sae_lens.training.elastic_tp_multihook import multi_cache_digest
+
+        digest = lambda: multi_cache_digest(session, full=args.audit_inputs)
+    packet = [digest()
               if groups.rank == 0 else None]
     dist.broadcast_object_list(packet, src=0, group=groups.control)
     expected_cache = packet[0]
@@ -146,7 +157,7 @@ def switch_and_validate(session, args):
         for a, b in zip(before[h], after[h]):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
     if groups.rank in groups.active_ranks:
-        assert cache_digest(session, args.hook, full=args.audit_inputs) == expected_cache
+        assert digest() == expected_cache
         assert session.state.progress == progress
     return metrics, time.perf_counter() - started, torch.cuda.max_memory_allocated()
 
@@ -158,6 +169,8 @@ def train(args):
     from sae_lens.training.dynamic_tp_input import DynamicTPInputLoader
 
     groups = None
+    hooks = online_hooks(args)
+    multi_hook = len(hooks) > 1
     rank = int(os.environ.get("RANK", "0"))
     buffer = input_loader = log = None
     failed = False
@@ -173,9 +186,22 @@ def train(args):
                 device=groups.device,
                 seed=args.seed,
             )
-            if rank == 0
+            if rank == 0 and not multi_hook
             else None
         )
+        if multi_hook:
+            from sae_lens.training.elastic_tp_multihook import (
+                MultiHookTPInputLoader,
+                hook_step_metrics,
+                refill_multi_hook,
+                save_multi_hook_models,
+            )
+
+            if rank == 0:
+                input_loader = MultiHookTPInputLoader(
+                    buffer, hooks=hooks, batch_size=args.batch_size,
+                    capacity_chunks=args.cache_batches, device=groups.device, seed=args.seed,
+                )
         log = (args.output / f"train_rank{rank}.jsonl").open("w", buffering=1)
         control_path = args.output / "producer_control.json"
         initial_control = [json.loads(control_path.read_text()) if rank == 0 else None]
@@ -190,6 +216,9 @@ def train(args):
         scale = args.activation_scale
         if scale is not None:
             session.input_scale = scale
+        scales = {h: scale for h in hooks} if multi_hook and scale is not None else None
+        if multi_hook:
+            session.input_scales = session.validate_input_scales(scales)
         started = time.perf_counter()
         last_poll, last_switch = -math.inf, -math.inf
         high_count = low_count = 0
@@ -199,7 +228,8 @@ def train(args):
             write_json(control_path, dict(tp=args.initial_tp, epoch=epoch, stop=False, startup=False))
             write_json(
                 args.output / "resolved_sae_config.json",
-                session.configs[args.hook].to_dict(),
+                {h: session.configs[h].to_dict() for h in hooks} if multi_hook
+                else session.configs[args.hook].to_dict(),
             )
             emit(
                 log,
@@ -215,6 +245,7 @@ def train(args):
                 low=args.low,
                 high=args.high,
                 vllm_residency=args.vllm_residency,
+                **(dict(hook_names=hooks) if multi_hook else {}),
             )
         completed = consumed = 0
         window_step_s = window_input_s = 0.0
@@ -434,7 +465,11 @@ def train(args):
 
             input_started = time.perf_counter()
             count = action["refill_chunks"]
-            if count:
+            if count and multi_hook:
+                scales = refill_multi_hook(
+                    session, args, input_loader, count, seen, scales, log, completed,
+                )
+            elif count:
                 estimate_scale = scale is None
                 if rank == 0:
                     data, current_chunks, order = input_loader.load_raw(count)
@@ -497,11 +532,16 @@ def train(args):
                 torch.cuda.synchronize()
                 input_s = time.perf_counter() - input_started
                 torch.cuda.reset_peak_memory_stats()
-                dead_before = int(
-                    (
-                        session.state.replicated[args.hook + "/since_fired"] > args.dead
-                    ).sum()
-                )
+                if multi_hook:
+                    dead_by_hook = {h: int((session.state.replicated[h + "/since_fired"] > args.dead).sum())
+                                    for h in hooks}
+                    dead_before = sum(dead_by_hook.values())
+                else:
+                    dead_before = int(
+                        (
+                            session.state.replicated[args.hook + "/since_fired"] > args.dead
+                        ).sum()
+                    )
                 train_started = time.perf_counter()
             losses = session.train_cached_microbatch(
                 args.batch_size, window_microbatches=window_microbatches
@@ -518,11 +558,17 @@ def train(args):
                 if not update_complete:
                     assert losses is None and session.state.in_step
                     continue
-                loss = float(losses[args.hook])
-                components = {
-                    k: float(v)
-                    for k, v in session.last_loss_components[args.hook].items()
-                }
+                if multi_hook:
+                    hook_metrics = hook_step_metrics(session, losses, dead_by_hook)
+                    loss = sum(v["loss"] for v in hook_metrics.values())
+                    components = {k: sum(v["components"][k] for v in hook_metrics.values())
+                                  for k in hook_metrics[hooks[0]]["components"]}
+                else:
+                    loss = float(losses[args.hook])
+                    components = {
+                        k: float(v)
+                        for k, v in session.last_loss_components[args.hook].items()
+                    }
                 losses = None  # Release even the detached per-update GPU scalars.
                 assert math.isfinite(loss) and all(
                     math.isfinite(v) for v in components.values()
@@ -547,6 +593,7 @@ def train(args):
                     peak_allocated=window_peak,
                     allocated=torch.cuda.memory_allocated(),
                     elapsed_s=time.perf_counter() - started,
+                    **(dict(hooks=hook_metrics) if multi_hook else {}),
                 )
                 if rank == 0:
                     samples.append(row)
@@ -558,12 +605,17 @@ def train(args):
         if rank == 0:
             assert seen == set(range(args.steps))
             assert session.state.activation_caches[args.hook].shape[0] == 0
+            if multi_hook:
+                assert all(t.shape[0] == 0 for t in session.state.activation_caches.values())
             write_json(
                 control_path, dict(tp=args.pool_size, epoch=epoch + 1, stop=True)
             )
         if not args.profile_only:
-            for model in session.state.models.values():
-                model.save_model(args.output / "model")
+            if multi_hook:
+                save_multi_hook_models(session, args.output / "model")
+            else:
+                for model in session.state.models.values():
+                    model.save_model(args.output / "model")
         dist.barrier(group=groups.control)
         if rank == 0:
             write_json(
@@ -584,6 +636,10 @@ def train(args):
                     final_loss=samples[-1]["loss"],
                     model_saved=not args.profile_only,
                     peak_dead=max(p["dead_before"] for p in samples),
+                    **(dict(hook_names=hooks, activation_scale_by_hook=scales,
+                            final_metrics_by_hook=samples[-1]["hooks"],
+                            peak_dead_by_hook={h: max(p["hooks"][h]["dead_before"] for p in samples) for h in hooks})
+                       if multi_hook else {}),
                     phase_means={
                         f"tp{tp}_{phase}": statistics.mean(
                             p["step_s"]

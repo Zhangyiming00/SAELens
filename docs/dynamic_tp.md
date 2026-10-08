@@ -42,8 +42,8 @@
 - 模型目录需已准备好权重及 `config.json`。输入维度从模型配置自动读取，每个 vLLM producer 使用 TP1，因此完整模型必须能放入单张卡。
 - 数据目录需是 `datasets.save_to_disk` 保存的单个 Dataset，包含非空、等长的二维 `tokens` 列。数据应事先使用该模型对应的 tokenizer 处理。每行 token 数必须是 `context-size` 的整数倍；运行时切为 context 窗口并循环读取至训练结束，不做下载或在线分词。
 - `train-batch-size-tokens` 是微批 token 数，必须是 `context-size` 的整数倍；`training-tokens` 必须是微批的整数倍。微批数为两者相除，optimizer 更新数为 `ceil(微批数 / GA)`。`max-model-len` 必须大于 `context-size`。
-- `/dev/shm` 要有足够空间。激活主体占用约为 `streaming-num-chunks × train-batch-size-tokens × d_in × dtype字节数`，另有少量元数据。例如 BF16、96 块、4096 tokens、d_in=4096 约需 3 GiB。
-- 当前在线模式支持单机、单 hook、SAE FP32、DP=PP=1、任意正整数 GA。模型与数据之外，Python 环境需已安装兼容的 PyTorch、vLLM、Transformers、Datasets 等依赖。
+- `/dev/shm` 要有足够空间。激活主体占用约为 `streaming-num-chunks × train-batch-size-tokens × hook数量 × d_in × dtype字节数`，另有少量元数据。例如 BF16、96 块、4096 tokens、d_in=4096，每个 hook 约需 3 GiB。
+- 当前在线模式支持单机、单/多 hook、SAE FP32、DP=PP=1、任意正整数 GA。多 hook 共用 SAE TP 拓扑，各 hook 的输入宽度必须等于模型配置的 hidden size。模型与数据之外，Python 环境需已安装兼容的 PyTorch、vLLM、Transformers、Datasets 等依赖。
 
 入口在导入 Transformers 前默认设置 `HF_HUB_OFFLINE=1`、`HF_DATASETS_OFFLINE=1`、`HF_HUB_DISABLE_TELEMETRY=1`、`VLLM_NO_USAGE_STATS=1`，所有子进程继承这些值，用户无需手写环境变量。加载前会拒绝远程模型标识和不存在的本地模型/数据目录。使用这些库读取本地文件不需要 Hugging Face 服务、账号或联网。
 
@@ -83,6 +83,34 @@ CUDA_VISIBLE_DEVICES=3,1,0,2 python run_sae_runner_gpu.py \
 GPU 顺序由 `CUDA_VISIBLE_DEVICES` 决定，池内 rank 对应其前 N 张卡。上面的两卡示例中，rank 0 是物理卡 3、rank 1 是物理卡 1；rank 0 始终训练，rank 1 可在 SAE 与活跃生产之间切换。不设置可见卡时使用前 N 张可见卡；程序不会自动寻找空闲 GPU，启动前应选择空闲且显存足够的卡。
 
 `--sae-tp-size N`（或 `-stp N`）只设置初始 SAE TP，**不会限制后续缩容**。省略时从最低允许 TP 启动，默认下限为 1。高低水位自动决定相邻切换，无需传入“从什么切换到什么”的列表。
+
+### 多 hook 在线 Elastic TP
+
+显式使用 `--hook-names`（别名 `--hooks`）启用。省略时仍只使用 `--hook-name`；共享 runner 原有的多 hook 默认列表不会自动启用多 hook。只传一个 hook 的列表也会归一化到原有单 hook 采集和输入加载路径。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python run_sae_runner_gpu.py \
+  --elastic-tp-size 4 --sae-tp-size 2 --elastic-tp-min-size 2 \
+  --model-name /root/models/Llama-3.1-8B \
+  --dataset-path /root/datasets/fineweb_tokenized_llama31_ctx2048 \
+  --hook-names blocks.16.hook_resid_post,blocks.21.hook_resid_post \
+  --d-sae 65536 --k 128 \
+  --train-batch-size-tokens 4096 --training-tokens 32768000 \
+  --context-size 1024 --max-model-len 1025 --store-batch-size-prompts 1 \
+  --gradient-accumulation-steps 2 --tp-overlap bounded \
+  --streaming-num-chunks 96 --streaming-prefetch-chunks 2 \
+  --output-path results/elastic_multi_hook
+```
+
+- 每个 producer 在一次 vLLM 前向中请求全部 hook。每个 hook 对应一个独立 SAE、Adam 和 firing/dead 状态；SAE 配置共用 `d_sae`、K 和其他训练参数，初始化按 `seed + hook_index`。当前在线入口不提供每 hook 不同维度/超参数的配置。
+- 所有 hook 共用一组 SAE TP ranks，一起扩容、缩容和卸载；不是 SAE PP，也不能分别为各 hook 选择不同 TP。`--elastic-tp-min-size` 必须考虑所有 SAE 及迁移临时存储的总显存需求。
+- 一个 SHM chunk 包含所有 hook 的同一批 tokens，按 hook-major 布局存储。补充缓存时所有 hook 使用同一 token 排列，不会把不同 hook 的激活当成额外 token。`training-tokens`、GA、水位和 chunk 序号仍按逻辑输入计数：上述命令每个 SAE 都训练 32,768,000 tokens，不会乘/除 hook 数。
+- 未指定 `--elastic-tp-activation-scale` 时，各 hook 分别从第一次 refill 估算缩放因子，并广播给全部 workers；指定这个现有参数时，所有 hook 共用该显式值。原始缓存保持 FP32/BF16，缩放发生在 SAE 输入边界。迁移时保留全部 hook 的缓存；`--elastic-tp-audit-inputs` 校验每个 hook 的完整缓存哈希。
+- 支持 GA；只在全部 hook 的完整 optimizer 更新边界切换。`--tp-overlap off/eager/lazy/bounded` 沿用 session 的跨 hook 前向调度；不支持 MultiSAETrainer 的 optimizer-overlap、SAE PP、动态 DP/ZeRO。
+- 多 hook 的逐步日志增加 `hooks[hook]`，包含各自 `loss`、`components`、`dead_before`；顶层这些指标是各 hook 的和。比较 MSE 时读取对应 hook，不将求和值与单 hook MSE 比较。`step_s` 为全部 hook 一次更新的计算时间。
+- `training_report.json` 保存 `activation_scale_by_hook`、`final_metrics_by_hook`、`peak_dead_by_hook`。默认导出到 `model/<独立hook目录>/`，用 `model/multi_sae_manifest.json` 的 `hook_to_dir` 查找；缩放因子也保存在该清单中。`--no-save-final-sae` 可关闭导出。单 hook 仍使用原来的 `model/` 路径和标量日志。
+
+不要直接沿用上文 `COMMON` 中的 `--hook-name blocks.21...` 再叠加以另一个 hook 开头的列表；同时显式指定两者时，`--hook-name` 必须与列表首项一致。hook 名称不能为空或重复。不同输入宽度会在采集时明确报错。
 
 ### 梯度累积：GA > 1
 

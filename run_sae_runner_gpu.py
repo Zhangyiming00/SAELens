@@ -1071,6 +1071,8 @@ def main() -> None:
             f"initial active vLLM={cfg.pool_size - cfg.initial_tp}, offline=True",
             flush=True,
         )
+        if cfg.hook_names:
+            print(f"[elastic TP] hooks={','.join(cfg.hook_names)}; shared TP, per-hook SAE/Adam", flush=True)
         ElasticTPSAETrainingRunner(cfg).run()
         return
 

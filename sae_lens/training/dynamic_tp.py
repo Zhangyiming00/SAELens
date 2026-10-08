@@ -630,6 +630,7 @@ class DynamicTPSession:
         tp_overlap_max_live_hooks=2,
         input_scale=1.0,
         gradient_accumulation_steps=1,
+        input_scales=None,
     ):
         from sae_lens.megatron_tp import require_megatron_core
         from sae_lens.saes.megatron_topk_sae import MegatronTopKSAE
@@ -655,6 +656,7 @@ class DynamicTPSession:
         self.input_scale = float(input_scale)
         if not math.isfinite(self.input_scale) or self.input_scale <= 0:
             raise ValueError("input_scale must be finite and positive")
+        self.input_scales = self.validate_input_scales(input_scales)
         if tp_overlap not in ("off", "eager", "lazy", "bounded"):
             raise ValueError("tp_overlap must be off/eager/lazy/bounded")
         if type(tp_overlap_max_live_hooks) is not int or tp_overlap_max_live_hooks < 1:
@@ -662,7 +664,7 @@ class DynamicTPSession:
         self.tp_overlap = tp_overlap
         self.tp_overlap_max_live_hooks = tp_overlap_max_live_hooks
         self.last_forward_schedule = "off"
-        settings = (tp_overlap, tp_overlap_max_live_hooks, self.input_scale, gradient_accumulation_steps)
+        settings = (tp_overlap, tp_overlap_max_live_hooks, self.input_scale, gradient_accumulation_steps, self.input_scales)
         groups.check(
             None
             if all(s == settings for s in groups.agree(settings))
@@ -699,6 +701,17 @@ class DynamicTPSession:
                 self.state.replicated[h + "/firing_counts"] = torch.zeros(
                     cfg.d_sae, device=groups.device
                 )
+
+    def validate_input_scales(self, scales):
+        """Optional per-hook factors; the scalar single-hook path stays intact."""
+        if scales is None:
+            return None
+        if not isinstance(scales, dict) or set(scales) != set(self.configs):
+            raise ValueError("input_scales must contain exactly the session hooks")
+        values = {h: float(scales[h]) for h in self.configs}
+        if any(not math.isfinite(v) or v <= 0 for v in values.values()):
+            raise ValueError("input_scales must be finite and positive")
+        return values
 
     def prepare(self, ranks):
         ranks = tuple(ranks)
@@ -860,7 +873,10 @@ class DynamicTPSession:
         inputs = {}
         for h, model in self.state.models.items():
             inputs[h] = TrainStepInput(
-                sae_in=prepare_sae_input(batches[h], model.dtype, self.input_scale),
+                sae_in=prepare_sae_input(
+                    batches[h], model.dtype,
+                    self.input_scale if self.input_scales is None else self.input_scales[h],
+                ),
                 coefficients={},
                 dead_neuron_mask=window.masks[h],
                 n_training_steps=self.state.progress["steps"],
